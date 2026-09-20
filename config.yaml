@@ -1,0 +1,83 @@
+# Azozo Model & System Configuration
+
+providers:
+  xah:
+    base_url: "https://api.xah.io/v1"
+    api_key_env: "XAH_API_KEY"
+  vilao:
+    base_url: "https://api.vilao.ai/v1"
+    api_key_env: "LLM_API_KEY"
+  nvidia:
+    base_url: "https://integrate.api.nvidia.com/v1"
+    api_key_env: "NVIDIA_API_KEY"
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key_env: "DEEPSEEK_API_KEY"
+  commandcode:
+    base_url: "http://127.0.0.1:3050/v1"
+    api_key_env: "CMD_API_KEY"
+  codex:
+    base_url: ""
+    api_key_env: "OPENAI_API_KEY"
+  agy:
+    base_url: "local://agy-cli"
+    api_key_env: ""
+
+models:
+  ocr:
+    model_name: "gpt-5.6-luna"
+    provider: "codex"
+    batch_size: 5
+    concurrency: 1
+    description: "Vision LLM model for converting PDF pages to markdown text"
+    figure_detection:
+      enabled: true
+      model_path: "export_onnx/iter1-haswell-int8.onnx"
+      confidence_threshold: 0.3
+      class_names: ["bangbienthien", "class_1"]
+      included_class_ids: [1]
+
+  parser:
+    model_name: "gemini-3.8-flash"
+    provider: "agy"
+    thinking: high
+    max_tokens: 128000
+    description: "Sequence labeling LLM model for question stem and option annotation"
+
+  linker:
+    model_name: "gpt-5.6-luna"
+    provider: "codex"
+    thinking: low
+    description: "Graph resolver agent for entity resolution and passage linking"
+
+  answer_mapper:
+    model_name: "phatchau036/minimax-m3"
+    provider: "xah"
+    description: "LLM model for mapping unstructured answer keys to questions"
+
+  chunker:
+    target_tokens: 12000
+    max_tokens: 16000
+    overlap_pages: 0
+    description: "Passage-locked greedy chunker token budget (12k-16k tokens per chunk)"
+
+  reviewer:
+    model_name: "gpt-5.6-luna"
+    provider: "codex"
+    thinking: high
+    min_score_threshold: 75
+    description: "Reviewer agent for rating sequence labelling XML quality and discarding malfunctioned documents"
+
+  editor:
+    model_name: "gpt-5.6-luna"
+    provider: "codex"
+    thinking: high
+    description: "Precision surgical editor agent using Search/Replace diff blocks"
+
+logging:
+  dir: "backend/logs/ocr_logs"
+  enabled: true
+
+server:
+  host: "0.0.0.0"
+  port: 8000

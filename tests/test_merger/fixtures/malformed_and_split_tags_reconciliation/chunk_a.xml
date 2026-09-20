@@ -1,0 +1,12 @@
+<input>
+Passage text.
+Question 5.
+Option A.
+Option B.
+</input>
+<parsed>
+<stimulus>Passage text.</stimulus>
+<question_label>**5.**</question_label>
+<opt_label>Option A.</opt_label>
+<option_label>Option B.</option_label>
+</parsed>

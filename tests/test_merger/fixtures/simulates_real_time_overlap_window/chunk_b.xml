@@ -1,0 +1,29 @@
+<input>
+Live Stream
+Shared passage appears in both chunks.
+**10.** Question 10 stem.
+**11.** Question 11 stem.
+**12.** Question 12 stem.
+**13.** Question 13 stem.
+**14.** Question 14 stem.
+**15.** Question 15 stem.
+**16.** Question 16 stem.
+</input>
+<parsed>
+<section>Live Stream</section>
+<stimulus>Shared passage appears in both chunks.</stimulus>
+<question_label>**10.**</question_label>
+<stem>Question 10 stem.</stem>
+<question_label>**11.**</question_label>
+<stem>Question 11 stem.</stem>
+<question_label>**12.**</question_label>
+<stem>Question 12 stem.</stem>
+<question_label>**13.**</question_label>
+<stem>Question 13 stem.</stem>
+<question_label>**14.**</question_label>
+<stem>Question 14 stem.</stem>
+<question_label>**15.**</question_label>
+<stem>Question 15 stem.</stem>
+<question_label>**16.**</question_label>
+<stem>Question 16 stem.</stem>
+</parsed>

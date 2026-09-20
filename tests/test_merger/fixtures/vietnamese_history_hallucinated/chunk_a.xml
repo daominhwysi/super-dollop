@@ -1,0 +1,16 @@
+<input>
+**1.**
+Sự kiện lịch sử nào đánh dấu sự khởi đầu của Cách mạng Tháng Tám năm 1945 tại Việt Nam?
+**2.**
+Hiệp định Giơ-ne-vơ về Đông Dương được ký kết vào năm nào?
+**3.**
+Chiến dịch Điện Biên Phủ diễn ra trong bao nhiêu ngày đêm?
+</input>
+<parsed>
+<question_label>**1.**</question_label>
+<stem>Sự kiện lịch sử nào đánh dấu sự khởi đầu của Cách mạng Tháng Tám năm 1945 tại Việt Nam?</stem>
+<question_label>**2.**</question_label>
+<stem>Hiệp định Giơ-ne-vơ về Đông Dương được ký kết vào năm nào?</stem>
+<question_label>**3.**</question_label>
+<stem>Chiến dịch Điện Biên Phủ diễn ra trong bao nhiêu ngày đêm?</stem>
+</parsed>

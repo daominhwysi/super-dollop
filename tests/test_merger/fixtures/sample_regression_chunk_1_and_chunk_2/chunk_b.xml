@@ -1,0 +1,80 @@
+<input>
+A one-year subscription is $20 and includes online access to all previous issues. We also offer a 10 percent discount on your first subscription renewal. What's more, subscribers receive our free weekly "Healthy Living" e-mail update, which includes special reports plus links to videos and podcasts.
+>
+> To get started, simply go to our Subscribe page and follow the instructions.
+
+> https://www.centraluniversity.edu/nutrition/newsletter/reviews
+>
+> Publication: Central University Health Newsletter
+> ★★★★★
+> Reviewed by: Ari Kipp
+> Date posted: August 4
+>
+> This is my second year subscribing to the Central University Health Newsletter, which I read cover to cover. I'm particularly impressed with the Ask an Expert column, and I always learn something new. This month, for instance, Dr. Stella Booth gives a surprising answer to the question of which pasta is most nutritious. I didn't know that bean-based pasta even existed, much less how much fiber it contains. I tried it and will never go back to regular pasta. My sole complaint is that the newsletter is only twelve pages long!
+
+310
+
+**176.** What is the purpose of the Web page?
+- (A) To explain the reason for a price increase
+- (B) To increase the size of the audience for a publication
+- (C) To recruit volunteers for a research project
+- (D) To sell nutritional supplements
+
+**177.** In the Web page, the word "delivers" in paragraph 1, line 4, is closest in meaning to
+- (A) presents
+- (B) transports
+- (C) guides
+- (D) claims
+
+**178.** What is true about Mr. Kipp?
+- (A) He is a health-care professional.
+- (B) He received a 20 percent discount on a subscription.
+- (C) He gets nutrition tips from a television program.
+- (D) He gets a weekly e-mail from Central University.
+
+**179.** What is indicated about the Central University School of Nutrition?
+- (A) It creates lesson plans for local teachers.
+- (B) It is headed by Dr. Booth.
+- (C) It offers online cooking classes.
+- (D) It has a job opening for a researcher.
+</input>
+<parsed>
+<stimulus>A one-year subscription is $20 and includes online access to all previous issues. We also offer a 10 percent discount on your first subscription renewal. What's more, subscribers receive our free weekly "Healthy Living" e-mail update, which includes special reports plus links to videos and podcasts.
+>
+> To get started, simply go to our Subscribe page and follow the instructions.
+
+> https://www.centraluniversity.edu/nutrition/newsletter/reviews
+>
+> **Publication:** *Central University Health Newsletter*
+> ★★★★★
+> **Reviewed by:** Ari Kipp
+> **Date posted:** August 4
+>
+> This is my second year subscribing to the *Central University Health Newsletter*, which I read cover to cover. I'm particularly impressed with the Ask an Expert column, and I always learn something new. This month, for instance, Dr. Stella Booth gives a surprising answer to the question of which pasta is most nutritious. I didn't know that bean-based pasta even existed, much less how much fiber it contains. I tried it and will never go back to regular pasta. My sole complaint is that the newsletter is only twelve pages long!
+
+310</stimulus>
+
+<question_label>**176.**</question_label> <stem>What is the purpose of the Web page?</stem>
+- <option_label>(A)</option_label> <option_text>To explain the reason for a price increase</option_text>
+- <option_label>(B)</option_label> <option_text>To increase the size of the audience for a publication</option_text>
+- <option_label>(C)</option_label> <option_text>To recruit volunteers for a research project</option_text>
+- <option_label>(D)</option_label> <option_text>To sell nutritional supplements</option_text>
+
+<question_label>**177.**</question_label> <stem>In the Web page, the word "delivers" in paragraph 1, line 4, is closest in meaning to</stem>
+- <option_label>(A)</option_label> <option_text>presents</option_text>
+- <option_label>(B)</option_label> <option_text>transports</option_text>
+- <option_label>(C)</option_label> <option_text>guides</option_text>
+- <option_label>(D)</option_label> <option_text>claims</option_text>
+
+<question_label>**178.**</question_label> <stem>What is true about Mr. Kipp?</stem>
+- <option_label>(A)</option_label> <option_text>He is a health-care professional.</option_text>
+- <option_label>(B)</option_label> <option_text>He received a 20 percent discount on a subscription.</option_text>
+- <option_label>(C)</option_label> <option_text>He gets nutrition tips from a television program.</option_text>
+- <option_label>(D)</option_label> <option_text>He gets a weekly e-mail from Central University.</option_text>
+
+<question_label>**179.**</question_label> <stem>What is indicated about the Central University School of Nutrition?</stem>
+- <option_label>(A)</option_label> <option_text>It creates lesson plans for local teachers.</option_text>
+- <option_label>(B)</option_label> <option_text>It is headed by Dr. Booth.</option_text>
+- <option_label>(C)</option_label> <option_text>It offers online cooking classes.</option_text>
+- <option_label>(D)</option_label> <option_text>It has a job opening for a researcher.</option_text>
+</parsed>

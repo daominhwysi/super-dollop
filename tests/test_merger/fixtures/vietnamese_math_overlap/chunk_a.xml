@@ -1,0 +1,40 @@
+<input>
+ĐỀ THI THỬ MÔN TOÁN - ĐÁNH GIÁ NĂNG LỰC
+BÀI ĐỌC HIỂU: Một học sinh chuẩn bị đi thi, cần xác định quãng đường đi bộ khi đi từ nhà đến trường trong giờ cao điểm.
+**1.**
+Trong phương trình x^2 - 5x + 6 = 0, nghiệm nhỏ là bao nhiêu?
+**2.**
+Tập nghiệm của bất phương trình 2x - 3 > 0 là gì?
+**3.**
+Cho hình chữ nhật có chu vi 20, diện tích lớn nhất khi:
+**4.**
+Một lớp có 45 học sinh chia thành các tổ...
+**5.**
+Trong không gian tọa độ, véc tơ nào sau đây có độ dài bằng 5?
+**6.**
+Đặt tên biến: n = số bài tập đã làm, 2n = số bài chưa làm. Tính n.
+**7.**
+Trong hình chóp tứ giác đều, mặt nào song song với đường thẳng.
+**8.**
+Diện tích tam giác có đáy 10, chiều cao 6 là bao nhiêu?
+</input>
+<parsed>
+<section>ĐỀ THI THỬ MÔN TOÁN - ĐÁNH GIÁ NĂNG LỰC</section>
+<stimulus>BÀI ĐỌC HIỂU: Một học sinh chuẩn bị đi thi, cần xác định quãng đường đi bộ khi đi từ nhà đến trường trong giờ cao điểm.</stimulus>
+<question_label>**1.**</question_label>
+<stem>Trong phương trình x^2 - 5x + 6 = 0, nghiệm nhỏ là bao nhiêu?</stem>
+<question_label>**2.**</question_label>
+<stem>Tập nghiệm của bất phương trình 2x - 3 > 0 là gì?</stem>
+<question_label>**3.**</question_label>
+<stem>Cho hình chữ nhật có chu vi 20, diện tích lớn nhất khi:</stem>
+<question_label>**4.**</question_label>
+<stem>Một lớp có 45 học sinh chia thành các tổ...</stem>
+<question_label>**5.**</question_label>
+<stem>Trong không gian tọa độ, véc tơ nào sau đây có độ dài bằng 5?</stem>
+<question_label>**6.**</question_label>
+<stem>Đặt tên biến: n = số bài tập đã làm, 2n = số bài chưa làm. Tính n.</stem>
+<question_label>**7.**</question_label>
+<stem>Trong hình chóp tứ giác đều, mặt nào song song với đường thẳng.</stem>
+<question_label>**8.**</question_label>
+<stem>Diện tích tam giác có đáy 10, chiều cao 6 là bao nhiêu?</stem>
+</parsed>

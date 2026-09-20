@@ -1,0 +1,25 @@
+[project]
+name = "vietnamese-sequence-labelling-v2"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi",
+  "python-multipart",
+  "uvicorn",
+  "pydantic",
+  "pymupdf",
+  "openai",
+  "python-dotenv",
+  "tqdm",
+  "pyyaml",
+  "numpy",
+  "opencv-python-headless",
+  "onnxruntime",
+]
+
+[project.scripts]
+sequence-label = "sequence_labelling.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests/unit", "tests/test_merger"]

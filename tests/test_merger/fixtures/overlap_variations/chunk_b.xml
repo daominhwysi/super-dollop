@@ -1,0 +1,12 @@
+<input>
+Overlap passage line 1.
+Overlap passage line 2.
+Question 3.
+Footer text.
+</input>
+<parsed>
+<stimulus>Overlap passage line 1.
+Overlap passage line 2.</stimulus>
+<question_label>Question 3.</question_label>
+Footer text.
+</parsed>

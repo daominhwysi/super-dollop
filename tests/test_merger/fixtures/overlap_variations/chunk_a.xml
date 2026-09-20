@@ -1,0 +1,14 @@
+<input>
+Header text.
+Question 1.
+Question 2.
+Overlap passage line 1.
+Overlap passage line 2.
+</input>
+<parsed>
+<section>Header text.</section>
+<question_label>Question 1.</question_label>
+<question_label>Question 2.</question_label>
+<stimulus>Overlap passage line 1.
+Overlap passage line 2.</stimulus>
+</parsed>

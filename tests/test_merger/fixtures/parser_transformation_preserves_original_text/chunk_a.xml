@@ -1,0 +1,6 @@
+<input>
+This is the original source text with exact spelling.
+</input>
+<parsed>
+<stem>This is the originaal extra hallucinated word source text with exact spelling.</stem>
+</parsed>

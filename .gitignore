@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+models/
+artifacts/
+*.sqlite
+*.log
+backend/logs/
+tests/test_merger/outputs/
+result.md

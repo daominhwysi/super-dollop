@@ -1,0 +1,18 @@
+<input>
+**3.**
+Chiến dịch Điện Biên Phủ diễn ra trong bao nhiêu ngày đêm?
+**4.**
+Đại hội đại biểu toàn quốc lần thứ I của Đảng Cộng sản Việt Nam họp ở đâu?
+**5.**
+Tổ chức nào là tiền thân của Đảng Cộng sản Việt Nam?
+</input>
+<parsed>
+<question_label>**3.**</question_label>
+<stem>Chiến dịch Điện Biên Phủ diễn ra trong bao nhiêu ngày đêm?</stem>
+<question_label>**4.**</question_label>
+<stem>Đại hội đại biểu toàn quốc lần thứ I của Đảng Cộng sản Việt Nam họp ở đâu?</stem>
+<question_label>**5.**</question_label>
+<stem>Tổ chức nào là tiền thân của Đảng Cộng sản Việt Nam?</stem>
+<question_label>**6.**</question_label>
+<stem>Câu hỏi ảo bị loại bỏ vì không có trong raw input.</stem>
+</parsed>

@@ -1,0 +1,36 @@
+<input>
+**6.**
+Đặt tên biến: n = số bài tập đã làm, 2n = số bài chưa làm. Tính n.
+**7.**
+Trong hình chóp tứ giác đều, mặt nào song song với đường thẳng.
+**8.**
+Diện tích tam giác có đáy 10, chiều cao 6 là bao nhiêu?
+**9.**
+Tính tổng các số nguyên dương nhỏ hơn 100 chia hết cho 3?
+**10.**
+Giá trị của sin(30°) là bao nhiêu?
+**11.**
+Phương trình log2(x) = 3 có nghiệm x bằng bao nhiêu?
+**12.**
+Cho tam giác vuông có hai cạnh góc vuông là 3 và 4. Độ dài cạnh huyền là bao nhiêu?
+**13.**
+Đạo hàm của hàm số y = x^3 - 3x là gì?
+</input>
+<parsed>
+<question_label>**6.**</question_label>
+<stem>Đặt tên biến: n = số bài tập đã làm, 2n = số bài chưa làm. Tính n.</stem>
+<question_label>**7.**</question_label>
+<stem>Trong hình chóp tứ giác đều, mặt nào song song với đường thẳng.</stem>
+<question_label>**8.**</question_label>
+<stem>Diện tích tam giác có đáy 10, chiều cao 6 là bao nhiêu?</stem>
+<question_label>**9.**</question_label>
+<stem>Tính tổng các số nguyên dương nhỏ hơn 100 chia hết cho 3?</stem>
+<question_label>**10.**</question_label>
+<stem>Giá trị của sin(30°) là bao nhiêu?</stem>
+<question_label>**11.**</question_label>
+<stem>Phương trình log2(x) = 3 có nghiệm x bằng bao nhiêu?</stem>
+<question_label>**12.**</question_label>
+<stem>Cho tam giác vuông có hai cạnh góc vuông là 3 và 4. Độ dài cạnh huyền là bao nhiêu?</stem>
+<question_label>**13.**</question_label>
+<stem>Đạo hàm của hàm số y = x^3 - 3x là gì?</stem>
+</parsed>
