@@ -75,8 +75,10 @@ def parse_args():
     parser.add_argument("--dataloader-num-workers", "--dataloader_num_workers", type=int, default=None, help="Dataloader num workers")
     
     # Checkpoint and Hub options
-    parser.add_argument("--resume-from-checkpoint", "--resume_from_checkpoint", type=str, default=None, help="Resume training from checkpoint ('auto' or directory path)")
-    parser.add_argument("--push-to-hub", "--push_to_hub", action="store_true", default=False, help="Push best model to Hugging Face Hub after training")
+    parser.add_argument("--resume-from-checkpoint", "--resume_from_checkpoint", type=str, default=None, help="Resume training from checkpoint ('auto', directory path, or Hugging Face Hub repo ID)")
+    parser.add_argument("--save-steps", "--save_steps", type=int, default=None, help="Save a rolling checkpoint every N steps (0 to disable)")
+    parser.add_argument("--save-total-limit", "--save_total_limit", type=int, default=None, help="Maximum number of rolling step checkpoints to keep (default: 2)")
+    parser.add_argument("--push-to-hub", "--push_to_hub", action="store_true", default=False, help="Push checkpoint to Hugging Face Hub during and after training")
     parser.add_argument("--hub-model-id", "--hub_model_id", type=str, default=None, help="Hugging Face model repository ID")
     
     # Hardware precision & Mixed Precision (AMP)
@@ -121,6 +123,95 @@ def compute_entity_metrics(
                     total += 1
         acc = correct / max(1, total)
         return {"macro_f1": acc, "precision": acc, "recall": acc, "micro_f1": acc}
+
+
+def save_training_checkpoint(
+    save_dir: Path,
+    model: nn.Module,
+    tokenizer: Any,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any,
+    epoch: int,
+    global_step: int,
+    best_macro_f1: float,
+    patience_counter: int,
+    tag_to_id: Dict[str, int],
+    id_to_tag: Dict[int, str],
+    is_main_process: bool = True
+):
+    """Saves model weights, config, tokenizer, label map, and full trainer state for continuity."""
+    if not is_main_process:
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    raw_model = model.module if hasattr(model, "module") else model
+
+    # 1. Save model weights, config, enhanced head config, safetensors, pytorch_model.bin
+    raw_model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+
+    # 2. Save label mapping
+    label_map_file = save_dir / "label_mapping.json"
+    with open(label_map_file, "w", encoding="utf-8") as f:
+        json.dump({"tag_to_id": tag_to_id, "id_to_tag": id_to_tag}, f, indent=2)
+
+    # 3. Save complete trainer state bundle (optimizer, scheduler, scaler, steps, epochs)
+    trainer_state = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_macro_f1": best_macro_f1,
+        "patience_counter": patience_counter,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler and scaler.is_enabled() else None,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+    }
+    torch.save(trainer_state, save_dir / "trainer_state.pt")
+
+
+def prune_checkpoints(output_dir: Path, save_total_limit: int, is_main_process: bool = True):
+    """Prunes older step checkpoints to respect save_total_limit and conserve disk space."""
+    if not is_main_process or save_total_limit <= 0:
+        return
+
+    import shutil
+    step_dirs = []
+    for d in output_dir.glob("checkpoint-*"):
+        if d.is_dir() and d.name.replace("checkpoint-", "").isdigit():
+            step_dirs.append((int(d.name.replace("checkpoint-", "")), d))
+
+    step_dirs.sort(key=lambda x: x[0])
+    while len(step_dirs) > save_total_limit:
+        oldest_step, oldest_dir = step_dirs.pop(0)
+        try:
+            print(f"Pruning old checkpoint: {oldest_dir.name} (exceeds save_total_limit={save_total_limit})")
+            shutil.rmtree(oldest_dir)
+        except Exception as e:
+            print(f"Warning: Could not prune {oldest_dir}: {e}")
+
+
+def push_checkpoint_to_hub(repo_id: str, folder_path: Path, commit_message: str):
+    """Pushes a checkpoint directory to Hugging Face Hub."""
+    try:
+        from huggingface_hub import HfApi
+        print(f"\nPushing checkpoint to Hugging Face Hub: '{repo_id}'...")
+        api = HfApi()
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+        api.upload_folder(
+            folder_path=str(folder_path),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message
+        )
+        print(f"Checkpoint successfully synchronized to: https://huggingface.co/{repo_id}")
+    except Exception as e:
+        print(f"Notice: Failed to push checkpoint to Hugging Face Hub: {e}")
 
 
 def main():
@@ -217,6 +308,8 @@ def main():
 
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16 and torch.cuda.is_available()))
     max_length = args.max_length or 2048
+    save_steps = args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 0))
+    save_total_limit = args.save_total_limit if args.save_total_limit is not None else int(train_cfg.get("save_total_limit", 2))
 
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +334,10 @@ def main():
         print(f"  Head LR              : {head_lr}")
         print(f"  Batch Size           : {batch_size} (effective: {batch_size * grad_accum * world_size})")
         print(f"  Max Sequence Length  : {max_length}")
+        if save_steps > 0:
+            print(f"  Save Checkpoints     : Every {save_steps} steps (Keep last {save_total_limit})")
+        if args.resume_from_checkpoint:
+            print(f"  Resume Source        : {args.resume_from_checkpoint}")
         print(f"  Output Dir           : {output_dir}")
         print(f"  Focal Gamma          : {focal_gamma}")
         print(f"  Label Smoothing      : {label_smoothing}")
@@ -417,22 +514,61 @@ def main():
         label_smoothing=label_smoothing
     ).to(device)
 
-    # Checkpoint resume support
+    # 5b. Checkpoint Resume Resolution (Auto, Local Path, or Hugging Face Hub)
+    resume_dir = None
     if args.resume_from_checkpoint:
-        resume_dir = output_dir if args.resume_from_checkpoint == "auto" else Path(args.resume_from_checkpoint)
+        raw_resume = args.resume_from_checkpoint.strip()
+        if raw_resume == "auto":
+            # Prefer output_dir / "latest_checkpoint", then output_dir
+            if (output_dir / "latest_checkpoint" / "trainer_state.pt").exists() or (output_dir / "latest_checkpoint" / "model.safetensors").exists():
+                resume_dir = output_dir / "latest_checkpoint"
+            elif (output_dir / "trainer_state.pt").exists() or (output_dir / "model.safetensors").exists() or (output_dir / "pytorch_model.bin").exists():
+                resume_dir = output_dir
+            else:
+                if is_main_process:
+                    print(f"Notice: --resume-from-checkpoint 'auto' specified, but no previous checkpoint found in '{output_dir}'. Starting fresh.")
+        elif "/" in raw_resume and not Path(raw_resume).exists():
+            # Hugging Face Hub repository ID!
+            if is_main_process:
+                print(f"Downloading checkpoint from Hugging Face Hub repository: '{raw_resume}'...")
+                from huggingface_hub import snapshot_download
+                dl_path = snapshot_download(repo_id=raw_resume)
+            else:
+                dl_path = None
+            if is_distributed:
+                obj_list = [dl_path]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                resume_dir = Path(obj_list[0])
+            else:
+                resume_dir = Path(dl_path)
+        else:
+            p = Path(raw_resume)
+            if not p.is_absolute():
+                p = WORKSPACE_DIR / p
+            if p.exists():
+                resume_dir = p
+            else:
+                if is_main_process:
+                    print(f"Warning: Checkpoint path '{p}' does not exist. Starting fresh.")
+
+    # Load Model Weights
+    if resume_dir is not None:
         weights_file = resume_dir / "model.safetensors"
         bin_file = resume_dir / "pytorch_model.bin"
         if weights_file.exists():
             from safetensors.torch import load_file
             if is_main_process:
-                print(f"Resuming weights from {weights_file}...")
+                print(f"Resuming model weights from '{weights_file}'...")
             state_dict = load_file(weights_file, device=str(device))
             model.load_state_dict(state_dict, strict=False)
         elif bin_file.exists():
             if is_main_process:
-                print(f"Resuming weights from {bin_file}...")
+                print(f"Resuming model weights from '{bin_file}'...")
             state_dict = torch.load(bin_file, map_location=device)
             model.load_state_dict(state_dict, strict=False)
+        else:
+            if is_main_process:
+                print(f"Notice: No model weights file found in '{resume_dir}'. Initializing from base model.")
 
     # Wrap model with DistributedDataParallel if running multi-GPU
     if is_distributed:
@@ -473,13 +609,72 @@ def main():
     else:
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
 
-    # 7. Training & Evaluation Loop
-    best_macro_f1 = -1.0
+    # 7. Training State & Continuity Restoration
+    start_epoch = 1
     global_step = 0
+    best_macro_f1 = -1.0
     patience_counter = 0
     max_patience = int(train_cfg.get("early_stopping_patience", 3))
 
-    for epoch in range(1, epochs + 1):
+    if resume_dir is not None:
+        trainer_state_file = resume_dir / "trainer_state.pt"
+        if trainer_state_file.exists():
+            try:
+                if is_main_process:
+                    print(f"Loading full trainer continuity state from '{trainer_state_file}'...")
+                trainer_state = torch.load(trainer_state_file, map_location=device)
+
+                # 1. Restore optimizer states and tensors
+                if "optimizer_state_dict" in trainer_state:
+                    optimizer.load_state_dict(trainer_state["optimizer_state_dict"])
+                    for state_val in optimizer.state.values():
+                        for k, v in state_val.items():
+                            if isinstance(v, torch.Tensor):
+                                state_val[k] = v.to(device)
+
+                # 2. Restore scheduler states
+                if "scheduler_state_dict" in trainer_state:
+                    scheduler.load_state_dict(trainer_state["scheduler_state_dict"])
+
+                # 3. Restore scaler states
+                if "scaler_state_dict" in trainer_state and trainer_state["scaler_state_dict"] is not None and scaler.is_enabled():
+                    scaler.load_state_dict(trainer_state["scaler_state_dict"])
+
+                # 4. Restore loop counters
+                saved_epoch = trainer_state.get("epoch", 0)
+                start_epoch = saved_epoch + 1
+                global_step = trainer_state.get("global_step", 0)
+                best_macro_f1 = trainer_state.get("best_macro_f1", -1.0)
+                patience_counter = trainer_state.get("patience_counter", 0)
+
+                # 5. Restore RNG states if present
+                if "rng_state" in trainer_state:
+                    try:
+                        rng = trainer_state["rng_state"]
+                        random.setstate(rng["python"])
+                        np.random.set_state(rng["numpy"])
+                        torch.set_rng_state(rng["torch"])
+                        if torch.cuda.is_available() and rng.get("cuda") is not None:
+                            torch.cuda.set_rng_state_all(rng["cuda"])
+                    except Exception:
+                        pass
+
+                if is_main_process:
+                    print(f"Successfully restored training continuity!")
+                    print(f"  Resuming at Epoch   : {start_epoch} (Completed: {saved_epoch}/{epochs})")
+                    print(f"  Current Global Step : {global_step}/{total_training_steps}")
+                    print(f"  Best Prior Macro F1 : {best_macro_f1 * 100:.2f}%")
+                    print(f"  Current LR          : {scheduler.get_last_lr()[0]:.2e}")
+            except Exception as e:
+                if is_main_process:
+                    print(f"Warning: Could not fully restore trainer_state.pt: {e}. Proceeding with resumed model weights only.")
+
+    if start_epoch > epochs:
+        if is_main_process:
+            print(f"\nNotice: Checkpoint has already completed epoch {start_epoch - 1} of {epochs}.")
+            print(f"To train further, specify a higher --epochs value (e.g. --epochs {start_epoch}).")
+
+    for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -521,6 +716,41 @@ def main():
 
                 if args.empty_cache_freq > 0 and global_step % args.empty_cache_freq == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+                # Periodic mid-epoch rolling checkpoint save
+                if save_steps > 0 and global_step % save_steps == 0:
+                    step_dir = output_dir / f"checkpoint-{global_step}"
+                    save_training_checkpoint(
+                        save_dir=step_dir,
+                        model=model,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        epoch=epoch,
+                        global_step=global_step,
+                        best_macro_f1=best_macro_f1,
+                        patience_counter=patience_counter,
+                        tag_to_id=tag_to_id,
+                        id_to_tag=id_to_tag,
+                        is_main_process=is_main_process
+                    )
+                    save_training_checkpoint(
+                        save_dir=output_dir / "latest_checkpoint",
+                        model=model,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        epoch=epoch,
+                        global_step=global_step,
+                        best_macro_f1=best_macro_f1,
+                        patience_counter=patience_counter,
+                        tag_to_id=tag_to_id,
+                        id_to_tag=id_to_tag,
+                        is_main_process=is_main_process
+                    )
+                    prune_checkpoints(output_dir, save_total_limit, is_main_process=is_main_process)
 
                 if is_main_process and hasattr(pbar, "set_postfix"):
                     pbar.set_postfix({
@@ -574,18 +804,56 @@ def main():
 
             print(f"\n[Epoch {epoch} Evaluation (Gold Test Set)] Val Loss: {avg_val_loss:.4f} | Macro F1: {current_macro_f1 * 100:.2f}% | Precision: {metrics['precision'] * 100:.2f}% | Recall: {metrics['recall'] * 100:.2f}%")
 
-            if current_macro_f1 > best_macro_f1:
+            is_best = current_macro_f1 > best_macro_f1
+            if is_best:
                 best_macro_f1 = current_macro_f1
                 patience_counter = 0
                 print(f"  --> New best model checkpoint! Saving to '{output_dir}'...")
-                save_model = model.module if hasattr(model, "module") else model
-                save_model.save_pretrained(output_dir)
-                tokenizer.save_pretrained(output_dir)
+                save_training_checkpoint(
+                    save_dir=output_dir,
+                    model=model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_macro_f1=best_macro_f1,
+                    patience_counter=patience_counter,
+                    tag_to_id=tag_to_id,
+                    id_to_tag=id_to_tag,
+                    is_main_process=is_main_process
+                )
             else:
                 patience_counter += 1
                 if patience_counter >= max_patience and not args.dry_run:
                     print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
                     stop_training = True
+
+            # Always save latest_checkpoint at end of epoch
+            save_training_checkpoint(
+                save_dir=output_dir / "latest_checkpoint",
+                model=model,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_macro_f1=best_macro_f1,
+                patience_counter=patience_counter,
+                tag_to_id=tag_to_id,
+                id_to_tag=id_to_tag,
+                is_main_process=is_main_process
+            )
+
+            # Auto-sync to Hugging Face Hub at end of each epoch if push_to_hub is active
+            if args.push_to_hub and args.hub_model_id:
+                push_checkpoint_to_hub(
+                    repo_id=args.hub_model_id,
+                    folder_path=output_dir,
+                    commit_message=f"Epoch {epoch}/{epochs} - Macro F1: {current_macro_f1 * 100:.2f}% (Best: {best_macro_f1 * 100:.2f}%)"
+                )
 
         if is_distributed:
             stop_tensor = torch.tensor(1 if stop_training else 0, device=device)
@@ -601,22 +869,13 @@ def main():
     if is_main_process:
         print(f"\nTraining completed! Best Validation Macro F1: {best_macro_f1 * 100:.2f}%")
 
-        # Push to Hugging Face Hub if requested
+        # Final push to Hugging Face Hub if requested
         if args.push_to_hub and args.hub_model_id:
-            try:
-                from huggingface_hub import HfApi
-                print(f"\nPushing best model checkpoint to Hugging Face Hub: '{args.hub_model_id}'...")
-                api = HfApi()
-                api.create_repo(repo_id=args.hub_model_id, repo_type="model", exist_ok=True)
-                api.upload_folder(
-                    folder_path=str(output_dir),
-                    repo_id=args.hub_model_id,
-                    repo_type="model",
-                    commit_message=f"Fine-tuned mmBERT on Vietnamese Exam Sequence Labelling (Macro F1: {best_macro_f1 * 100:.2f}%)"
-                )
-                print(f"Model successfully published to: https://huggingface.co/{args.hub_model_id}")
-            except Exception as e:
-                print(f"Warning: Failed to push model to Hugging Face Hub: {e}")
+            push_checkpoint_to_hub(
+                repo_id=args.hub_model_id,
+                folder_path=output_dir,
+                commit_message=f"Final mmBERT on Vietnamese Exam Sequence Labelling (Macro F1: {best_macro_f1 * 100:.2f}%)"
+            )
 
     if is_distributed:
         torch.distributed.destroy_process_group()
