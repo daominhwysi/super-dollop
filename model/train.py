@@ -10,6 +10,9 @@ import os
 import sys
 from pathlib import Path
 
+# Configure PyTorch memory allocator to avoid fragmentation on T4 / constrained GPUs
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Ensure repository root is in sys.path regardless of execution entrypoint
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_DIR) not in sys.path:
@@ -76,6 +79,13 @@ def parse_args():
     parser.add_argument("--push-to-hub", "--push_to_hub", action="store_true", default=False, help="Push best model to Hugging Face Hub after training")
     parser.add_argument("--hub-model-id", "--hub_model_id", type=str, default=None, help="Hugging Face model repository ID")
     
+    # Hardware precision & Mixed Precision (AMP)
+    parser.add_argument("--fp16", action="store_true", default=None, help="Enable FP16 mixed precision training (recommended for NVIDIA T4/V100 GPUs)")
+    parser.add_argument("--bf16", action="store_true", default=None, help="Enable BF16 mixed precision training (for Ampere+ GPUs)")
+    parser.add_argument("--no-amp", "--no_amp", action="store_true", default=False, help="Disable Automatic Mixed Precision (run in full FP32)")
+    parser.add_argument("--max-length", "--max_length", "--max-seq-length", type=int, default=None, help="Maximum token sequence length (defaults to 2048)")
+    parser.add_argument("--empty-cache-freq", "--empty_cache_freq", type=int, default=0, help="Periodically empty CUDA cache every N steps (0 to disable)")
+
     # General
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--dry-run", action="store_true", help="Run quick 5-step test without full training")
@@ -168,6 +178,46 @@ def main():
     label_smoothing = args.label_smoothing if args.label_smoothing is not None else float(head_cfg.get("label_smoothing", 0.0))
     seed = args.seed or int(data_cfg.get("seed", 42))
 
+    # Determine Mixed Precision (AMP)
+    if args.no_amp:
+        use_amp = False
+        amp_dtype = torch.float32
+        precision_str = "FP32 (AMP disabled)"
+    elif args.fp16 is True:
+        use_amp = True
+        amp_dtype = torch.float16
+        precision_str = "FP16 (via --fp16)"
+    elif args.bf16 is True:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            use_amp = True
+            amp_dtype = torch.bfloat16
+            precision_str = "BF16 (via --bf16)"
+        else:
+            if is_main_process:
+                print("Notice: BF16 requested but GPU lacks native BF16 support (e.g. NVIDIA T4). Falling back to FP16.")
+            use_amp = True
+            amp_dtype = torch.float16
+            precision_str = "FP16 (fallback from --bf16: GPU lacks native bf16)"
+    else:
+        # Resolve from train_config.yaml
+        cfg_bf16 = bool(train_cfg.get("bf16", False))
+        cfg_fp16 = bool(train_cfg.get("fp16", False))
+        if cfg_bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            use_amp = True
+            amp_dtype = torch.bfloat16
+            precision_str = "BF16 (from config)"
+        elif cfg_fp16 or cfg_bf16:
+            use_amp = True
+            amp_dtype = torch.float16
+            precision_str = "FP16 (from config)" if cfg_fp16 else "FP16 (fallback from config bf16: GPU lacks native bf16)"
+        else:
+            use_amp = False
+            amp_dtype = torch.float32
+            precision_str = "FP32 (config bf16/fp16 both false)"
+
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16 and torch.cuda.is_available()))
+    max_length = args.max_length or 2048
+
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,10 +234,13 @@ def main():
         print(f"  Backbone Model       : {model_name}")
         print(f"  Distributed          : {is_distributed} (World Size: {world_size}, Local Rank: {local_rank})")
         print(f"  Device               : {device}")
+        print(f"  Precision            : {precision_str}")
+        print(f"  GradScaler Enabled   : {scaler.is_enabled()}")
         print(f"  Epochs               : {epochs}")
         print(f"  Backbone LR          : {lr}")
         print(f"  Head LR              : {head_lr}")
         print(f"  Batch Size           : {batch_size} (effective: {batch_size * grad_accum * world_size})")
+        print(f"  Max Sequence Length  : {max_length}")
         print(f"  Output Dir           : {output_dir}")
         print(f"  Focal Gamma          : {focal_gamma}")
         print(f"  Label Smoothing      : {label_smoothing}")
@@ -257,6 +310,7 @@ def main():
             chunks_file_path=chunks_file,
             tag_to_id=tag_to_id,
             tokenizer=tokenizer,
+            max_length=max_length,
             max_samples=20 if args.dry_run else None
         )
         if is_main_process:
@@ -265,6 +319,7 @@ def main():
             chunks_file_path=val_chunks_file,
             tag_to_id=tag_to_id,
             tokenizer=tokenizer,
+            max_length=max_length,
             max_samples=20 if args.dry_run else None
         )
         if is_main_process:
@@ -274,6 +329,7 @@ def main():
             chunks_file_path=chunks_file,
             tag_to_id=tag_to_id,
             tokenizer=tokenizer,
+            max_length=max_length,
             max_samples=20 if args.dry_run else None
         )
         val_ratio = float(data_cfg.get("val_ratio", 0.0))
@@ -417,10 +473,6 @@ def main():
     else:
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
 
-    use_amp = bool(train_cfg.get("bf16", False)) or bool(train_cfg.get("fp16", False))
-    amp_dtype = torch.bfloat16 if train_cfg.get("bf16", False) and torch.cuda.is_bf16_supported() else torch.float16
-    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16 and torch.cuda.is_available()))
-
     # 7. Training & Evaluation Loop
     best_macro_f1 = -1.0
     global_step = 0
@@ -467,6 +519,9 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
+                if args.empty_cache_freq > 0 and global_step % args.empty_cache_freq == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 if is_main_process and hasattr(pbar, "set_postfix"):
                     pbar.set_postfix({
                         "loss": f"{loss.item() * grad_accum:.4f}",
@@ -490,7 +545,12 @@ def main():
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                if use_amp and device.type == "cuda":
+                    with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                else:
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
                 val_loss += outputs.loss.item()
 
                 preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
@@ -506,6 +566,7 @@ def main():
                     all_preds.append(seq_pred)
                     all_labels.append(seq_lbl)
 
+        stop_training = False
         if is_main_process:
             avg_val_loss = val_loss / max(1, len(val_loader))
             metrics = compute_entity_metrics(all_preds, all_labels)
@@ -524,7 +585,15 @@ def main():
                 patience_counter += 1
                 if patience_counter >= max_patience and not args.dry_run:
                     print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
-                    break
+                    stop_training = True
+
+        if is_distributed:
+            stop_tensor = torch.tensor(1 if stop_training else 0, device=device)
+            torch.distributed.broadcast(stop_tensor, src=0)
+            stop_training = bool(stop_tensor.item() == 1)
+
+        if stop_training:
+            break
 
         if args.dry_run:
             break

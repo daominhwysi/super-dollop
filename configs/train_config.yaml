@@ -68,8 +68,8 @@ training:
   max_grad_norm: 1.0                     # Gradient clipping threshold
   
   # Precision & Accelerator Settings
-  bf16: true                             # Enable bfloat16 mixed precision (auto-fallback to fp16)
-  fp16: false
+  bf16: false                            # bfloat16 mixed precision (only on Ampere+ e.g. A100/H100)
+  fp16: true                             # Enable fp16 mixed precision with GradScaler (recommended for NVIDIA T4/V100)
   dataloader_num_workers: 4
   dataloader_pin_memory: true
   
