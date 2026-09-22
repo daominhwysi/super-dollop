@@ -6,9 +6,14 @@ Packages trained mmBERT checkpoints and exports to ONNX with dynamic batch and s
 
 import os
 import sys
+from pathlib import Path
+
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR))
+
 import json
 import argparse
-from pathlib import Path
 from typing import Dict, Any, Tuple
 
 import torch

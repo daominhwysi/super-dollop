@@ -2,23 +2,31 @@
 """
 Full Fine-Tuning Trainer for Vietnamese Sequence Labelling.
 Optimized for jhu-clsp/mmBERT-base (280M parameters, 8192 context window) with
-Multi-Scale Sliding Windows, Focal Loss, and seqeval entity metrics.
+Multi-Scale Sliding Windows, Focal Loss, Distributed Training (DDP/torchrun),
+and Hugging Face Hub integration.
 """
 
 import os
 import sys
+from pathlib import Path
+
+# Ensure repository root is in sys.path regardless of execution entrypoint
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR))
+
 import json
 import yaml
 import math
 import random
 import argparse
-from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     AutoTokenizer,
     AutoConfig,
@@ -35,17 +43,43 @@ from model.module.dataset import get_tag_mappings, MultiWindowBIODataset, Online
 def parse_args():
     parser = argparse.ArgumentParser(description="Train mmBERT-base for Vietnamese Sequence Labelling.")
     parser.add_argument("--config", type=str, default="configs/train_config.yaml", help="Path to training config YAML (default: configs/train_config.yaml)")
-    parser.add_argument("--model-name", type=str, default=None, help="Hugging Face model backbone")
-    parser.add_argument("--data-dir", type=str, default=None, help="Directory containing training dataset")
-    parser.add_argument("--output-dir", type=str, default=None, help="Directory to save checkpoints")
+    
+    # Model configuration
+    parser.add_argument("--model-name", "--model_name", type=str, default=None, help="Hugging Face model backbone")
+    parser.add_argument("--output-dir", "--output_dir", type=str, default=None, help="Directory to save checkpoints")
+    parser.add_argument("--enhanced-head", "--enhanced_head", action="store_true", default=True, help="Enable enhanced head with multi-sample dropout and layer pooling")
+    parser.add_argument("--no-lora", "--no_lora", action="store_true", default=False, help="Full fine-tuning without LoRA")
+    parser.add_argument("--focal-gamma", "--focal_gamma", type=float, default=None, help="Focal loss gamma parameter")
+    parser.add_argument("--label-smoothing", "--label_smoothing", type=float, default=None, help="Label smoothing rate")
+    
+    # Dataset options
+    parser.add_argument("--dataset-repo-id", "--dataset_repo_id", type=str, default=None, help="Hugging Face dataset repo ID (e.g. daominhwysi/synthetic-seq-labelling-vi-exam-v2)")
+    parser.add_argument("--data-dir", "--data_dir", type=str, default=None, help="Directory containing training dataset")
+    parser.add_argument("--val-file", "--val_file", type=str, default=None, help="Path to evaluation/validation chunks JSONL file (e.g. data/training_dataset/test_bio_chunks.jsonl)")
+    
+    # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Backbone learning rate")
-    parser.add_argument("--head-lr", type=float, default=None, help="Classifier head learning rate")
-    parser.add_argument("--batch-size", type=int, default=None, help="Per-device batch size")
-    parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps")
+    parser.add_argument("--head-lr", "--head_lr", type=float, default=None, help="Classifier head learning rate")
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=None, help="Per-device train batch size")
+    parser.add_argument("--eval-batch-size", "--eval_batch_size", type=int, default=None, help="Per-device eval batch size")
+    parser.add_argument("--gradient-accumulation-steps", "--gradient_accumulation_steps", "--grad-accum", type=int, default=None, help="Gradient accumulation steps")
+    parser.add_argument("--gradient-checkpointing", "--gradient_checkpointing", action="store_true", default=False, help="Enable gradient checkpointing to save GPU memory")
+    parser.add_argument("--weight-decay", "--weight_decay", type=float, default=None, help="Weight decay")
+    parser.add_argument("--lr-scheduler-type", "--lr_scheduler_type", type=str, default=None, help="Learning rate scheduler type (cosine or linear)")
+    parser.add_argument("--warmup-ratio", "--warmup_ratio", type=float, default=None, help="Warmup ratio")
+    parser.add_argument("--logs-per-epoch", "--logs_per_epoch", type=int, default=None, help="Number of progress logs per epoch")
+    parser.add_argument("--dataloader-num-workers", "--dataloader_num_workers", type=int, default=None, help="Dataloader num workers")
+    
+    # Checkpoint and Hub options
+    parser.add_argument("--resume-from-checkpoint", "--resume_from_checkpoint", type=str, default=None, help="Resume training from checkpoint ('auto' or directory path)")
+    parser.add_argument("--push-to-hub", "--push_to_hub", action="store_true", default=False, help="Push best model to Hugging Face Hub after training")
+    parser.add_argument("--hub-model-id", "--hub_model_id", type=str, default=None, help="Hugging Face model repository ID")
+    
+    # General
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--val-file", type=str, default=None, help="Path to evaluation/validation chunks JSONL file (e.g. data/training_dataset/test_bio_chunks.jsonl)")
     parser.add_argument("--dry-run", action="store_true", help="Run quick 5-step test without full training")
+    
     return parser.parse_args()
 
 
@@ -67,7 +101,6 @@ def compute_entity_metrics(
             "micro_f1": float(micro_f1)
         }
     except ImportError:
-        # Simple token-level fallback if seqeval not installed
         correct = 0
         total = 0
         for p_seq, l_seq in zip(all_preds, all_labels):
@@ -83,14 +116,37 @@ def compute_entity_metrics(
 def main():
     args = parse_args()
     
+    # Distributed Training Initialization (DDP / torchrun)
+    is_distributed = "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+    if is_distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group(backend="nccl")
+        device = torch.device("cuda", local_rank)
+    else:
+        local_rank = 0
+        world_size = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    is_main_process = (local_rank == 0)
+
     # 1. Load Configuration
     cfg_path = Path(args.config)
-    if not cfg_path.exists() and Path("train_config.yaml").exists():
+    if not cfg_path.exists() and (WORKSPACE_DIR / "configs" / "train_config.yaml").exists():
+        cfg_path = WORKSPACE_DIR / "configs" / "train_config.yaml"
+    elif not cfg_path.exists() and Path("train_config.yaml").exists():
         cfg_path = Path("train_config.yaml")
+
     cfg = {}
     if cfg_path.exists():
-        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-        print(f"Loaded training config from '{cfg_path}'.")
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            if is_main_process:
+                print(f"Loaded training config from '{cfg_path}'.")
+        except Exception as e:
+            if is_main_process:
+                print(f"Warning: Could not parse config '{cfg_path}': {e}")
 
     model_cfg = cfg.get("model", {})
     head_cfg = cfg.get("head", {})
@@ -103,73 +159,116 @@ def main():
     lr = args.lr or float(train_cfg.get("learning_rate", 2.5e-5))
     head_lr = args.head_lr or float(train_cfg.get("head_learning_rate", 5.0e-5))
     batch_size = args.batch_size or int(train_cfg.get("per_device_train_batch_size", 4))
-    grad_accum = args.grad_accum or int(train_cfg.get("gradient_accumulation_steps", 4))
+    eval_batch_size = args.eval_batch_size or int(train_cfg.get("per_device_eval_batch_size", 4))
+    grad_accum = args.gradient_accumulation_steps or int(train_cfg.get("gradient_accumulation_steps", 4))
+    weight_decay = args.weight_decay or float(train_cfg.get("weight_decay", 0.01))
+    scheduler_type = args.lr_scheduler_type or train_cfg.get("lr_scheduler_type", "cosine")
+    warmup_ratio = args.warmup_ratio or float(train_cfg.get("warmup_ratio", 0.10))
+    focal_gamma = args.focal_gamma if args.focal_gamma is not None else float(head_cfg.get("focal_gamma", 1.5))
+    label_smoothing = args.label_smoothing if args.label_smoothing is not None else float(head_cfg.get("label_smoothing", 0.0))
     seed = args.seed or int(data_cfg.get("seed", 42))
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set seeds
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(seed + local_rank)
+    np.random.seed(seed + local_rank)
+    torch.manual_seed(seed + local_rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed + local_rank)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n============================================================")
-    print(f"Starting mmBERT Sequence Labelling Full Fine-Tuning (NO LoRA)")
-    print(f"  Backbone Model  : {model_name}")
-    print(f"  Device          : {device}")
-    print(f"  Epochs          : {epochs}")
-    print(f"  Backbone LR     : {lr}")
-    print(f"  Head LR         : {head_lr}")
-    print(f"  Batch Size      : {batch_size} (effective: {batch_size * grad_accum})")
-    print(f"  Output Dir      : {output_dir}")
-    print(f"============================================================\n")
+    if is_main_process:
+        print(f"\n============================================================")
+        print(f"Starting mmBERT Sequence Labelling Full Fine-Tuning")
+        print(f"  Backbone Model       : {model_name}")
+        print(f"  Distributed          : {is_distributed} (World Size: {world_size}, Local Rank: {local_rank})")
+        print(f"  Device               : {device}")
+        print(f"  Epochs               : {epochs}")
+        print(f"  Backbone LR          : {lr}")
+        print(f"  Head LR              : {head_lr}")
+        print(f"  Batch Size           : {batch_size} (effective: {batch_size * grad_accum * world_size})")
+        print(f"  Output Dir           : {output_dir}")
+        print(f"  Focal Gamma          : {focal_gamma}")
+        print(f"  Label Smoothing      : {label_smoothing}")
+        print(f"============================================================\n")
 
     # 2. Setup Tokenizer and Tag Mappings
     tag_to_id, id_to_tag = get_tag_mappings()
     num_labels = len(tag_to_id)
 
-    # Save label mapping to output dir
-    label_map_file = output_dir / "label_mapping.json"
-    with open(label_map_file, "w", encoding="utf-8") as f:
-        json.dump({"tag_to_id": tag_to_id, "id_to_tag": id_to_tag}, f, indent=2)
+    if is_main_process:
+        label_map_file = output_dir / "label_mapping.json"
+        with open(label_map_file, "w", encoding="utf-8") as f:
+            json.dump({"tag_to_id": tag_to_id, "id_to_tag": id_to_tag}, f, indent=2)
 
-    print(f"Loading tokenizer '{model_name}'...")
+    if is_main_process:
+        print(f"Loading tokenizer '{model_name}'...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     latex_placeholder = model_cfg.get("latex_placeholder", "[LATEX]")
     special_tokens = ["<blank />", "<blank/>", "[BLANK]"]
     if latex_placeholder:
         special_tokens.append(latex_placeholder)
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
-    tokenizer.save_pretrained(output_dir)
+    
+    if is_main_process:
+        tokenizer.save_pretrained(output_dir)
 
-    # 3. Load Dataset
-    chunks_file = Path(data_cfg.get("bio_chunks_file", "data/training_dataset/train_bio_chunks.jsonl"))
+    # 3. Resolve Dataset Files (Local or Hugging Face Hub)
+    if args.dataset_repo_id:
+        from huggingface_hub import hf_hub_download
+        if is_main_process:
+            print(f"Downloading dataset from Hugging Face repository: '{args.dataset_repo_id}'...")
+        chunks_file = Path(hf_hub_download(
+            repo_id=args.dataset_repo_id,
+            filename="train_bio_chunks.jsonl",
+            repo_type="dataset"
+        ))
+        val_chunks_file = Path(hf_hub_download(
+            repo_id=args.dataset_repo_id,
+            filename="test_bio_chunks.jsonl",
+            repo_type="dataset"
+        ))
+    else:
+        chunks_path = args.data_dir or data_cfg.get("bio_chunks_file", "data/training_dataset/train_bio_chunks.jsonl")
+        chunks_file = Path(chunks_path)
+        if not chunks_file.is_absolute():
+            chunks_file = WORKSPACE_DIR / chunks_file
+
+        val_chunks_path = args.val_file or data_cfg.get("val_bio_chunks_file")
+        if val_chunks_path:
+            val_chunks_file = Path(val_chunks_path)
+            if not val_chunks_file.is_absolute():
+                val_chunks_file = WORKSPACE_DIR / val_chunks_file
+        else:
+            val_chunks_file = None
+
     if not chunks_file.exists():
-        print(f"Error: BIO chunks file '{chunks_file}' does not exist. Run 'tools/build_training_dataset.py' first.")
+        if is_main_process:
+            print(f"Error: BIO chunks file '{chunks_file}' does not exist.")
+            print("Please pass --dataset_repo_id or run 'tools/build_training_dataset.py' first.")
         sys.exit(1)
 
-    val_chunks_path = args.val_file or data_cfg.get("val_bio_chunks_file")
-    val_chunks_file = Path(val_chunks_path) if val_chunks_path else None
-
+    # 4. Load Datasets
     if val_chunks_file and val_chunks_file.exists():
-        print(f"Loading 100% of training chunks from '{chunks_file.name}' for model training...")
+        if is_main_process:
+            print(f"Loading 100% of training chunks from '{chunks_file.name}' for training...")
         train_dataset = MultiWindowBIODataset(
             chunks_file_path=chunks_file,
             tag_to_id=tag_to_id,
             tokenizer=tokenizer,
             max_samples=20 if args.dry_run else None
         )
-        print(f"Loading Gold Benchmark test/validation chunks from '{val_chunks_file.name}'...")
+        if is_main_process:
+            print(f"Loading evaluation chunks from Gold Benchmark test set '{val_chunks_file.name}'...")
         val_dataset = MultiWindowBIODataset(
             chunks_file_path=val_chunks_file,
             tag_to_id=tag_to_id,
             tokenizer=tokenizer,
             max_samples=20 if args.dry_run else None
         )
-        print(f"Dataset configuration: {len(train_dataset)} training chunks (100%), {len(val_dataset)} validation chunks from Gold Benchmark.")
+        if is_main_process:
+            print(f"Dataset split: {len(train_dataset)} training chunks (100%), {len(val_dataset)} validation chunks (Gold Benchmark).")
     else:
         full_dataset = MultiWindowBIODataset(
             chunks_file_path=chunks_file,
@@ -177,16 +276,18 @@ def main():
             tokenizer=tokenizer,
             max_samples=20 if args.dry_run else None
         )
-        val_ratio = float(data_cfg.get("val_ratio", 0.10))
+        val_ratio = float(data_cfg.get("val_ratio", 0.0))
         if val_ratio > 0.0:
             n_val = max(1, int(len(full_dataset) * val_ratio))
             n_train = len(full_dataset) - n_val
             train_dataset, val_dataset = random_split(full_dataset, [n_train, n_val])
-            print(f"Dataset split (random holdout): {n_train} training chunks, {n_val} validation chunks.")
+            if is_main_process:
+                print(f"Dataset split: {n_train} training chunks, {n_val} validation chunks.")
         else:
             train_dataset = full_dataset
             val_dataset = full_dataset
-            print(f"Notice: val_ratio is 0.0 and no separate val_bio_chunks_file found; validating on training set.")
+            if is_main_process:
+                print(f"Notice: Validating on training set ({len(train_dataset)} chunks).")
 
     def collate_fn(batch):
         input_ids = [b["input_ids"] for b in batch]
@@ -204,24 +305,38 @@ def main():
             "labels": padded_labels
         }
 
+    # Distributed or standard samplers
+    if is_distributed:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True, seed=seed)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+    else:
+        train_sampler = None
+        val_sampler = None
+
+    workers = int(args.dataloader_num_workers if args.dataloader_num_workers is not None else train_cfg.get("dataloader_num_workers", 2))
+    if os.name == "nt":
+        workers = 0
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=collate_fn,
-        num_workers=0 if os.name == "nt" else int(train_cfg.get("dataloader_num_workers", 2)),
+        num_workers=workers,
         pin_memory=torch.cuda.is_available()
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=eval_batch_size,
         shuffle=False,
+        sampler=val_sampler,
         collate_fn=collate_fn,
-        num_workers=0 if os.name == "nt" else int(train_cfg.get("dataloader_num_workers", 2))
+        num_workers=workers
     )
 
-    # 4. Initialize Enhanced Model
+    # 5. Initialize Model
     config = AutoConfig.from_pretrained(
         model_name,
         num_labels=num_labels,
@@ -233,30 +348,62 @@ def main():
     base_model = AutoModel.from_pretrained(model_name, config=config)
     base_model.resize_token_embeddings(len(tokenizer))
 
+    if args.gradient_checkpointing and hasattr(base_model, "gradient_checkpointing_enable"):
+        base_model.gradient_checkpointing_enable()
+        if is_main_process:
+            print("Gradient checkpointing enabled.")
+
     model = EnhancedBertForTokenClassification(
         config=config,
         base_model=base_model,
         num_layers_to_fuse=int(head_cfg.get("layers_to_pool", 4)),
-        focal_gamma=float(head_cfg.get("focal_gamma", 1.5)),
-        label_smoothing=float(head_cfg.get("label_smoothing", 0.0))
+        focal_gamma=focal_gamma,
+        label_smoothing=label_smoothing
     ).to(device)
 
-    # 5. Differential Optimizer (Backbone vs Head)
+    # Checkpoint resume support
+    if args.resume_from_checkpoint:
+        resume_dir = output_dir if args.resume_from_checkpoint == "auto" else Path(args.resume_from_checkpoint)
+        weights_file = resume_dir / "model.safetensors"
+        bin_file = resume_dir / "pytorch_model.bin"
+        if weights_file.exists():
+            from safetensors.torch import load_file
+            if is_main_process:
+                print(f"Resuming weights from {weights_file}...")
+            state_dict = load_file(weights_file, device=str(device))
+            model.load_state_dict(state_dict, strict=False)
+        elif bin_file.exists():
+            if is_main_process:
+                print(f"Resuming weights from {bin_file}...")
+            state_dict = torch.load(bin_file, map_location=device)
+            model.load_state_dict(state_dict, strict=False)
+
+    # Wrap model with DistributedDataParallel if running multi-GPU
+    if is_distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True
+        )
+
+    # 6. Optimizer & Scheduler
+    raw_model = model.module if hasattr(model, "module") else model
     no_decay = ["bias", "LayerNorm.weight", "layer_weights"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.base_model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": float(train_cfg.get("weight_decay", 0.01)),
+            "params": [p for n, p in raw_model.base_model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": weight_decay,
             "lr": lr
         },
         {
-            "params": [p for n, p in model.base_model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in raw_model.base_model.named_parameters() if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
             "lr": lr
         },
         {
-            "params": [p for n, p in model.head.named_parameters()],
-            "weight_decay": float(train_cfg.get("weight_decay", 0.01)),
+            "params": [p for n, p in raw_model.head.named_parameters()],
+            "weight_decay": weight_decay,
             "lr": head_lr
         }
     ]
@@ -264,23 +411,29 @@ def main():
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, eps=1e-6)
 
     total_training_steps = (len(train_loader) // grad_accum) * epochs
-    warmup_steps = int(total_training_steps * float(train_cfg.get("warmup_ratio", 0.10)))
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
+    warmup_steps = int(total_training_steps * warmup_ratio)
+    if scheduler_type == "linear":
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
+    else:
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
 
     use_amp = bool(train_cfg.get("bf16", False)) or bool(train_cfg.get("fp16", False))
     amp_dtype = torch.bfloat16 if train_cfg.get("bf16", False) and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16 and torch.cuda.is_available()))
 
-    # 6. Training & Evaluation Loop
+    # 7. Training & Evaluation Loop
     best_macro_f1 = -1.0
     global_step = 0
     patience_counter = 0
     max_patience = int(train_cfg.get("early_stopping_patience", 3))
 
     for epoch in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         model.train()
         train_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") if is_main_process else train_loader
 
         optimizer.zero_grad()
         for step, batch in enumerate(pbar):
@@ -314,13 +467,15 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
-                pbar.set_postfix({
-                    "loss": f"{loss.item() * grad_accum:.4f}",
-                    "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-                })
+                if is_main_process and hasattr(pbar, "set_postfix"):
+                    pbar.set_postfix({
+                        "loss": f"{loss.item() * grad_accum:.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}"
+                    })
 
             if args.dry_run and global_step >= 5:
-                print("Dry run test steps completed!")
+                if is_main_process:
+                    print("Dry run test steps completed!")
                 break
 
         # Validation at end of epoch
@@ -351,28 +506,51 @@ def main():
                     all_preds.append(seq_pred)
                     all_labels.append(seq_lbl)
 
-        avg_val_loss = val_loss / max(1, len(val_loader))
-        metrics = compute_entity_metrics(all_preds, all_labels)
-        current_macro_f1 = metrics["macro_f1"]
+        if is_main_process:
+            avg_val_loss = val_loss / max(1, len(val_loader))
+            metrics = compute_entity_metrics(all_preds, all_labels)
+            current_macro_f1 = metrics["macro_f1"]
 
-        print(f"\n[Epoch {epoch} Results] Val Loss: {avg_val_loss:.4f} | Macro F1: {current_macro_f1 * 100:.2f}% | Precision: {metrics['precision'] * 100:.2f}% | Recall: {metrics['recall'] * 100:.2f}%")
+            print(f"\n[Epoch {epoch} Evaluation (Gold Test Set)] Val Loss: {avg_val_loss:.4f} | Macro F1: {current_macro_f1 * 100:.2f}% | Precision: {metrics['precision'] * 100:.2f}% | Recall: {metrics['recall'] * 100:.2f}%")
 
-        if current_macro_f1 > best_macro_f1:
-            best_macro_f1 = current_macro_f1
-            patience_counter = 0
-            print(f"  --> New best model! Saving checkpoint to '{output_dir}'...")
-            model.save_pretrained(output_dir)
-            tokenizer.save_pretrained(output_dir)
-        else:
-            patience_counter += 1
-            if patience_counter >= max_patience and not args.dry_run:
-                print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
-                break
+            if current_macro_f1 > best_macro_f1:
+                best_macro_f1 = current_macro_f1
+                patience_counter = 0
+                print(f"  --> New best model checkpoint! Saving to '{output_dir}'...")
+                save_model = model.module if hasattr(model, "module") else model
+                save_model.save_pretrained(output_dir)
+                tokenizer.save_pretrained(output_dir)
+            else:
+                patience_counter += 1
+                if patience_counter >= max_patience and not args.dry_run:
+                    print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
+                    break
 
         if args.dry_run:
             break
 
-    print(f"\nTraining completed! Best Validation Macro F1: {best_macro_f1 * 100:.2f}%")
+    if is_main_process:
+        print(f"\nTraining completed! Best Validation Macro F1: {best_macro_f1 * 100:.2f}%")
+
+        # Push to Hugging Face Hub if requested
+        if args.push_to_hub and args.hub_model_id:
+            try:
+                from huggingface_hub import HfApi
+                print(f"\nPushing best model checkpoint to Hugging Face Hub: '{args.hub_model_id}'...")
+                api = HfApi()
+                api.create_repo(repo_id=args.hub_model_id, repo_type="model", exist_ok=True)
+                api.upload_folder(
+                    folder_path=str(output_dir),
+                    repo_id=args.hub_model_id,
+                    repo_type="model",
+                    commit_message=f"Fine-tuned mmBERT on Vietnamese Exam Sequence Labelling (Macro F1: {best_macro_f1 * 100:.2f}%)"
+                )
+                print(f"Model successfully published to: https://huggingface.co/{args.hub_model_id}")
+            except Exception as e:
+                print(f"Warning: Failed to push model to Hugging Face Hub: {e}")
+
+    if is_distributed:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

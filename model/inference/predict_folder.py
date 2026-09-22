@@ -7,8 +7,13 @@ inference, and writes predicted XML annotations into an output directory.
 
 import os
 import sys
-import argparse
 from pathlib import Path
+
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR))
+
+import argparse
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer

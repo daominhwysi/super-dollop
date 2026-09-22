@@ -8,10 +8,15 @@ with zero character corruption.
 
 import os
 import sys
+from pathlib import Path
+
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR))
+
 import re
 import json
 import argparse
-from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Union
 
 import torch
