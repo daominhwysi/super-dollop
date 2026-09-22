@@ -19,6 +19,21 @@ dependencies = [
 
 [project.scripts]
 sequence-label = "sequence_labelling.cli:main"
+synthetic-exam-gen = "synthetic_exam_generator.cli:main"
+seqlabel-train = "model.train:main"
+seqlabel-predict = "model.inference.predict:main"
+seqlabel-export = "model.export:main"
+
+[project.optional-dependencies]
+train = [
+  "torch>=2.0.0",
+  "transformers>=4.40.0",
+  "seqeval>=1.2.2",
+  "accelerate>=0.28.0"
+]
+
+[tool.setuptools.packages.find]
+include = ["sequence_labelling*", "synthetic_exam_generator*", "model*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

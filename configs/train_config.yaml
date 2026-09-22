@@ -1,0 +1,93 @@
+# ==============================================================================
+# VIETNAMESE SEQUENCE LABELLING v2 - TRAINING CONFIGURATION
+# ==============================================================================
+# Fine-tuning configuration for jhu-clsp/mmBERT-base (280M params, 8192 context)
+# Full parameter fine-tuning (no LoRA) with Multi-Scale Sliding Windows & Focal Loss.
+# ==============================================================================
+
+version: "2.0"
+
+# ------------------------------------------------------------------------------
+# 1. Base Model & Architecture
+# ------------------------------------------------------------------------------
+model:
+  name_or_path: "jhu-clsp/mmBERT-base"
+  tokenizer_name: "jhu-clsp/mmBERT-base"
+  max_sequence_length: 8192
+  use_lora: false                        # Full fine-tuning of all 280M parameters (no LoRA)
+  latex_placeholder: "[LATEX]"
+  mask_latex_during_inference: true
+
+# ------------------------------------------------------------------------------
+# 2. Classification Head & Loss Function
+# ------------------------------------------------------------------------------
+head:
+  type: "enhanced"                       # "enhanced" (WeightedLayerPooling + MSD) or "standard"
+  layers_to_pool: 4                      # Softmax weighted pooling across top-4 transformer layers
+  multi_sample_dropout: true
+  dropout_prob: 0.20                     # Base dropout rate
+  dropout_samples: 5                     # Number of parallel dropout masks averaged
+  loss_type: "focal"                     # "focal" or "cross_entropy"
+  focal_gamma: 1.5                       # Focusing parameter for down-weighting easy background 'O' tokens
+  label_smoothing: 0.0                   # 0.0 for crisp BIO token boundaries (v1 Run 4 lesson: non-zero blurs B/I transitions)
+
+# ------------------------------------------------------------------------------
+# 3. Dataset & Sliding Window Contexts
+# ------------------------------------------------------------------------------
+dataset:
+  data_dir: "data/training_dataset"
+  spans_file: "data/training_dataset/train_spans.jsonl"
+  bio_chunks_file: "data/training_dataset/train_bio_chunks.jsonl"
+  val_bio_chunks_file: "data/training_dataset/test_bio_chunks.jsonl"
+  gold_set: "data/benchmark_gold_set.json"
+  val_ratio: 0.0                        # 0.0: No internal train split; 100% of chunks used for training
+  test_ratio: 0.0                       # Test set evaluated via val_bio_chunks_file (the 63 Gold Docs)
+  seed: 42
+  
+  # Multi-scale sliding window configurations (512 to 2048 tokens)
+  sliding_windows:
+    - [512, 128]
+    - [768, 192]
+    - [1024, 256]
+    - [2048, 512]
+
+# ------------------------------------------------------------------------------
+# 4. Optimization & Hyperparameters (Calibrated for mmBERT Full Fine-Tuning)
+# ------------------------------------------------------------------------------
+training:
+  output_dir: "results/mmbert_seqlabel_v2"
+  learning_rate: 2.5e-5                  # Backbone encoder learning rate
+  head_learning_rate: 5.0e-5             # Classifier head learning rate
+  weight_decay: 0.01                     # Weight decay (excluding bias and LayerNorm)
+  per_device_train_batch_size: 4         # Batch size per GPU/device
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4         # Effective batch size = 16
+  num_train_epochs: 4
+  lr_scheduler_type: "cosine"            # Cosine annealing with warmup
+  warmup_ratio: 0.10                     # 10% warmup steps
+  max_grad_norm: 1.0                     # Gradient clipping threshold
+  
+  # Precision & Accelerator Settings
+  bf16: true                             # Enable bfloat16 mixed precision (auto-fallback to fp16)
+  fp16: false
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  
+  # Checkpointing & Validation
+  eval_strategy: "steps"
+  eval_steps: 250                        # Evaluate every 250 optimization steps
+  save_strategy: "steps"
+  save_steps: 250
+  save_total_limit: 2                    # Keep best 2 checkpoints
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_macro_f1"
+  greater_is_better: true
+  early_stopping_patience: 3             # Stop training after 3 evals without improvement
+
+# ------------------------------------------------------------------------------
+# 5. Logging & Tracking
+# ------------------------------------------------------------------------------
+logging:
+  report_to: "none"                      # "none", "wandb", or "tensorboard"
+  wandb_project: "vietnamese-sequence-labelling-v2"
+  logging_steps: 25

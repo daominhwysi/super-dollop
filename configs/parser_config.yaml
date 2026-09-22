@@ -69,8 +69,8 @@ models:
     description: "Reviewer agent for rating sequence labelling XML quality and discarding malfunctioned documents"
 
   editor:
-    model_name: "gpt-5.6-luna"
-    provider: "codex"
+    model_name: "gemini-3.8-flash"
+    provider: "agy"
     thinking: high
     description: "Precision surgical editor agent using Search/Replace diff blocks"
 

@@ -8,6 +8,9 @@ models/
 artifacts/
 *.sqlite
 *.log
+logs/
 backend/logs/
+*.egg-info/
 tests/test_merger/outputs/
 result.md
+results/

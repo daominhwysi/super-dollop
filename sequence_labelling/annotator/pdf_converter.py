@@ -457,11 +457,23 @@ class PDFOCRConverter:
                         }
                     )
 
-                messages = self.few_shot_messages + [{"role": "user", "content": content_parts}]
+                start_ocr_t = time.time()
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                 )
+                duration_ocr_sec = time.time() - start_ocr_t
+                try:
+                    from sequence_labelling.llm.token_tracker import log_response
+                    log_response(
+                        response,
+                        model=self.model,
+                        provider=self.provider,
+                        caller="pdf_vision_ocr",
+                        duration_sec=duration_ocr_sec,
+                    )
+                except Exception:
+                    pass
                 raw_result = response.choices[0].message.content
                 batch_result = prune_think_tags(raw_result)
                 batch_result = normalize_batch_metadata(batch_result, s_idx + 1)

@@ -268,7 +268,7 @@ def main():
         }
 
     # Save to JSON
-    out_json = WORKSPACE_DIR / "backend/logs/artifact/passed_documents_token_det_f1_benchmark.json"
+    out_json = WORKSPACE_DIR / "artifacts" / "passed_documents_token_det_f1_benchmark.json"
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Results saved to {out_json}")

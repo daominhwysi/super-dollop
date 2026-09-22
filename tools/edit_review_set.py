@@ -124,16 +124,20 @@ def load_revision_targets(
         xml_p = r.get("file_path")
         raw_p = r.get("raw_file_path")
 
-        xml_path = Path(xml_p) if xml_p else None
-        if not (xml_path and xml_path.exists()):
-            # Try to resolve relative to annotated_dir
-            for cand in [
-                annotated_dir / f"{doc_id}/merged.xml",
-                annotated_dir / f"{doc_id}.xml",
-            ]:
-                if cand.exists():
-                    xml_path = cand
-                    break
+        # Always prefer canonical source in annotated_dir to prevent branch collisions
+        cand_annot = None
+        for cand in [
+            annotated_dir / f"{doc_id}/merged.xml",
+            annotated_dir / f"{doc_id}.xml",
+        ]:
+            if cand.exists():
+                cand_annot = cand
+                break
+
+        if cand_annot:
+            xml_path = cand_annot
+        else:
+            xml_path = Path(xml_p) if xml_p else None
 
         raw_path = Path(raw_p) if raw_p else None
         if not (raw_path and raw_path.exists()):
@@ -523,10 +527,15 @@ def process_single_revision(
 
     branch_xml_path = branch_dir / rel_xml
     if branch_xml_path.resolve() == xml_path.resolve():
-        raise RuntimeError(
-            f"Branch path {branch_xml_path} matches original path {xml_path}! "
-            "Direct overwriting of original files is strictly prohibited."
-        )
+        # Defensive fallback: if xml_path was somehow resolved into branch_dir, point to canonical annotated_dir
+        cand_in_annot = annotated_dir / rel_xml
+        if cand_in_annot.exists() and cand_in_annot.resolve() != branch_xml_path.resolve():
+            xml_path = cand_in_annot
+        else:
+            raise RuntimeError(
+                f"Branch path {branch_xml_path} matches original path {xml_path}! "
+                "Direct overwriting of original files is strictly prohibited."
+            )
 
     state_path = branch_xml_path.with_name("revision_state.json")
     state: Dict[str, Any] = {

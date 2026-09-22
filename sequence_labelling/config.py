@@ -12,12 +12,19 @@ from dotenv import load_dotenv
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = PROJECT_DIR
 load_dotenv(PROJECT_DIR / ".env")
-CONFIG_FILE = PROJECT_DIR / "config.yaml"
+CONFIG_FILE = PROJECT_DIR / "configs" / "parser_config.yaml"
+if not CONFIG_FILE.exists():
+    if (PROJECT_DIR / "parser_config.yaml").exists():
+        CONFIG_FILE = PROJECT_DIR / "parser_config.yaml"
+    elif (PROJECT_DIR / "config.yaml").exists():
+        CONFIG_FILE = PROJECT_DIR / "config.yaml"
 DATA_DIR = Path(os.environ.get("SEQUENCE_LABEL_DATA_DIR", PROJECT_DIR / "data")).expanduser().resolve()
 MODEL_DIR = Path(os.environ.get("SEQUENCE_LABEL_MODEL_DIR", PROJECT_DIR / "models")).expanduser().resolve()
 ARTIFACTS_DIR = Path(os.environ.get("SEQUENCE_LABEL_ARTIFACTS_DIR", PROJECT_DIR / "artifacts")).expanduser().resolve()
 LOGS_DIR = ARTIFACTS_DIR / "ocr_logs"
 LLM_LOGS_DIR = ARTIFACTS_DIR / "llm_logs"
+TOKEN_USAGE_DIR = ARTIFACTS_DIR / "token_usage"
+TOKEN_USAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 config_data: dict[str, Any] = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
 providers = config_data.get("providers", {})

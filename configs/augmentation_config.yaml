@@ -1,0 +1,167 @@
+# ==============================================================================
+# VIETNAMESE SEQUENCE LABELLING v2 - DATA AUGMENTATION CONFIGURATION
+# ==============================================================================
+# Calibrated configuration for training robust, generalized sequence labelling models
+# (PhoBERT, XLM-RoBERTa, mDeBERTa-v3, Qwen2.5, Llama-3) on Vietnamese examination documents.
+#
+# Grounded in empirical experiments on 488 real documents and 566 synthetic curriculum exams.
+# ==============================================================================
+
+version: "2.0"
+active_profile: "balanced_production"
+
+paths:
+  gold_set: "data/benchmark_gold_set.json"           # Strictly isolated test set (63 docs across 4 tiers)
+  annotated_dir: "data/sequence_labelling_annotated" # Real annotated documents directory
+  synthetic_dir: "data/synthetic_exams"              # Synthetic curriculum exams directory
+  output_dir: "data/training_dataset"                # Destination directory for training formats
+
+# ------------------------------------------------------------------------------
+# 1. CORPUS SIZING & MIXING RATIO
+# ------------------------------------------------------------------------------
+corpus:
+  synthetic_ratio: 0.40              # 40% synthetic, 60% real (optimal Shannon entropy balance)
+  min_real_score: 85.0               # Minimum review quality score for real documents
+  chunk_size: 512                    # Token window size for sliding chunk BIO extraction
+  stride: 128                        # Stride for sliding window
+  sliding_windows:                   # Multi-scale sliding window configurations (512 to 2048)
+    - [512, 128]
+    - [768, 192]
+    - [1024, 256]
+    - [2048, 512]
+  seed: 42                           # Master random seed for sampling and shuffling
+
+# ------------------------------------------------------------------------------
+# 2. REAL DATA AUGMENTATION POLICY
+# ------------------------------------------------------------------------------
+real_data:
+  # Stochastic Paired Whitespace Augmentation
+  # Real exams are 82.6% scanned. To avoid "Noise Compounding" (which causes 18%-72% F1 loss),
+  # keep 100% of real docs pristine, and generate paired whitespace-augmented clones for a subset.
+  whitespace_augmentation:
+    enabled: true
+    paired_variant_prob: 0.25        # 25% of real docs generate a paired augmented twin (100 twins)
+    modes: ["collapse", "jitter", "mixed"]
+    collapse_multispaces_to_single: true
+    expand_single_space_prob: 0.08
+    tab_replacement_prob: 0.30
+    tab_to_space: true               # Normalize tabs to single space in collapse/normalize modes
+    flatten_newlines_prob: 0.30      # 20% probability of flattening all newlines into spaces in augmented twin
+    newline_to_space_prob: 0.30      # 20% soft line-break conversion to space
+    protect_latex_math: true         # Prevent altering spaces inside $...$ and $$...$$
+    protect_markdown_tables: true    # Prevent altering spaces inside table rows (|...|)
+    filter_zero_length_spans: true   # Discard degenerate zero-length spans
+
+  # LaTeX Formula Masking & Delimiter Jitter on Real Data
+  # Applied only to the paired augmented variants (never mutating pristine ground truth).
+  latex_masking:
+    enabled: true
+    mask_prob: 0.05                  # 5% of LaTeX formulas masked with placeholder [LATEX]
+    placeholder: "[LATEX]"           # Placeholder token for masked formulas
+    vary_delimiters_prob: 0.20       # 10% convert $formula$ to \( formula \)
+
+  # Artificial Typo / Noise Injection on Real Data
+  # NEVER inject artificial typos or OCR character swaps into real scanned documents.
+  artificial_noise:
+    enabled: false                   # Strictly false (prevents double-corruption of real OCR)
+    typo_rate: 0.0
+    char_swap_prob: 0.0
+
+# ------------------------------------------------------------------------------
+# 3. SYNTHETIC DATA AUGMENTATION POLICY (ReconstructorConfig)
+# ------------------------------------------------------------------------------
+synthetic_data:
+  # Administrative & School Headers (Untagged background 'O' lines)
+  # Prepend authentic school/department metadata (Sở GD&ĐT, THPT Chuyên, Mã đề, SBD) as label 'O'.
+  administrative_headers:
+    enabled: true
+    probability: 0.50                 # 40% of synthetic exams include an administrative header
+
+  # A. Layout & Spatial Transformations
+  # Teaches the model to recognize option labels regardless of horizontal vs vertical layout.
+  layout:
+    inline_option_prob: 0.35          # 35% horizontal inline options (A. ... B. ... C. ...)
+    grid_2x2_prob: 0.20               # 20% 2x2 grid layout (A, B \n C, D)
+    same_line_stem_options_prob: 0.10 # 10% option A starts immediately after stem on same line
+    collapse_whitespace_prob: 0.15    # 15% collapsing multiple spaces/tabs into a single space
+    flatten_newlines_prob: 0.20       # 20% flattening all newlines into spaces across exam
+    separator_options: "\n"           # Default option separator when not inline
+    separator_stem_options: "\n"      # Default stem-to-options separator
+    separator_questions: "\n\n"       # Inter-question separator
+    min_inline_spaces: 1
+    max_inline_spaces: 20
+    min_inline_tabs: 1
+    max_inline_tabs: 3
+
+  # B. Structural & Pedagogical Diversity
+  # Enforces curriculum variety and AGENTS.md invariant (question labels do not require stems).
+  structure:
+    enable_permutations: true         # 50% option shuffling (A, B, C, D order) to eliminate position bias
+    option_drop_prob: 0.03            # 3% 3-choice questions (rare exam formats)
+    stemless_cloze_prob: 0.05         # 5% pure stemless questions (<question_label> -> <option_label>)
+    cloze_blank_randomization: true   # Randomize <blank/> into ____, ....., or [blank]
+
+    # Barem / Explanation Architecture Distribution
+    barem_distribution:
+      prob_inline_barem: 0.35         # 35% explanation immediately follows each question
+      prob_answer_grid: 0.15          # 15% tabular answer grid at end of exam
+      prob_table_barem: 0.10          # 10% markdown table barem
+      prob_no_barem: 0.40             # 40% raw clean exam with no explanations (unseen exam simulation)
+
+  # C. Surface OCR & Typographical Perturbations (Synthetic Text Only)
+  # Simulates realistic Vietnamese OCR errors and Telex typing slips.
+  noise:
+    typo_rate: 0.015                  # 1.5% word-level Vietnamese typo rate
+    typo_types:
+      tone_strip: 0.40                # Stripping diacritical tone marks (à -> a, ề -> ê)
+      telex_residue: 0.25             # Typing residue (s, f, r, x, j, w)
+      char_replace: 0.20              # Keyboard neighbor replacement (qwerty/telex)
+      swap: 0.15                      # Adjacent character swap
+    space_noise_rate: 0.035           # 3.5% space jitter & tabulation noise
+    casing_noise_prob: 0.03           # 3% casing noise on question/option labels (CÂU 1 vs Câu 1)
+    formatting_noise_prob: 0.05       # 5% markdown styling jitter (**Câu 1:** vs Câu 1.)
+    latex_mask_prob: 0.05             # 5% LaTeX formula placeholder / delimiter variation
+    latex_placeholder: "[LATEX]"
+
+# ------------------------------------------------------------------------------
+# 4. NAMED CONFIGURATION PROFILES
+# ------------------------------------------------------------------------------
+profiles:
+  # Balanced Production Profile: Best trade-off of robustness, generalization, and clean precision
+  balanced_production:
+    synthetic_ratio: 0.40
+    real_whitespace_aug_prob: 0.25
+    real_latex_mask_prob: 0.05
+    real_flatten_newlines_prob: 0.20
+    synthetic_flatten_newlines_prob: 0.20
+    synthetic_collapse_whitespace_prob: 0.15
+    inline_option_prob: 0.35
+    grid_2x2_prob: 0.20
+    typo_rate: 0.015
+    space_noise_rate: 0.035
+
+  # Conservative Clean Profile: Minimal noise, strictly pristine real data, standard vertical layout
+  conservative_clean:
+    synthetic_ratio: 0.30
+    real_whitespace_aug_prob: 0.00
+    real_latex_mask_prob: 0.00
+    real_flatten_newlines_prob: 0.00
+    synthetic_flatten_newlines_prob: 0.00
+    synthetic_collapse_whitespace_prob: 0.00
+    inline_option_prob: 0.15
+    grid_2x2_prob: 0.10
+    typo_rate: 0.005
+    space_noise_rate: 0.010
+
+  # Aggressive Stress-Test Profile: High layout variance & noise for adversarial robustness testing
+  aggressive_stress_test:
+    synthetic_ratio: 0.50
+    real_whitespace_aug_prob: 0.40
+    real_latex_mask_prob: 0.15
+    real_flatten_newlines_prob: 0.30
+    synthetic_flatten_newlines_prob: 0.25
+    synthetic_collapse_whitespace_prob: 0.35
+    inline_option_prob: 0.60
+    grid_2x2_prob: 0.35
+    typo_rate: 0.035
+    space_noise_rate: 0.080

@@ -57,7 +57,7 @@ OPENAI_API_KEY=...
 # CMD_API_KEY=...
 ```
 
-Provider endpoints, default models, token budgets, reviewer thresholds, and figure detection are configured in [`config.yaml`](config.yaml). The main data locations can be overridden with:
+Provider endpoints, default models, token budgets, reviewer thresholds, and figure detection are configured in [`configs/parser_config.yaml`](configs/parser_config.yaml). Training configurations reside in [`configs/train_config.yaml`](configs/train_config.yaml) and augmentation settings in [`configs/augmentation_config.yaml`](configs/augmentation_config.yaml). The main data locations can be overridden with:
 
 ```bash
 export SEQUENCE_LABEL_DATA_DIR=/path/to/data
@@ -327,9 +327,9 @@ The Studio save endpoint writes to the selected document path, so use it against
 
 ## Configuration and providers
 
-`config.yaml` defines provider base URLs and default model assignments for OCR, parser/annotation, linker, answer-key mapping, reviewer, editor, figure detection, and chunking.
+`configs/parser_config.yaml` defines provider base URLs and default model assignments for OCR, parser/annotation, linker, answer-key mapping, reviewer, editor, figure detection, and chunking.
 
-The provider adapter in `sequence_labelling/llm/deepseek_client.py` routes requests to configured OpenAI-compatible services, Codex, or the local `agy` adapter. Keep API keys in `.env` or the process environment; never place secrets in `config.yaml` or committed reports.
+The provider adapter in `sequence_labelling/llm/deepseek_client.py` routes requests to configured OpenAI-compatible services, Codex, or the local `agy` adapter. Keep API keys in `.env` or the process environment; never place secrets in `configs/parser_config.yaml` or committed reports.
 
 ## Testing
 
@@ -377,7 +377,7 @@ Rerun the same command. Compatible `revision_state.json` checkpoints and branch 
 
 ### A provider request fails
 
-Check the selected provider in `config.yaml`, the matching environment variable, the model name, and the provider base URL. Start with `--limit 1` or `--doc-id ...` before launching a large batch.
+Check the selected provider in `configs/parser_config.yaml`, the matching environment variable, the model name, and the provider base URL. Start with `--limit 1` or `--doc-id ...` before launching a large batch.
 
 ## Repository rules
 

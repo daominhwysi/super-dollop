@@ -365,6 +365,22 @@ class StreamingLLMLogger:
 
     def finalize(self):
         self.flush(is_final=True)
+        try:
+            from sequence_labelling.llm.token_tracker import log_token_usage
+            tot_tokens = self.total_tokens if self.total_tokens else (self.prompt_tokens + self.completion_tokens)
+            duration = max(0.0, time.time() - self.start_time)
+            log_token_usage(
+                provider=self.provider or "unknown",
+                model=self.model or "unknown",
+                input_tokens=self.prompt_tokens,
+                output_tokens=max(0, self.completion_tokens - self.reasoning_tokens),
+                reasoning_tokens=self.reasoning_tokens,
+                total_tokens=tot_tokens,
+                duration_sec=duration,
+                caller="llm_logger"
+            )
+        except Exception:
+            pass
 
 
 def log_llm_call(
@@ -374,6 +390,7 @@ def log_llm_call(
     provider: str = "",
     duration_sec: float = 0.0,
     request_id: Optional[str] = None,
+    usage: Optional[Any] = None,
 ) -> Path:
     """
     Synchronous/One-shot fallback helper for non-streamed LLM responses.
@@ -389,12 +406,15 @@ def log_llm_call(
     )
 
     output_text, reasoning_content, reasoning_summary = _extract_response_components(response)
-    usage = getattr(response, "usage", None)
+    resp_usage = usage if usage is not None else getattr(response, "usage", None)
+    if resp_usage is None and isinstance(response, dict):
+        resp_usage = response.get("usage")
+
     logger.append_chunk(
         content=output_text,
         reasoning=reasoning_content,
         reasoning_summary=reasoning_summary,
-        usage=usage
+        usage=resp_usage
     )
     logger.finalize()
     return logger.log_file

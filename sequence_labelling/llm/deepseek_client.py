@@ -10,11 +10,7 @@ try:
 except ImportError:
     CODEX_AVAILABLE = False
 
-try:
-    from src.token_tracker import log_response
-except ImportError:
-    def log_response(response, model=""):
-        pass
+from sequence_labelling.llm.token_tracker import log_response, log_token_usage
 
 # Locate .env by searching up directory hierarchy
 current_dir = Path(__file__).resolve().parent
@@ -241,6 +237,7 @@ def chat(
             model=target_model,
             provider=target_provider,
             duration_sec=duration_sec,
+            usage=usage,
         )
         return reply_text
 
