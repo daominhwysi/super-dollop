@@ -37,6 +37,20 @@ def get_tag_mappings(base_tags: Optional[List[str]] = None) -> Tuple[Dict[str, i
     return tag_to_id, id_to_tag
 
 
+def normalize_bio_tag(tag: str) -> str:
+    """
+    Normalizes BIO tags to canonical format:
+    e.g. 'B-QUESTION_LABEL' -> 'B-question_label', 'I-STEM' -> 'I-stem', 'O' -> 'O'.
+    Protects against case mismatches between dataset generation and tag mappings.
+    """
+    if not tag or str(tag).strip().upper() == "O":
+        return "O"
+    tag_str = str(tag).strip()
+    if tag_str.startswith(("B-", "b-", "I-", "i-")):
+        return f"{tag_str[:2].upper()}{tag_str[2:].lower()}"
+    return tag_str.lower()
+
+
 class MultiWindowBIODataset(Dataset):
     """
     Fast, pre-tokenized BIO dataset loader supporting multi-scale sliding window chunks
@@ -77,6 +91,14 @@ class MultiWindowBIODataset(Dataset):
 
         print(f"Loaded {len(self.samples)} multi-scale BIO chunks from '{self.chunks_file_path.name}'.")
 
+    def _lookup_tag_id(self, tag: str) -> int:
+        norm = normalize_bio_tag(tag)
+        if norm in self.tag_to_id:
+            return self.tag_to_id[norm]
+        if tag in self.tag_to_id:
+            return self.tag_to_id[tag]
+        return self.tag_to_id.get("O", 0)
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -90,7 +112,7 @@ class MultiWindowBIODataset(Dataset):
             if bio_tags and isinstance(bio_tags[0], int):
                 label_ids = bio_tags
             else:
-                label_ids = [self.tag_to_id.get(t, self.tag_to_id.get("O", 0)) for t in bio_tags]
+                label_ids = [self._lookup_tag_id(t) for t in bio_tags]
             attention_mask = item.get("attention_mask", [1] * len(input_ids))
         elif self.tokenizer is not None:
             tokenized = self.tokenizer(
@@ -116,7 +138,7 @@ class MultiWindowBIODataset(Dataset):
                     elif word_idx != previous_word_idx:
                         if word_idx < len(bio_tags):
                             tag_str = bio_tags[word_idx]
-                            label_ids.append(self.tag_to_id.get(tag_str, self.tag_to_id.get("O", 0)))
+                            label_ids.append(self._lookup_tag_id(tag_str))
                         else:
                             label_ids.append(self.ignore_label_id)
                     else:
@@ -124,7 +146,7 @@ class MultiWindowBIODataset(Dataset):
                     previous_word_idx = word_idx
             else:
                 label_ids = [
-                    self.tag_to_id.get(bio_tags[min(i, len(bio_tags) - 1)], 0)
+                    self._lookup_tag_id(bio_tags[min(i, len(bio_tags) - 1)])
                     for i in range(len(input_ids))
                 ]
         else:
@@ -274,7 +296,7 @@ class OnlineAugmentedDataset(Dataset):
         offset_mapping = tokenized["offset_mapping"][chunk_idx]
 
         bio_tags = align_spans_to_bio(offset_mapping, spans)
-        labels = [self.tag_to_id.get(t, 0) for t in bio_tags]
+        labels = [self.tag_to_id.get(normalize_bio_tag(t), self.tag_to_id.get(t, 0)) for t in bio_tags]
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),

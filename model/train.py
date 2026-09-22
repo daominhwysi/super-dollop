@@ -753,8 +753,10 @@ def main():
                     prune_checkpoints(output_dir, save_total_limit, is_main_process=is_main_process)
 
                 if is_main_process and hasattr(pbar, "set_postfix"):
+                    step_loss = loss.item() * grad_accum
+                    loss_disp = f"{step_loss:.2e}" if (0 < step_loss < 0.001) else f"{step_loss:.4f}"
                     pbar.set_postfix({
-                        "loss": f"{loss.item() * grad_accum:.4f}",
+                        "loss": loss_disp,
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}"
                     })
 
