@@ -635,7 +635,13 @@ def main():
         elif bin_file.exists():
             if is_main_process:
                 print(f"Resuming model weights from '{bin_file}'...")
-            state_dict = torch.load(bin_file, map_location=device)
+            try:
+                state_dict = torch.load(bin_file, map_location=device, weights_only=True)
+            except Exception:
+                try:
+                    state_dict = torch.load(bin_file, map_location=device, weights_only=False)
+                except TypeError:
+                    state_dict = torch.load(bin_file, map_location=device)
             model.load_state_dict(state_dict, strict=False)
         else:
             if is_main_process:
@@ -693,7 +699,10 @@ def main():
             try:
                 if is_main_process:
                     print(f"Loading full trainer continuity state from '{trainer_state_file}'...")
-                trainer_state = torch.load(trainer_state_file, map_location=device)
+                try:
+                    trainer_state = torch.load(trainer_state_file, map_location=device, weights_only=False)
+                except TypeError:
+                    trainer_state = torch.load(trainer_state_file, map_location=device)
 
                 # 1. Restore optimizer states and tensors
                 if "optimizer_state_dict" in trainer_state:
@@ -747,79 +756,90 @@ def main():
 
     mlflow_client = None
     if is_main_process:
-        try:
-            import mlflow
+        dagshub_config_path = WORKSPACE_DIR / "configs" / "dagshub_config.yaml"
+        dagshub_config = {}
+        if dagshub_config_path.exists():
+            dagshub_config = yaml.safe_load(
+                dagshub_config_path.read_text(encoding="utf-8")
+            ) or {}
+        dagshub_settings = dagshub_config.get("dagshub", {})
 
-            dagshub_config_path = WORKSPACE_DIR / "configs" / "dagshub_config.yaml"
-            dagshub_config = {}
-            if dagshub_config_path.exists():
-                dagshub_config = yaml.safe_load(
-                    dagshub_config_path.read_text(encoding="utf-8")
-                ) or {}
-            dagshub_settings = dagshub_config.get("dagshub", {})
+        report_to = str(logging_cfg.get("report_to", "none")).lower()
+        mlflow_enabled = (
+            report_to == "mlflow"
+            or dagshub_settings.get("enabled", False)
+            or bool(os.getenv("MLFLOW_TRACKING_URI"))
+        )
 
-            if dagshub_settings.get("enabled", False):
-                username_env = dagshub_settings.get(
-                    "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_USERNAME"
-                )
-                password_env = dagshub_settings.get(
-                    "MLFLOW_TRACKING_PASSWORD", "MLFLOW_TRACKING_PASSWORD"
-                )
-                tracking_username = os.getenv(username_env)
-                tracking_password = os.getenv(password_env)
-                if not tracking_username or not tracking_password:
-                    raise RuntimeError(
-                        f"Set {username_env} and {password_env} to enable DagsHub tracking."
+        if mlflow_enabled:
+            try:
+                import mlflow
+
+                if dagshub_settings.get("enabled", False):
+                    username_env = dagshub_settings.get(
+                        "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_USERNAME"
                     )
-                os.environ["MLFLOW_TRACKING_USERNAME"] = tracking_username
-                os.environ["MLFLOW_TRACKING_PASSWORD"] = tracking_password
+                    password_env = dagshub_settings.get(
+                        "MLFLOW_TRACKING_PASSWORD", "MLFLOW_TRACKING_PASSWORD"
+                    )
+                    tracking_username = os.getenv(username_env)
+                    tracking_password = os.getenv(password_env)
+                    if not tracking_username or not tracking_password:
+                        raise RuntimeError(
+                            f"Set {username_env} and {password_env} to enable DagsHub tracking."
+                        )
+                    os.environ["MLFLOW_TRACKING_USERNAME"] = tracking_username
+                    os.environ["MLFLOW_TRACKING_PASSWORD"] = tracking_password
 
-                tracking_uri = dagshub_settings["set_tracking_uri"]
-                mlflow.set_tracking_uri(tracking_uri)
-                experiment_base = dagshub_settings["set_experiment"]
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                experiment_name = f"{experiment_base}_{timestamp}"
-            else:
-                tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
-                if tracking_uri:
+                    tracking_uri = dagshub_settings["set_tracking_uri"]
                     mlflow.set_tracking_uri(tracking_uri)
-                experiment_name = os.getenv(
-                    "MLFLOW_EXPERIMENT_NAME",
-                    logging_cfg.get("mlflow_experiment_name", "vietnamese-sequence-labelling"),
-                )
+                    experiment_base = dagshub_settings["set_experiment"]
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    experiment_name = f"{experiment_base}_{timestamp}"
+                else:
+                    tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+                    if tracking_uri:
+                        mlflow.set_tracking_uri(tracking_uri)
+                    else:
+                        local_mlruns = output_dir / "mlruns"
+                        mlflow.set_tracking_uri(f"file://{local_mlruns.resolve()}")
+                    experiment_name = os.getenv(
+                        "MLFLOW_EXPERIMENT_NAME",
+                        logging_cfg.get("mlflow_experiment_name", "vietnamese-sequence-labelling"),
+                    )
 
-            mlflow.set_experiment(experiment_name)
-            mlflow.start_run(run_name=output_dir.name)
-            mlflow_client = mlflow
-            run_params = {
-                "model_name": model_name,
-                "output_dir": str(output_dir),
-                "epochs": epochs,
-                "learning_rate": lr,
-                "head_learning_rate": head_lr,
-                "batch_size": batch_size,
-                "eval_batch_size": eval_batch_size,
-                "gradient_accumulation_steps": grad_accum,
-                "weight_decay": weight_decay,
-                "scheduler_type": scheduler_type,
-                "warmup_ratio": warmup_ratio,
-                "max_length": max_length,
-                "focal_gamma": focal_gamma,
-                "label_smoothing": label_smoothing,
-                "precision": precision_str,
-                "world_size": world_size,
-                "seed": seed,
-            }
-            mlflow.log_params({key: value for key, value in run_params.items() if value is not None})
-            print(f"MLflow tracking enabled (experiment: {experiment_name}).")
-        except Exception as e:
-            print(f"Warning: MLflow could not be initialized; continuing without tracking: {e}")
-            if mlflow_client is not None:
-                try:
-                    mlflow_client.end_run(status="FAILED")
-                except Exception:
-                    pass
-                mlflow_client = None
+                mlflow.set_experiment(experiment_name)
+                mlflow.start_run(run_name=output_dir.name)
+                mlflow_client = mlflow
+                run_params = {
+                    "model_name": model_name,
+                    "output_dir": str(output_dir),
+                    "epochs": epochs,
+                    "learning_rate": lr,
+                    "head_lr": head_lr,
+                    "batch_size": batch_size,
+                    "eval_batch_size": eval_batch_size,
+                    "gradient_accumulation_steps": grad_accum,
+                    "weight_decay": weight_decay,
+                    "scheduler_type": scheduler_type,
+                    "warmup_ratio": warmup_ratio,
+                    "max_length": max_length,
+                    "focal_gamma": focal_gamma,
+                    "label_smoothing": label_smoothing,
+                    "precision": precision_str,
+                    "world_size": world_size,
+                    "seed": seed,
+                }
+                mlflow.log_params({key: value for key, value in run_params.items() if value is not None})
+                print(f"MLflow tracking enabled (experiment: {experiment_name}).")
+            except Exception as e:
+                print(f"Warning: MLflow could not be initialized; continuing without tracking: {e}")
+                if mlflow_client is not None:
+                    try:
+                        mlflow_client.end_run(status="FAILED")
+                    except Exception:
+                        pass
+                    mlflow_client = None
 
     for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
