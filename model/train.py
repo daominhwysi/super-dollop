@@ -95,8 +95,9 @@ def parse_args():
     parser.add_argument("--max-length", "--max_length", "--max-seq-length", type=int, default=None, help="Maximum token sequence length (defaults to 2048)")
     parser.add_argument("--empty-cache-freq", "--empty_cache_freq", type=int, default=0, help="Periodically empty CUDA cache every N steps (0 to disable)")
 
-    # General
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--no-dagshub", "--no_dagshub", action="store_true", default=False, help="Disable DagsHub tracking even if enabled in config")
+    parser.add_argument("--no-mlflow", "--no_mlflow", action="store_true", default=False, help="Disable MLflow tracking completely")
     parser.add_argument("--dry-run", action="store_true", help="Run quick 5-step test without full training")
     
     return parser.parse_args()
@@ -764,8 +765,11 @@ def main():
             ) or {}
         dagshub_settings = dagshub_config.get("dagshub", {})
 
+        if args.no_mlflow or args.no_dagshub:
+            dagshub_settings["enabled"] = False
+
         report_to = str(logging_cfg.get("report_to", "none")).lower()
-        mlflow_enabled = (
+        mlflow_enabled = not args.no_mlflow and (
             report_to == "mlflow"
             or dagshub_settings.get("enabled", False)
             or bool(os.getenv("MLFLOW_TRACKING_URI"))
@@ -775,7 +779,7 @@ def main():
             try:
                 import mlflow
 
-                if dagshub_settings.get("enabled", False):
+                if dagshub_settings.get("enabled", False) and not args.no_dagshub:
                     username_env = dagshub_settings.get(
                         "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_USERNAME"
                     )
@@ -791,9 +795,11 @@ def main():
                     os.environ["MLFLOW_TRACKING_USERNAME"] = tracking_username
                     os.environ["MLFLOW_TRACKING_PASSWORD"] = tracking_password
 
-                    tracking_uri = dagshub_settings["set_tracking_uri"]
+                    tracking_uri = dagshub_settings.get("set_tracking_uri", "")
+                    if "dagshub.com" in tracking_uri and not tracking_uri.endswith(".mlflow"):
+                        tracking_uri = tracking_uri.rstrip("/") + ".mlflow"
                     mlflow.set_tracking_uri(tracking_uri)
-                    experiment_base = dagshub_settings["set_experiment"]
+                    experiment_base = dagshub_settings.get("set_experiment", "vietnamese-sequence-labelling")
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     experiment_name = f"{experiment_base}_{timestamp}"
                 else:
@@ -833,7 +839,12 @@ def main():
                 mlflow.log_params({key: value for key, value in run_params.items() if value is not None})
                 print(f"MLflow tracking enabled (experiment: {experiment_name}).")
             except Exception as e:
-                print(f"Warning: MLflow could not be initialized; continuing without tracking: {e}")
+                err_msg = str(e)
+                if "<html" in err_msg.lower() or "<!doctype" in err_msg.lower():
+                    err_summary = "Tracking server returned an HTML error page (verify repository exists on DagsHub and URI ends in .mlflow)"
+                else:
+                    err_summary = err_msg.split("\n")[0]
+                print(f"Warning: MLflow could not be initialized; continuing without tracking: {err_summary}")
                 if mlflow_client is not None:
                     try:
                         mlflow_client.end_run(status="FAILED")
