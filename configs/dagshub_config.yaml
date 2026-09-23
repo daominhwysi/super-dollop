@@ -1,0 +1,7 @@
+dagshub:
+  enabled: true
+  # These values name environment variables. Keep tokens out of this file.
+  MLFLOW_TRACKING_USERNAME: MLFLOW_TRACKING_USERNAME
+  MLFLOW_TRACKING_PASSWORD: MLFLOW_TRACKING_PASSWORD
+  set_tracking_uri: "https://dagshub.com/daominhwysi/super-dollop.mlflow"
+  set_experiment: "vietnamese-sequence-labelling"

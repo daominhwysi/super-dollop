@@ -91,3 +91,5 @@ logging:
   report_to: "none"                      # "none", "wandb", or "tensorboard"
   wandb_project: "vietnamese-sequence-labelling-v2"
   logging_steps: 25
+  mlflow_experiment_name: "vietnamese-sequence-labelling"
+  # Override the tracking store with MLFLOW_TRACKING_URI when needed.

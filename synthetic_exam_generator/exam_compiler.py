@@ -7,7 +7,6 @@ import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-from tqdm import tqdm
 
 try:
     from synthetic_exam_generator.generator import (

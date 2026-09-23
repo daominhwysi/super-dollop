@@ -11,7 +11,6 @@ import time
 import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from tqdm import tqdm
 
 # Ensure workspace root is in sys.path
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
@@ -255,19 +254,13 @@ def main():
     success_count = 0
     failed_count = 0
 
-    pbar = tqdm(targets, desc="Reparsing Documents", unit="doc")
-    for item in pbar:
+    for item_idx, item in enumerate(targets, start=1):
         rel_path = item["rel_path"]
         raw_file = item["raw_file"]
         doc_id = item["doc_id"]
         decision = item["decision"]
 
-        pbar.set_postfix({
-            "doc": str(rel_path.stem)[:20],
-            "type": decision[:3],
-            "ok": success_count,
-            "fail": failed_count,
-        })
+        print(f"[Reparsing Documents] {item_idx}/{len(targets)}: {rel_path.stem} ({decision})")
 
         try:
             res = process_single_document(
@@ -281,12 +274,12 @@ def main():
                 concurrency=args.concurrency,
             )
             success_count += 1
-            tqdm.write(
+            print(
                 f"  ✅ [Reparsed] {rel_path} ({decision}) -> {res['questions']} questions in {res['duration']}s"
             )
         except Exception as e:
             failed_count += 1
-            tqdm.write(f"\n❌ [Failed] {rel_path} ({decision}): {e}")
+            print(f"❌ [Failed] {rel_path} ({decision}): {e}")
 
     print("\n" + "=" * 70)
     print("🎉 REPARSING RUN COMPLETED!")

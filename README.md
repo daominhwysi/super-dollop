@@ -71,6 +71,14 @@ Inspect resolved defaults with:
 uv run sequence-label paths
 ```
 
+## Training metrics
+
+Install the optional training dependencies with `uv sync --extra train`. Copy `.env.example` to `.env` for local training credentials; shell and Kaggle environment variables take precedence. Training logs parameters, periodic loss and learning rate, and validation metrics to a local MLflow run by default. DagsHub tracking is configured in [`configs/dagshub_config.yaml`](configs/dagshub_config.yaml); set `MLFLOW_TRACKING_USERNAME` and `MLFLOW_TRACKING_PASSWORD` to authenticate. Each DagsHub run uses the configured experiment name with a timestamp suffix. Set `enabled: false` to disable DagsHub and use the normal local MLflow setup. Start the local UI with:
+
+```bash
+uv run mlflow ui
+```
+
 ## Data layout
 
 Runtime datasets are intentionally local and ignored by Git:

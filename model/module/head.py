@@ -13,8 +13,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Union, Dict, Any, List
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 from transformers.modeling_outputs import TokenClassifierOutput
 from transformers import AutoModel, AutoConfig, PreTrainedModel
+from transformers.utils import logging as transformers_logging
+
+transformers_logging.disable_progress_bar()
+try:
+    from huggingface_hub.utils import disable_progress_bars
+
+    disable_progress_bars()
+except ImportError:
+    pass
 
 
 class FocalLoss(nn.Module):

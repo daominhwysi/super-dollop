@@ -10,7 +10,6 @@ dependencies = [
   "pymupdf",
   "openai",
   "python-dotenv",
-  "tqdm",
   "pyyaml",
   "numpy",
   "opencv-python-headless",
@@ -29,7 +28,8 @@ train = [
   "torch>=2.0.0",
   "transformers>=4.40.0",
   "seqeval>=1.2.2",
-  "accelerate>=0.28.0"
+  "accelerate>=0.28.0",
+  "mlflow"
 ]
 
 [tool.setuptools.packages.find]

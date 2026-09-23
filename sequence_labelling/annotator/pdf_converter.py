@@ -13,7 +13,6 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 from openai import OpenAI
-from tqdm import tqdm
 
 # Reconfigure stdout to use UTF-8 encoding
 if hasattr(sys.stdout, "reconfigure"):
@@ -487,23 +486,20 @@ class PDFOCRConverter:
                     f"Vision LLM API failed for batch {b_id + 1} (pages {s_idx + 1}-{e_idx}): {e}"
                 ) from e
 
-        # Run batches concurrently using ThreadPoolExecutor with tqdm progress bar
+        # Run batches concurrently and print one progress line per completed batch.
         results = [None] * len(batches)
         if batches:
             max_workers = min(effective_concurrency, len(batches))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_batch = {executor.submit(process_single_batch, b): b for b in batches}
-                pbar = tqdm(
-                    as_completed(future_to_batch),
-                    total=len(batches),
-                    desc="[OCR Batches]",
-                    unit="batch"
-                )
+                completed_batches = 0
                 completed_pages = 0
-                for future in pbar:
+                for future in as_completed(future_to_batch):
                     b_id, batch_text = future.result()
                     results[b_id] = batch_text
+                    completed_batches += 1
                     completed_pages += batch_sizes[b_id]
+                    print(f"[OCR Batches] {completed_batches}/{len(batches)} completed ({completed_pages}/{total_pages} pages)")
                     notify_progress(
                         "OCR LLM",
                         completed_pages,
@@ -551,7 +547,8 @@ class PDFOCRConverter:
             pdf_files = pdf_files[:limit]
 
         output_paths = []
-        for pdf_path in tqdm(pdf_files, desc="[OCR Files]", unit="file"):
+        for file_idx, pdf_path in enumerate(pdf_files, start=1):
+            print(f"[OCR Files] {file_idx}/{len(pdf_files)}: {pdf_path.name}")
             rel_path = pdf_path.relative_to(input_dir)
             out_rel_path = rel_path.with_suffix(".md")
             output_file_path = output_dir / out_rel_path

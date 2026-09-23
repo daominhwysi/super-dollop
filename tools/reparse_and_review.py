@@ -45,7 +45,6 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from tqdm import tqdm
 
 from sequence_labelling.config import (
     WORKSPACE_DIR,
@@ -409,15 +408,13 @@ def main():
     reparse_failed_count = 0
     start_all = time.time()
 
-    pbar = tqdm(targets, desc="Reparse & Review", unit="doc")
-
-    for target in pbar:
+    for target_idx, target in enumerate(targets, start=1):
         doc_id = target["doc_id"]
         rel_path = target["rel_path"]
         prior_dec = target["prior_decision"]
         prior_sc = target["prior_score"]
 
-        pbar.set_postfix({"doc": str(rel_path.stem)[:18], "prior": prior_dec[:3]})
+        print(f"[Reparse & Review] {target_idx}/{len(targets)}: {rel_path.stem} ({prior_dec})")
 
         doc_out_dir = output_dir / rel_path.parent / rel_path.stem
         merged_xml_path = doc_out_dir / "merged.xml"
@@ -437,7 +434,7 @@ def main():
                 )
                 if not reparse_info["success"]:
                     reparse_failed_count += 1
-                    tqdm.write(f"❌ [Reparse Failed] {doc_id} -> XML output not generated.")
+                    print(f"❌ [Reparse Failed] {doc_id} -> XML output not generated.")
                     results.append({
                         "doc_id": doc_id,
                         "rel_path": str(rel_path),
@@ -450,7 +447,7 @@ def main():
                     continue
             except Exception as e:
                 reparse_failed_count += 1
-                tqdm.write(f"❌ [Reparse Error] {doc_id}: {e}")
+                print(f"❌ [Reparse Error] {doc_id}: {e}")
                 results.append({
                     "doc_id": doc_id,
                     "rel_path": str(rel_path),
@@ -466,7 +463,7 @@ def main():
         # ── Step 2: Quality Review with GPT-5.6 Luna High ─────────────────
         if args.stage in ("all", "review-only"):
             if not merged_xml_path.exists():
-                tqdm.write(f"⚠️ [Skip Review] {doc_id}: {merged_xml_path} does not exist.")
+                print(f"⚠️ [Skip Review] {doc_id}: {merged_xml_path} does not exist.")
                 continue
 
             try:
@@ -491,7 +488,7 @@ def main():
                     status_icon = "❌ [DISCARD]"
 
                 delta_str = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
-                tqdm.write(
+                print(
                     f"  {status_icon} {doc_id} ({rel_path.stem[:25]}): "
                     f"{prior_dec} ({prior_sc:.1f}) -> {new_dec} ({new_sc:.1f}) [{delta_str} pts, Grade {review_rep.grade}]"
                 )
@@ -515,7 +512,7 @@ def main():
                     "issues": [iss.model_dump(mode="json") for iss in review_rep.issues[:10]],
                 })
             except Exception as rev_err:
-                tqdm.write(f"❌ [Review Error] {doc_id}: {rev_err}")
+                print(f"❌ [Review Error] {doc_id}: {rev_err}")
                 results.append({
                     "doc_id": doc_id,
                     "rel_path": str(rel_path),
@@ -528,7 +525,7 @@ def main():
                 })
         else:
             # Reparse-only result recording
-            tqdm.write(f"  ✅ [Reparsed] {doc_id}: {reparse_info.get('questions_count', 0)} questions in {reparse_info.get('duration_seconds', 0)}s")
+            print(f"  ✅ [Reparsed] {doc_id}: {reparse_info.get('questions_count', 0)} questions in {reparse_info.get('duration_seconds', 0)}s")
             results.append({
                 "doc_id": doc_id,
                 "rel_path": str(rel_path),

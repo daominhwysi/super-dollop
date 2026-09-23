@@ -71,7 +71,6 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from tqdm import tqdm
 
 from sequence_labelling.config import (
     EDITOR_MODEL,
@@ -869,7 +868,7 @@ def main():
 
     save_partial_report()
 
-    pbar = tqdm(total=len(targets), desc="Resolving Revisions", unit="doc")
+    completed_targets = 0
 
     max_workers = max(1, min(args.concurrency, len(targets)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -896,18 +895,18 @@ def main():
                 if res.get("already_passed"):
                     success_count += 1
                     already_passed_count += 1
-                    tqdm.write(
+                    print(
                         f"  ✅ [Already PASS after fresh review] {doc_id}: {res['initial_score']:.1f} ({res['initial_decision']}) — no edit needed"
                     )
                 elif res["success"]:
                     success_count += 1
                     saved_info = f" [Saved to branch: {res['branch_xml_path']}]" if res.get("saved_to_branch") else ""
-                    tqdm.write(
+                    print(
                         f"  ✅ [Repaired] {doc_id}: {res['initial_score']:.1f} ({res['initial_decision']}) -> {res['final_score']:.1f} ({res['final_decision']}) [{res['applied_patches']} patches in {res['duration_seconds']:.1f}s]{saved_info}"
                     )
                 else:
                     fail_count += 1
-                    tqdm.write(
+                    print(
                         f"  ⚠️ [Partial/Unresolved] {doc_id}: {res['initial_score']:.1f} -> {res['final_score']:.1f} ({res['final_decision']})"
                     )
                 save_partial_report()
@@ -921,12 +920,10 @@ def main():
                     "error": str(e),
                 })
                 save_partial_report()
-                tqdm.write(f"\n❌ [Error] Failed repairing {doc_id}: {e}")
+                print(f"❌ [Error] Failed repairing {doc_id}: {e}")
 
-            pbar.update(1)
-            pbar.set_postfix({"ok": success_count, "pass": already_passed_count, "fail": fail_count})
-
-    pbar.close()
+            completed_targets += 1
+            print(f"[Resolving Revisions] {completed_targets}/{len(targets)} completed (ok: {success_count}, pass: {already_passed_count}, fail: {fail_count})")
 
     summary_data = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),

@@ -12,6 +12,7 @@ from pathlib import Path
 
 # Configure PyTorch memory allocator to avoid fragmentation on T4 / constrained GPUs
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 # Ensure repository root is in sys.path regardless of execution entrypoint
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
@@ -23,7 +24,11 @@ import yaml
 import math
 import random
 import argparse
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=WORKSPACE_DIR / ".env")
 
 import numpy as np
 import torch
@@ -37,7 +42,9 @@ from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup
 )
-from tqdm import tqdm
+from transformers.utils import logging as transformers_logging
+
+transformers_logging.disable_progress_bar()
 
 from model.module.head import EnhancedBertForTokenClassification, FocalLoss
 from model.module.dataset import get_tag_mappings, MultiWindowBIODataset, OnlineAugmentedDataset
@@ -343,6 +350,7 @@ def main():
     max_length = args.max_length or 2048
     save_steps = args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 0))
     save_total_limit = args.save_total_limit if args.save_total_limit is not None else int(train_cfg.get("save_total_limit", 2))
+    logging_cfg = cfg.get("logging", {})
 
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -737,26 +745,97 @@ def main():
             print(f"\nNotice: Checkpoint has already completed epoch {start_epoch - 1} of {epochs}.")
             print(f"To train further, specify a higher --epochs value (e.g. --epochs {start_epoch}).")
 
+    mlflow_client = None
+    if is_main_process:
+        try:
+            import mlflow
+
+            dagshub_config_path = WORKSPACE_DIR / "configs" / "dagshub_config.yaml"
+            dagshub_config = {}
+            if dagshub_config_path.exists():
+                dagshub_config = yaml.safe_load(
+                    dagshub_config_path.read_text(encoding="utf-8")
+                ) or {}
+            dagshub_settings = dagshub_config.get("dagshub", {})
+
+            if dagshub_settings.get("enabled", False):
+                username_env = dagshub_settings.get(
+                    "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_USERNAME"
+                )
+                password_env = dagshub_settings.get(
+                    "MLFLOW_TRACKING_PASSWORD", "MLFLOW_TRACKING_PASSWORD"
+                )
+                tracking_username = os.getenv(username_env)
+                tracking_password = os.getenv(password_env)
+                if not tracking_username or not tracking_password:
+                    raise RuntimeError(
+                        f"Set {username_env} and {password_env} to enable DagsHub tracking."
+                    )
+                os.environ["MLFLOW_TRACKING_USERNAME"] = tracking_username
+                os.environ["MLFLOW_TRACKING_PASSWORD"] = tracking_password
+
+                tracking_uri = dagshub_settings["set_tracking_uri"]
+                mlflow.set_tracking_uri(tracking_uri)
+                experiment_base = dagshub_settings["set_experiment"]
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                experiment_name = f"{experiment_base}_{timestamp}"
+            else:
+                tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+                if tracking_uri:
+                    mlflow.set_tracking_uri(tracking_uri)
+                experiment_name = os.getenv(
+                    "MLFLOW_EXPERIMENT_NAME",
+                    logging_cfg.get("mlflow_experiment_name", "vietnamese-sequence-labelling"),
+                )
+
+            mlflow.set_experiment(experiment_name)
+            mlflow.start_run(run_name=output_dir.name)
+            mlflow_client = mlflow
+            run_params = {
+                "model_name": model_name,
+                "output_dir": str(output_dir),
+                "epochs": epochs,
+                "learning_rate": lr,
+                "head_learning_rate": head_lr,
+                "batch_size": batch_size,
+                "eval_batch_size": eval_batch_size,
+                "gradient_accumulation_steps": grad_accum,
+                "weight_decay": weight_decay,
+                "scheduler_type": scheduler_type,
+                "warmup_ratio": warmup_ratio,
+                "max_length": max_length,
+                "focal_gamma": focal_gamma,
+                "label_smoothing": label_smoothing,
+                "precision": precision_str,
+                "world_size": world_size,
+                "seed": seed,
+            }
+            mlflow.log_params({key: value for key, value in run_params.items() if value is not None})
+            print(f"MLflow tracking enabled (experiment: {experiment_name}).")
+        except Exception as e:
+            print(f"Warning: MLflow could not be initialized; continuing without tracking: {e}")
+            if mlflow_client is not None:
+                try:
+                    mlflow_client.end_run(status="FAILED")
+                except Exception:
+                    pass
+                mlflow_client = None
+
     for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         model.train()
         train_loss = 0.0
-        min_iters = 1
         if args.logs_per_epoch and args.logs_per_epoch > 0:
-            min_iters = max(1, len(train_loader) // args.logs_per_epoch)
-
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch}/{epochs}",
-            mininterval=10.0,
-            miniters=min_iters,
-            dynamic_ncols=True
-        ) if is_main_process else train_loader
+            progress_interval = max(1, math.ceil(len(train_loader) / args.logs_per_epoch))
+        else:
+            progress_interval = max(1, int(logging_cfg.get("logging_steps", 25)))
+        interval_loss_sum = 0.0
+        interval_batch_count = 0
 
         optimizer.zero_grad()
-        for step, batch in enumerate(pbar):
+        for step, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
@@ -772,6 +851,8 @@ def main():
                 loss.backward()
 
             train_loss += loss.item() * grad_accum
+            interval_loss_sum += loss.item() * grad_accum
+            interval_batch_count += 1
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
                 if use_amp and amp_dtype == torch.float16:
@@ -818,13 +899,29 @@ def main():
                     update_latest_checkpoint_link(output_dir, step_dir, is_main_process=is_main_process)
                     prune_checkpoints(output_dir, save_total_limit, is_main_process=is_main_process)
 
-                if is_main_process and hasattr(pbar, "set_postfix"):
-                    step_loss = loss.item() * grad_accum
-                    loss_disp = f"{step_loss:.2e}" if (0 < step_loss < 0.001) else f"{step_loss:.4f}"
-                    pbar.set_postfix({
-                        "loss": loss_disp,
-                        "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-                    }, refresh=False)
+            if is_main_process and ((step + 1) % progress_interval == 0 or (step + 1) == len(train_loader)):
+                avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
+                current_lr = scheduler.get_last_lr()[0]
+                print(
+                    f"[Epoch {epoch}/{epochs}] Batch {step + 1}/{len(train_loader)} "
+                    f"| Step {global_step}/{total_training_steps} "
+                    f"| Loss {avg_train_loss:.4f} | LR {current_lr:.2e}"
+                )
+                if mlflow_client is not None:
+                    try:
+                        mlflow_client.log_metrics(
+                            {"train/loss": avg_train_loss, "train/learning_rate": current_lr},
+                            step=global_step,
+                        )
+                    except Exception as e:
+                        print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
+                        try:
+                            mlflow_client.end_run(status="FAILED")
+                        except Exception:
+                            pass
+                        mlflow_client = None
+                interval_loss_sum = 0.0
+                interval_batch_count = 0
 
             if args.dry_run and global_step >= 5:
                 if is_main_process:
@@ -871,6 +968,27 @@ def main():
             current_macro_f1 = metrics["macro_f1"]
 
             print(f"\n[Epoch {epoch} Evaluation (Gold Test Set)] Val Loss: {avg_val_loss:.4f} | Macro F1: {current_macro_f1 * 100:.2f}% | Precision: {metrics['precision'] * 100:.2f}% | Recall: {metrics['recall'] * 100:.2f}%")
+            if mlflow_client is not None:
+                try:
+                    mlflow_client.log_metrics(
+                        {
+                            "validation/loss": avg_val_loss,
+                            "validation/macro_f1": metrics["macro_f1"],
+                            "validation/precision": metrics["precision"],
+                            "validation/recall": metrics["recall"],
+                            "validation/micro_f1": metrics["micro_f1"],
+                            "epoch": epoch,
+                            "best_validation/macro_f1": max(best_macro_f1, current_macro_f1),
+                        },
+                        step=global_step,
+                    )
+                except Exception as e:
+                    print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
+                    try:
+                        mlflow_client.end_run(status="FAILED")
+                    except Exception:
+                        pass
+                    mlflow_client = None
 
             is_best = current_macro_f1 > best_macro_f1
             if is_best:
@@ -937,6 +1055,11 @@ def main():
 
     if is_main_process:
         print(f"\nTraining completed! Best Validation Macro F1: {best_macro_f1 * 100:.2f}%")
+        if mlflow_client is not None and mlflow_client.active_run() is not None:
+            try:
+                mlflow_client.end_run()
+            except Exception as e:
+                print(f"Warning: Could not close MLflow run cleanly: {e}")
 
         # Final push to Hugging Face Hub if requested
         if args.push_to_hub and args.hub_model_id:

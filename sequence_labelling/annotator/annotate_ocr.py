@@ -15,7 +15,6 @@ sys.path.append(str(workspace_dir))
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from tqdm import tqdm
 
 from sequence_labelling.config import (
     PARSER_MODEL,
@@ -1029,7 +1028,7 @@ def main():
 
     print(f"Found {len(md_files)} file(s) to process.\n")
 
-    for idx, file_path in enumerate(tqdm(md_files, desc="[Annotating Files]", unit="file")):
+    for idx, file_path in enumerate(md_files):
         print(f"\n[{idx + 1}/{len(md_files)}] Processing: {file_path.name}")
 
         rel_sig = file_path.name

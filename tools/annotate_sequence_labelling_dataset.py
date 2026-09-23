@@ -9,7 +9,6 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 
 # Ensure workspace root is in sys.path
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
@@ -207,12 +206,12 @@ def process_single_document(
         chunk_xml_check = XMLChecker.check(cres.get("raw_xml", ""))
         if not chunk_xml_check.is_valid:
             v_errors.extend(chunk_xml_check.error_messages)
-            tqdm.write(
+            print(
                 f"  ⚠️ [XML TAG MISMATCH / ISSUE] Document '{rel_path}' Chunk {idx}: "
                 f"{len(chunk_xml_check.issues)} issue(s) detected. Diagnostics: {chunk_xml_check.error_messages[:3]}"
             )
         elif attempts > 1 or v_errors:
-            tqdm.write(
+            print(
                 f"  ⚠️ [RETRY / WARNING] Document '{rel_path}' Chunk {idx}: "
                 f"{attempts} attempt(s) used. Diagnostics: {v_errors}"
             )
@@ -249,7 +248,7 @@ def process_single_document(
 
     questions_count = len(merge_result.get("structured_questions", []))
     if questions_count == 0:
-        tqdm.write(f"  ℹ️ Document '{rel_path}': 0 questions found (non-exam or reference document).")
+        print(f"  ℹ️ Document '{rel_path}': 0 questions found (non-exam or reference document).")
 
     duration = time.time() - start_time
 
@@ -259,7 +258,7 @@ def process_single_document(
     merged_xml_content = clean_merged.cleaned_xml
     merged_xml_check = XMLChecker.check(merged_xml_content)
     if not merged_xml_check.is_valid:
-        tqdm.write(f"  ❌ [MERGED XML TAG ISSUE] '{rel_path}': {len(merged_xml_check.issues)} issue(s) found in merged.xml")
+        print(f"  ❌ [MERGED XML TAG ISSUE] '{rel_path}': {len(merged_xml_check.issues)} issue(s) found in merged.xml")
 
     # Save Merged Version
     merged_data = {
@@ -390,11 +389,9 @@ def main():
     success_count = 0
     failed_count = 0
 
-    pbar = tqdm(md_files, desc="Annotating Documents", unit="doc")
-    for file_path in pbar:
+    for file_idx, file_path in enumerate(md_files, start=1):
         rel_path = file_path.relative_to(input_path)
-
-        pbar.set_postfix({"file": rel_path.name[:25], "success": success_count, "failed": failed_count})
+        print(f"[Annotating Documents] {file_idx}/{len(md_files)}: {rel_path}")
 
         try:
             res = process_single_document(

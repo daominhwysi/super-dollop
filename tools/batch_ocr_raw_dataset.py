@@ -3,7 +3,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-from tqdm import tqdm
 
 # Ensure workspace root is in sys.path
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
@@ -64,8 +63,8 @@ def run_batch_ocr(
     failed_count = 0
 
     total_to_process = len(files_to_process)
-    pbar = tqdm(enumerate(files_to_process, 1), total=total_to_process, desc="Batch OCR Progress", unit="file")
-    for file_idx, pdf_path in pbar:
+    for file_idx, pdf_path in enumerate(files_to_process, start=1):
+        print(f"[Batch OCR Progress] {file_idx}/{total_to_process}: {pdf_path.name}")
         rel_path = pdf_path.relative_to(raw_dir)
         target_md = out_dir / rel_path.with_suffix(".md")
 
@@ -73,12 +72,7 @@ def run_batch_ocr(
 
         def make_callback(f_idx, f_total, f_name):
             def callback(stage: str, current: int, total: int, msg: str):
-                pbar.set_postfix({
-                    "pdf": f"{f_idx}/{f_total}",
-                    "stage": stage,
-                    "page": f"{current}/{total}",
-                    "file": f_name[:18],
-                })
+                print(f"[Batch OCR Progress] PDF {f_idx}/{f_total} {f_name}: {stage} {current}/{total} - {msg}")
             return callback
 
         cb = make_callback(file_idx, total_to_process, pdf_path.stem)

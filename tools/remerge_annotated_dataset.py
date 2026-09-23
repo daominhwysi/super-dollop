@@ -13,7 +13,6 @@ import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 
 # Ensure workspace root is in sys.path
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
@@ -200,21 +199,20 @@ def main():
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {executor.submit(remerge_exam_dir, ed): ed for ed in exam_dirs}
-        with tqdm(total=len(futures), desc="Re-merging exams", unit="doc") as pbar:
-            for future in as_completed(futures):
-                res = future.result()
-                results.append(res)
-                st = res.get("status")
-                if "remerged" in st:
-                    success_count += 1
-                elif st == "cleaned_sentinel":
-                    cleaned_count += 1
-                elif st == "skipped_no_chunks":
-                    skipped_count += 1
-                elif st == "error":
-                    error_count += 1
-                    tqdm.write(f"  ❌ Error re-merging {res.get('doc_id')}: {res.get('error')}")
-                pbar.update(1)
+        for completed, future in enumerate(as_completed(futures), start=1):
+            res = future.result()
+            results.append(res)
+            st = res.get("status")
+            if "remerged" in st:
+                success_count += 1
+            elif st == "cleaned_sentinel":
+                cleaned_count += 1
+            elif st == "skipped_no_chunks":
+                skipped_count += 1
+            elif st == "error":
+                error_count += 1
+                print(f"  ❌ Error re-merging {res.get('doc_id')}: {res.get('error')}")
+            print(f"[Re-merging exams] {completed}/{len(futures)} completed: {res.get('doc_id')}")
 
     duration = time.time() - start_time
     print("\n" + "=" * 70)

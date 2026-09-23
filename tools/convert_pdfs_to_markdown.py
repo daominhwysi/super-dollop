@@ -18,7 +18,7 @@ Key Features:
    - Detects scrambled vertical MathType operator stacks and unparseable PUA clusters.
    - Replaces unparseable blocks with authentic, clean high-school math LaTeX expressions.
 4. Fast Concurrent Processing:
-   - Uses ProcessPoolExecutor with tqdm progress reporting.
+   - Uses ProcessPoolExecutor with printed completion updates.
    - Produces individual .md files and a comprehensive conversion_report.json.
 
 Usage:
@@ -38,7 +38,6 @@ from typing import Dict, Any, List, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pymupdf
-from tqdm import tqdm
 
 # Authentic Vietnamese High School Math LaTeX Pool
 LATEX_POOL = [
@@ -531,11 +530,10 @@ def main():
             for pdf in selected_pdfs
         }
 
-        with tqdm(total=len(selected_pdfs), desc="Converting PDFs to Markdown", unit="pdf") as pbar:
-            for future in as_completed(future_to_pdf):
-                res = future.result()
-                results.append(res)
-                pbar.update(1)
+        for completed, future in enumerate(as_completed(future_to_pdf), start=1):
+            res = future.result()
+            results.append(res)
+            print(f"[Converting PDFs to Markdown] {completed}/{len(selected_pdfs)} completed: {future_to_pdf[future]}")
 
     total_time = (datetime.now() - start_all).total_seconds()
 

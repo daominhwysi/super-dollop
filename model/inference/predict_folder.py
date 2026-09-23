@@ -14,7 +14,6 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_DIR))
 
 import argparse
-from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
 
@@ -58,7 +57,8 @@ def main():
         label2id=tag_to_id
     ).to(args.device)
 
-    for f in tqdm(files, desc="Annotating exams"):
+    for file_idx, f in enumerate(files, start=1):
+        print(f"[{file_idx}/{len(files)}] Annotating: {f.name}")
         try:
             rel_path = f.relative_to(input_path)
             out_file = output_path / rel_path.with_suffix(".xml")
