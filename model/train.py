@@ -175,29 +175,61 @@ def save_training_checkpoint(
     torch.save(trainer_state, save_dir / "trainer_state.pt")
 
 
+def get_free_disk_space_gb(path: Path) -> float:
+    """Returns free disk space in gigabytes for the given filesystem path."""
+    try:
+        import shutil
+        target = path if path.exists() else (path.parent if path.parent.exists() else Path.cwd())
+        total, used, free = shutil.disk_usage(target)
+        return free / (1024 ** 3)
+    except Exception:
+        return 999.0
+
+
+def update_latest_checkpoint_link(output_dir: Path, target_dir: Path, is_main_process: bool = True):
+    """Updates latest_checkpoint symlink or pointer metadata without duplicating gigabytes of model files."""
+    if not is_main_process:
+        return
+    import shutil
+    latest_link = output_dir / "latest_checkpoint"
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            if latest_link.is_dir() and not latest_link.is_symlink():
+                shutil.rmtree(latest_link)
+            else:
+                latest_link.unlink()
+        rel_target = target_dir.relative_to(output_dir) if target_dir.is_relative_to(output_dir) else target_dir
+        latest_link.symlink_to(rel_target, target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError):
+        # Fallback for environments without symlink support: store a lightweight metadata pointer
+        pointer_file = output_dir / "latest_checkpoint.json"
+        with open(pointer_file, "w", encoding="utf-8") as f:
+            json.dump({"target_dir": str(target_dir.resolve()), "name": target_dir.name}, f, indent=2)
+
+
 def prune_checkpoints(output_dir: Path, save_total_limit: int, is_main_process: bool = True):
     """Prunes older step checkpoints to respect save_total_limit and conserve disk space."""
-    if not is_main_process or save_total_limit <= 0:
+    if not is_main_process or save_total_limit < 0:
         return
 
     import shutil
     step_dirs = []
     for d in output_dir.glob("checkpoint-*"):
-        if d.is_dir() and d.name.replace("checkpoint-", "").isdigit():
+        if d.is_dir() and not d.is_symlink() and d.name.replace("checkpoint-", "").isdigit():
             step_dirs.append((int(d.name.replace("checkpoint-", "")), d))
 
     step_dirs.sort(key=lambda x: x[0])
     while len(step_dirs) > save_total_limit:
         oldest_step, oldest_dir = step_dirs.pop(0)
         try:
-            print(f"Pruning old checkpoint: {oldest_dir.name} (exceeds save_total_limit={save_total_limit})")
+            print(f"Pruning old checkpoint: {oldest_dir.name} (enforcing save_total_limit={save_total_limit})")
             shutil.rmtree(oldest_dir)
         except Exception as e:
             print(f"Warning: Could not prune {oldest_dir}: {e}")
 
 
 def push_checkpoint_to_hub(repo_id: str, folder_path: Path, commit_message: str):
-    """Pushes a checkpoint directory to Hugging Face Hub."""
+    """Pushes the primary model checkpoint to Hugging Face Hub (excluding intermediate checkpoints)."""
     try:
         from huggingface_hub import HfApi
         print(f"\nPushing checkpoint to Hugging Face Hub: '{repo_id}'...")
@@ -207,7 +239,8 @@ def push_checkpoint_to_hub(repo_id: str, folder_path: Path, commit_message: str)
             folder_path=str(folder_path),
             repo_id=repo_id,
             repo_type="model",
-            commit_message=commit_message
+            commit_message=commit_message,
+            ignore_patterns=["checkpoint-*", "checkpoint-*/*", "*.tmp"]
         )
         print(f"Checkpoint successfully synchronized to: https://huggingface.co/{repo_id}")
     except Exception as e:
@@ -338,7 +371,11 @@ def main():
             print(f"  Save Checkpoints     : Every {save_steps} steps (Keep last {save_total_limit})")
         if args.resume_from_checkpoint:
             print(f"  Resume Source        : {args.resume_from_checkpoint}")
+        free_gb = get_free_disk_space_gb(output_dir)
         print(f"  Output Dir           : {output_dir}")
+        print(f"  Free Disk Space      : {free_gb:.2f} GB")
+        if free_gb < 5.0:
+            print(f"  WARNING: Low free disk space ({free_gb:.2f} GB)! Checkpoint pruning will aggressively maintain headroom.")
         print(f"  Focal Gamma          : {focal_gamma}")
         print(f"  Label Smoothing      : {label_smoothing}")
         print(f"============================================================\n")
@@ -519,8 +556,16 @@ def main():
     if args.resume_from_checkpoint:
         raw_resume = args.resume_from_checkpoint.strip()
         if raw_resume == "auto":
-            # Prefer output_dir / "latest_checkpoint", then output_dir
-            if (output_dir / "latest_checkpoint" / "trainer_state.pt").exists() or (output_dir / "latest_checkpoint" / "model.safetensors").exists():
+            # 1. Prefer highest step checkpoint in output_dir
+            step_checkpoints = []
+            for d in output_dir.glob("checkpoint-*"):
+                if d.is_dir() and d.name.replace("checkpoint-", "").isdigit():
+                    if (d / "trainer_state.pt").exists() or (d / "model.safetensors").exists() or (d / "pytorch_model.bin").exists():
+                        step_checkpoints.append((int(d.name.replace("checkpoint-", "")), d))
+            if step_checkpoints:
+                step_checkpoints.sort(key=lambda x: x[0], reverse=True)
+                resume_dir = step_checkpoints[0][1]
+            elif (output_dir / "latest_checkpoint" / "trainer_state.pt").exists() or (output_dir / "latest_checkpoint" / "model.safetensors").exists() or (output_dir / "latest_checkpoint" / "pytorch_model.bin").exists():
                 resume_dir = output_dir / "latest_checkpoint"
             elif (output_dir / "trainer_state.pt").exists() or (output_dir / "model.safetensors").exists() or (output_dir / "pytorch_model.bin").exists():
                 resume_dir = output_dir
@@ -532,7 +577,11 @@ def main():
             if is_main_process:
                 print(f"Downloading checkpoint from Hugging Face Hub repository: '{raw_resume}'...")
                 from huggingface_hub import snapshot_download
-                dl_path = snapshot_download(repo_id=raw_resume)
+                # Only download the primary checkpoint & state, skipping redundant intermediate step dirs
+                dl_path = snapshot_download(
+                    repo_id=raw_resume,
+                    ignore_patterns=["checkpoint-*", "checkpoint-*/*", "latest_checkpoint/*"]
+                )
             else:
                 dl_path = None
             if is_distributed:
@@ -553,6 +602,20 @@ def main():
 
     # Load Model Weights
     if resume_dir is not None:
+        # If resume_dir points to a directory without weights at root, inspect subfolders
+        if not (resume_dir / "model.safetensors").exists() and not (resume_dir / "pytorch_model.bin").exists():
+            if (resume_dir / "latest_checkpoint" / "model.safetensors").exists() or (resume_dir / "latest_checkpoint" / "pytorch_model.bin").exists():
+                resume_dir = resume_dir / "latest_checkpoint"
+            else:
+                step_subs = []
+                for sub in resume_dir.glob("checkpoint-*"):
+                    if sub.is_dir() and sub.name.replace("checkpoint-", "").isdigit():
+                        if (sub / "model.safetensors").exists() or (sub / "pytorch_model.bin").exists():
+                            step_subs.append((int(sub.name.replace("checkpoint-", "")), sub))
+                if step_subs:
+                    step_subs.sort(key=lambda x: x[0], reverse=True)
+                    resume_dir = step_subs[0][1]
+
         weights_file = resume_dir / "model.safetensors"
         bin_file = resume_dir / "pytorch_model.bin"
         if weights_file.exists():
@@ -680,7 +743,17 @@ def main():
 
         model.train()
         train_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") if is_main_process else train_loader
+        min_iters = 1
+        if args.logs_per_epoch and args.logs_per_epoch > 0:
+            min_iters = max(1, len(train_loader) // args.logs_per_epoch)
+
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{epochs}",
+            mininterval=10.0,
+            miniters=min_iters,
+            dynamic_ncols=True
+        ) if is_main_process else train_loader
 
         optimizer.zero_grad()
         for step, batch in enumerate(pbar):
@@ -719,6 +792,12 @@ def main():
 
                 # Periodic mid-epoch rolling checkpoint save
                 if save_steps > 0 and global_step % save_steps == 0:
+                    # Prune older checkpoints BEFORE saving to ensure disk headroom
+                    free_gb = get_free_disk_space_gb(output_dir)
+                    if free_gb < 3.0:
+                        print(f"\nWarning: Low free disk space ({free_gb:.2f} GB). Aggressively pruning old checkpoints...")
+                    prune_checkpoints(output_dir, max(0, save_total_limit - 1), is_main_process=is_main_process)
+
                     step_dir = output_dir / f"checkpoint-{global_step}"
                     save_training_checkpoint(
                         save_dir=step_dir,
@@ -735,21 +814,8 @@ def main():
                         id_to_tag=id_to_tag,
                         is_main_process=is_main_process
                     )
-                    save_training_checkpoint(
-                        save_dir=output_dir / "latest_checkpoint",
-                        model=model,
-                        tokenizer=tokenizer,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        scaler=scaler,
-                        epoch=epoch,
-                        global_step=global_step,
-                        best_macro_f1=best_macro_f1,
-                        patience_counter=patience_counter,
-                        tag_to_id=tag_to_id,
-                        id_to_tag=id_to_tag,
-                        is_main_process=is_main_process
-                    )
+                    # Update symlink/pointer to latest checkpoint without duplicating gigabytes
+                    update_latest_checkpoint_link(output_dir, step_dir, is_main_process=is_main_process)
                     prune_checkpoints(output_dir, save_total_limit, is_main_process=is_main_process)
 
                 if is_main_process and hasattr(pbar, "set_postfix"):
@@ -758,7 +824,7 @@ def main():
                     pbar.set_postfix({
                         "loss": loss_disp,
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-                    })
+                    }, refresh=False)
 
             if args.dry_run and global_step >= 5:
                 if is_main_process:
@@ -826,28 +892,29 @@ def main():
                     id_to_tag=id_to_tag,
                     is_main_process=is_main_process
                 )
+                update_latest_checkpoint_link(output_dir, output_dir, is_main_process=is_main_process)
             else:
                 patience_counter += 1
                 if patience_counter >= max_patience and not args.dry_run:
                     print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
                     stop_training = True
 
-            # Always save latest_checkpoint at end of epoch
-            save_training_checkpoint(
-                save_dir=output_dir / "latest_checkpoint",
-                model=model,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=epoch,
-                global_step=global_step,
-                best_macro_f1=best_macro_f1,
-                patience_counter=patience_counter,
-                tag_to_id=tag_to_id,
-                id_to_tag=id_to_tag,
-                is_main_process=is_main_process
-            )
+                # Only save to latest_checkpoint if output_dir was not updated with a new best
+                save_training_checkpoint(
+                    save_dir=output_dir / "latest_checkpoint",
+                    model=model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_macro_f1=best_macro_f1,
+                    patience_counter=patience_counter,
+                    tag_to_id=tag_to_id,
+                    id_to_tag=id_to_tag,
+                    is_main_process=is_main_process
+                )
 
             # Auto-sync to Hugging Face Hub at end of each epoch if push_to_hub is active
             if args.push_to_hub and args.hub_model_id:

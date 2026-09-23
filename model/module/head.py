@@ -321,15 +321,19 @@ class EnhancedBertForTokenClassification(nn.Module):
             with open(os.path.join(save_directory, "config.json"), "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
 
+        saved_safetensors = False
         try:
             from safetensors.torch import save_file
             tensors = {k: v.contiguous() for k, v in self.state_dict().items()}
             save_file(tensors, os.path.join(save_directory, "model.safetensors"))
+            saved_safetensors = True
         except Exception:
-            pass
+            saved_safetensors = False
 
-        model_save_path = os.path.join(save_directory, "pytorch_model.bin")
-        torch.save(self.state_dict(), model_save_path)
+        # Only fall back to pytorch_model.bin if safetensors failed or is unavailable
+        if not saved_safetensors:
+            model_save_path = os.path.join(save_directory, "pytorch_model.bin")
+            torch.save(self.state_dict(), model_save_path)
 
         meta = {
             "model_type": "enhanced_token_classifier",
