@@ -152,6 +152,11 @@ def save_training_checkpoint(
     if not is_main_process:
         return
 
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     save_dir.mkdir(parents=True, exist_ok=True)
     raw_model = model.module if hasattr(model, "module") else model
 
@@ -181,6 +186,8 @@ def save_training_checkpoint(
         }
     }
     torch.save(trainer_state, save_dir / "trainer_state.pt")
+    del trainer_state
+    gc.collect()
 
 
 def get_free_disk_space_gb(path: Path) -> float:

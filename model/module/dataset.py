@@ -53,8 +53,10 @@ def normalize_bio_tag(tag: str) -> str:
 
 class MultiWindowBIODataset(Dataset):
     """
-    Fast, pre-tokenized BIO dataset loader supporting multi-scale sliding window chunks
-    (512, 768, 1024, 2048 tokens).
+    Memory-efficient, lazy offset-indexed BIO dataset loader supporting multi-scale
+    sliding window chunks (512, 768, 1024, 2048 tokens).
+    Maintains a tiny index in RAM (< 1 MB) and reads lines on-demand, preventing
+    out-of-memory (OOM) crashes in multi-process/DDP distributed environments.
     """
     def __init__(
         self,
@@ -72,24 +74,48 @@ class MultiWindowBIODataset(Dataset):
         self.pad_token_id = pad_token_id
         self.ignore_label_id = ignore_label_id
         self.max_length = max_length
-        self.samples = []
+        self._file = None
 
         if not self.chunks_file_path.exists():
             raise FileNotFoundError(f"Chunks file not found: {self.chunks_file_path}")
 
-        with open(self.chunks_file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    data = json.loads(line)
-                    self.samples.append(data)
-                    if max_samples and len(self.samples) >= max_samples:
+        # Build binary byte offsets for zero-copy lazy loading
+        offsets = []
+        with open(self.chunks_file_path, "rb") as f:
+            offset = f.tell()
+            line = f.readline()
+            while line:
+                if line.strip():
+                    offsets.append(offset)
+                    if max_samples and len(offsets) >= max_samples:
                         break
-                except Exception:
-                    pass
+                offset = f.tell()
+                line = f.readline()
 
-        print(f"Loaded {len(self.samples)} multi-scale BIO chunks from '{self.chunks_file_path.name}'.")
+        import numpy as np
+        self.offsets = np.array(offsets, dtype=np.int64)
+        self._pid = None
+        print(f"Indexed {len(self.offsets)} multi-scale BIO chunks from '{self.chunks_file_path.name}' (RAM: {self.offsets.nbytes / (1024 * 1024):.2f} MB).")
+
+    def _get_file(self):
+        current_pid = os.getpid()
+        if getattr(self, "_pid", None) != current_pid:
+            self._file = None
+            self._pid = current_pid
+        if self._file is None or self._file.closed:
+            self._file = open(self.chunks_file_path, "r", encoding="utf-8")
+        return self._file
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_file"] = None
+        state["_pid"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._file = None
+        self._pid = None
 
     def _lookup_tag_id(self, tag: str) -> int:
         norm = normalize_bio_tag(tag)
@@ -100,10 +126,14 @@ class MultiWindowBIODataset(Dataset):
         return self.tag_to_id.get("O", 0)
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.offsets)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        item = self.samples[idx]
+        f = self._get_file()
+        f.seek(int(self.offsets[idx]))
+        line = f.readline()
+        item = json.loads(line)
+
         tokens = item.get("tokens", [])
         bio_tags = item.get("ner_tags", item.get("tags", item.get("labels", [])))
 
@@ -157,6 +187,13 @@ class MultiWindowBIODataset(Dataset):
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(label_ids, dtype=torch.long)
         }
+
+    def __del__(self):
+        if hasattr(self, "_file") and self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
 
 
 class OnlineAugmentedDataset(Dataset):

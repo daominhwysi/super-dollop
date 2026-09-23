@@ -70,7 +70,7 @@ training:
   # Precision & Accelerator Settings
   bf16: false                            # bfloat16 mixed precision (only on Ampere+ e.g. A100/H100)
   fp16: true                             # Enable fp16 mixed precision with GradScaler (recommended for NVIDIA T4/V100)
-  dataloader_num_workers: 4
+  dataloader_num_workers: 2              # 2 workers per GPU prevents memory fragmentation in DDP
   dataloader_pin_memory: true
   
   # Checkpointing & Validation
