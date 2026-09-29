@@ -30,11 +30,15 @@ def evaluate_span_matching(gold_spans, pred_spans, label, tolerance=4):
     
     for p in pred:
         p_start = p.get("start", 0)
+        p_end = p.get("end", 0)
         found_idx = None
         for idx, g in enumerate(gold):
-            if idx not in matched_gold_indices and abs(g.get("start", 0) - p_start) <= tolerance:
-                found_idx = idx
-                break
+            if idx not in matched_gold_indices:
+                g_start = g.get("start", 0)
+                g_end = g.get("end", 0)
+                if abs(g_start - p_start) <= tolerance and abs(g_end - p_end) <= tolerance:
+                    found_idx = idx
+                    break
         if found_idx is not None:
             tp += 1
             matched_gold_indices.add(found_idx)

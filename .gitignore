@@ -14,3 +14,5 @@ backend/logs/
 tests/test_merger/outputs/
 result.md
 results/
+.ag-kit-backups/
+.agents/

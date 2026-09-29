@@ -65,20 +65,35 @@ class FocalLoss(nn.Module):
         valid_logits = flat_logits[valid_mask]
         valid_targets = flat_targets[valid_mask]
 
-        # Standard cross entropy with optional label smoothing
-        ce_loss = F.cross_entropy(
-            valid_logits,
-            valid_targets,
-            weight=self.weight,
-            reduction="none",
-            label_smoothing=self.label_smoothing
-        )
+        # Compute log probabilities and probabilities directly for numerical stability
+        log_probs = F.log_softmax(valid_logits, dim=-1)
+        probs = torch.exp(log_probs)
 
-        # Probabilities of true class
-        p_t = torch.exp(-ce_loss)
-        
+        # True class log_prob and prob
+        log_p_t = log_probs.gather(-1, valid_targets.unsqueeze(-1)).squeeze(-1)
+        p_t = probs.gather(-1, valid_targets.unsqueeze(-1)).squeeze(-1)
+
         # Focal modulation factor: (1 - p_t)^gamma
-        focal_loss = ((1.0 - p_t) ** self.gamma) * ce_loss
+        focal_weight = ((1.0 - p_t) ** self.gamma)
+
+        if self.label_smoothing > 0.0:
+            ce_loss = F.cross_entropy(
+                valid_logits,
+                valid_targets,
+                weight=None,
+                reduction="none",
+                label_smoothing=self.label_smoothing
+            )
+            base_loss = ce_loss
+        else:
+            base_loss = -log_p_t
+
+        focal_loss = focal_weight * base_loss
+
+        # Apply class weights if provided (without corrupting p_t exponentiation)
+        if self.weight is not None:
+            class_weights = self.weight[valid_targets]
+            focal_loss = class_weights * focal_loss
 
         return focal_loss.mean()
 

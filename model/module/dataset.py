@@ -66,7 +66,8 @@ class MultiWindowBIODataset(Dataset):
         pad_token_id: int = 0,
         ignore_label_id: int = -100,
         max_samples: Optional[int] = None,
-        max_length: int = 2048
+        max_length: int = 2048,
+        label_all_subwords: bool = True
     ):
         self.chunks_file_path = Path(chunks_file_path)
         self.tag_to_id = tag_to_id
@@ -74,6 +75,7 @@ class MultiWindowBIODataset(Dataset):
         self.pad_token_id = pad_token_id
         self.ignore_label_id = ignore_label_id
         self.max_length = max_length
+        self.label_all_subwords = label_all_subwords
         self._file = None
 
         if not self.chunks_file_path.exists():
@@ -172,7 +174,13 @@ class MultiWindowBIODataset(Dataset):
                         else:
                             label_ids.append(self.ignore_label_id)
                     else:
-                        label_ids.append(self.ignore_label_id)
+                        if self.label_all_subwords and word_idx < len(bio_tags):
+                            tag_str = bio_tags[word_idx]
+                            norm = normalize_bio_tag(tag_str)
+                            cont_tag = f"I-{norm[2:]}" if norm.startswith("B-") else norm
+                            label_ids.append(self._lookup_tag_id(cont_tag))
+                        else:
+                            label_ids.append(self.ignore_label_id)
                     previous_word_idx = word_idx
             else:
                 label_ids = [

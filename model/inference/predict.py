@@ -16,6 +16,8 @@ if str(WORKSPACE_DIR) not in sys.path:
 
 import re
 import json
+import math
+import bisect
 import argparse
 from typing import List, Tuple, Dict, Any, Optional, Union
 
@@ -168,10 +170,12 @@ def predict_text(
     device: str = "cpu",
     max_length: int = 1024,
     stride: int = 256,
+    batch_size: int = 8,
     mask_latex: bool = False
 ) -> Dict[str, Any]:
     """
-    Runs sequence labeling on a raw text document with sliding window and overlapping logit pooling.
+    Runs sequence labeling on a raw text document with sliding window, batched GPU execution,
+    and center-weighted overlapping logit pooling.
     """
     model.eval()
     clean_text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -185,18 +189,31 @@ def predict_text(
             last_idx = end
         processed_text += clean_text[last_idx:]
 
-        def map_idx(idx):
-            mod_pos = 0
-            orig_pos = 0
-            for o_start, o_end in latex_spans:
-                segment_len = o_start - orig_pos
-                if idx <= mod_pos + segment_len:
-                    return orig_pos + (idx - mod_pos)
-                orig_pos = o_end
-                mod_pos += segment_len + len("[LATEX]")
-                if idx < mod_pos:
-                    return o_start
-            return orig_pos + (idx - mod_pos)
+        # Precompute interval mapping boundaries for O(log M) binary search
+        mod_intervals = []
+        cur_mod = 0
+        cur_orig = 0
+        latex_len = len("[LATEX]")
+        for o_start, o_end in latex_spans:
+            text_seg_len = o_start - cur_orig
+            if text_seg_len > 0:
+                mod_intervals.append((cur_mod, cur_mod + text_seg_len, cur_orig, False))
+                cur_mod += text_seg_len
+                cur_orig = o_start
+            mod_intervals.append((cur_mod, cur_mod + latex_len, cur_orig, True))
+            cur_mod += latex_len
+            cur_orig = o_end
+        mod_intervals.append((cur_mod, float("inf"), cur_orig, False))
+        mod_starts = [x[0] for x in mod_intervals]
+
+        def map_idx(idx: int) -> int:
+            i = bisect.bisect_right(mod_starts, idx) - 1
+            if i < 0:
+                return 0
+            m_start, _, o_start, is_latex = mod_intervals[i]
+            if is_latex:
+                return o_start
+            return o_start + (idx - m_start)
     else:
         processed_text = clean_text
         map_idx = lambda x: x
@@ -211,41 +228,50 @@ def predict_text(
     )
 
     num_chunks = len(tokenized["input_ids"])
-    span_logits: Dict[Tuple[int, int], List[torch.Tensor]] = {}
+    span_logits: Dict[Tuple[int, int], List[Tuple[torch.Tensor, float]]] = {}
 
     with torch.no_grad():
-        for chunk_idx in range(num_chunks):
-            chunk_input_ids = tokenized["input_ids"][chunk_idx]
-            chunk_attention_mask = tokenized["attention_mask"][chunk_idx]
-            chunk_offsets = tokenized["offset_mapping"][chunk_idx]
+        for b_start in range(0, num_chunks, batch_size):
+            b_end = min(b_start + batch_size, num_chunks)
+            b_input_ids = torch.tensor(tokenized["input_ids"][b_start:b_end], dtype=torch.long, device=device)
+            b_attention_mask = torch.tensor(tokenized["attention_mask"][b_start:b_end], dtype=torch.long, device=device)
 
-            inputs = {
-                "input_ids": torch.tensor([chunk_input_ids], dtype=torch.long, device=device),
-                "attention_mask": torch.tensor([chunk_attention_mask], dtype=torch.long, device=device)
-            }
+            outputs = model(input_ids=b_input_ids, attention_mask=b_attention_mask)
+            b_logits = outputs.logits.cpu()  # [B, seq_len, num_labels]
 
-            outputs = model(**inputs)
-            logits = outputs.logits[0].cpu()  # [seq_len, num_labels]
+            for chunk_offset_in_batch, chunk_idx in enumerate(range(b_start, b_end)):
+                chunk_offsets = tokenized["offset_mapping"][chunk_idx]
+                logits = b_logits[chunk_offset_in_batch]
+                chunk_len = len(chunk_offsets)
 
-            for tok_idx, (start, end) in enumerate(chunk_offsets):
-                if start == end:
-                    continue
-                orig_start = map_idx(start)
-                orig_end = map_idx(end)
-                if orig_start >= orig_end:
-                    continue
+                for tok_idx, (start, end) in enumerate(chunk_offsets):
+                    if start == end:
+                        continue
+                    orig_start = map_idx(start)
+                    orig_end = map_idx(end)
+                    if orig_start >= orig_end:
+                        continue
 
-                key = (orig_start, orig_end)
-                if key not in span_logits:
-                    span_logits[key] = []
-                span_logits[key].append(logits[tok_idx])
+                    # Center-weighted pooling: edge tokens receive lower weight than central tokens
+                    dist_to_edge = min(tok_idx, chunk_len - 1 - tok_idx)
+                    weight = min(1.0, (dist_to_edge + 1) / 32.0)
 
-    # Average logits for overlapping subwords
+                    key = (orig_start, orig_end)
+                    if key not in span_logits:
+                        span_logits[key] = []
+                    span_logits[key].append((logits[tok_idx], weight))
+
+    # Weighted average logits for overlapping subwords
     sorted_spans = sorted(span_logits.keys(), key=lambda x: x[0])
     token_predictions = []
     for span in sorted_spans:
-        avg_logits = torch.mean(torch.stack(span_logits[span]), dim=0)
-        pred_id = int(torch.argmax(avg_logits).item())
+        items = span_logits[span]
+        total_w = sum(w for _, w in items)
+        if total_w > 0.0:
+            weighted_logits = sum(l * w for l, w in items) / total_w
+        else:
+            weighted_logits = items[0][0]
+        pred_id = int(torch.argmax(weighted_logits).item())
         tag = id_to_tag.get(pred_id, "O")
         token_predictions.append({
             "start": span[0],
@@ -264,14 +290,20 @@ def predict_text(
         end = tok["end"]
 
         if tag.startswith("B-"):
-            if current_seg:
-                segments.append(current_seg)
-            current_seg = {
-                "label": tag[2:],
-                "start": start,
-                "end": end,
-                "text": clean_text[start:end]
-            }
+            label = tag[2:]
+            # Subword continuity: merge if same label and directly adjacent without separation
+            if current_seg and current_seg["label"] == label and start == current_seg["end"]:
+                current_seg["end"] = end
+                current_seg["text"] = clean_text[current_seg["start"]:end]
+            else:
+                if current_seg:
+                    segments.append(current_seg)
+                current_seg = {
+                    "label": label,
+                    "start": start,
+                    "end": end,
+                    "text": clean_text[start:end]
+                }
         elif tag.startswith("I-"):
             label = tag[2:]
             if current_seg and current_seg["label"] == label:
@@ -314,11 +346,13 @@ class SequenceLabelPredictor:
         device: Optional[str] = None,
         max_length: int = 1024,
         stride: int = 256,
+        batch_size: int = 8,
         mask_latex: bool = False
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_length = max_length
         self.stride = stride
+        self.batch_size = batch_size
         self.mask_latex = mask_latex
         self.model_dir = Path(model_dir)
 
@@ -340,6 +374,7 @@ class SequenceLabelPredictor:
             device=self.device,
             max_length=self.max_length,
             stride=self.stride,
+            batch_size=self.batch_size,
             mask_latex=self.mask_latex
         )
 
@@ -352,6 +387,7 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="Path to save output XML file")
     parser.add_argument("--max-length", type=int, default=1024, help="Sliding window token length")
     parser.add_argument("--stride", type=int, default=256, help="Sliding window stride")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for sliding window chunks")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -379,7 +415,8 @@ def main():
         id_to_tag,
         device=args.device,
         max_length=args.max_length,
-        stride=args.stride
+        stride=args.stride,
+        batch_size=args.batch_size
     )
 
     print("\n--- Predicted XML Output ---")

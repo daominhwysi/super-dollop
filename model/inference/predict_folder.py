@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="output/predictions", help="Output directory for predicted XMLs")
     parser.add_argument("--max-length", type=int, default=1024, help="Sliding window token length")
     parser.add_argument("--stride", type=int, default=256, help="Sliding window stride")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for sliding window chunks")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of files to process")
     args = parser.parse_args()
@@ -45,7 +46,7 @@ def main():
         files = files[:args.limit]
 
     print(f"Found {len(files)} files to process in '{args.input_dir}'.")
-    print(f"Loading model from '{args.model_dir}' onto {args.device}...")
+    print(f"Loading model from '{args.model_dir}' onto {args.device} (batch_size: {args.batch_size})...")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     tag_to_id, id_to_tag = load_label_mapping(args.model_dir)
@@ -72,7 +73,8 @@ def main():
                 id_to_tag,
                 device=args.device,
                 max_length=args.max_length,
-                stride=args.stride
+                stride=args.stride,
+                batch_size=args.batch_size
             )
             out_file.write_text(res["xml_text"], encoding="utf-8")
         except Exception as e:
