@@ -1144,13 +1144,18 @@ def main():
                 if use_amp and amp_dtype == torch.float16:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(train_cfg.get("max_grad_norm", 1.0)))
+                    scale_before = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
+                    scale_after = scaler.get_scale()
+                    # Only advance learning rate schedule if optimizer was not skipped during FP16 scale calibration
+                    if scale_before <= scale_after:
+                        scheduler.step()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(train_cfg.get("max_grad_norm", 1.0)))
                     optimizer.step()
+                    scheduler.step()
 
-                scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
