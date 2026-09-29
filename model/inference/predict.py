@@ -135,6 +135,19 @@ def load_label_mapping(model_dir: Union[str, Path]) -> Tuple[Dict[str, int], Dic
             except Exception:
                 pass
 
+    if not os.path.isdir(str(model_dir)):
+        try:
+            from transformers.utils.hub import cached_file
+            cached_map = cached_file(str(model_dir), "label_mapping.json")
+            if cached_map and os.path.exists(cached_map):
+                with open(cached_map, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    tag_to_id = data["tag_to_id"]
+                    id_to_tag = {int(k): v for k, v in data["id_to_tag"].items()}
+                    return tag_to_id, id_to_tag
+        except Exception:
+            pass
+
     # Default fallback mapping
     base_tags = ["question_label", "stem", "option_label", "option_text", "stimulus", "section", "explanation"]
     tag_to_id = {"O": 0}
@@ -145,6 +158,8 @@ def load_label_mapping(model_dir: Union[str, Path]) -> Tuple[Dict[str, int], Dic
     return tag_to_id, id_to_tag
 
 
+
+
 def predict_text(
     text: str,
     model: Any,
@@ -153,7 +168,7 @@ def predict_text(
     device: str = "cpu",
     max_length: int = 1024,
     stride: int = 256,
-    mask_latex: bool = True
+    mask_latex: bool = False
 ) -> Dict[str, Any]:
     """
     Runs sequence labeling on a raw text document with sliding window and overlapping logit pooling.
@@ -299,7 +314,7 @@ class SequenceLabelPredictor:
         device: Optional[str] = None,
         max_length: int = 1024,
         stride: int = 256,
-        mask_latex: bool = True
+        mask_latex: bool = False
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_length = max_length

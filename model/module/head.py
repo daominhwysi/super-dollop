@@ -398,6 +398,17 @@ class EnhancedBertForTokenClassification(nn.Module):
                 meta_file = cached_file(str(model_name_or_path), "enhanced_head_config.json", token=token)
             except Exception:
                 meta_file = None
+            try:
+                from transformers.utils.hub import cached_file
+                safetensors_file = cached_file(str(model_name_or_path), "model.safetensors", token=token)
+            except Exception:
+                safetensors_file = None
+            if not safetensors_file:
+                try:
+                    from transformers.utils.hub import cached_file
+                    model_bin_file = cached_file(str(model_name_or_path), "pytorch_model.bin", token=token)
+                except Exception:
+                    model_bin_file = None
 
         num_layers_to_fuse = 4
         if meta_file and os.path.exists(meta_file):
@@ -407,20 +418,6 @@ class EnhancedBertForTokenClassification(nn.Module):
                     num_layers_to_fuse = meta.get("num_layers_to_fuse", 4)
             except Exception:
                 pass
-
-        base_model = AutoModel.from_pretrained(
-            model_name_or_path,
-            config=config,
-            token=token,
-            torch_dtype=torch_dtype,
-            **kwargs
-        )
-        
-        model = cls(
-            config=config,
-            base_model=base_model,
-            num_layers_to_fuse=num_layers_to_fuse
-        )
 
         loaded_state_dict = None
         if safetensors_file and os.path.exists(safetensors_file):
@@ -434,6 +431,32 @@ class EnhancedBertForTokenClassification(nn.Module):
                 loaded_state_dict = torch.load(model_bin_file, map_location="cpu")
             except Exception:
                 pass
+
+        # If this checkpoint already contains full model weights (base_model.* + head.*),
+        # initialize base_model from config directly to avoid misleading missing/unexpected warnings from AutoModel
+        has_full_weights = loaded_state_dict is not None and any(k.startswith("base_model.") for k in loaded_state_dict.keys())
+        if has_full_weights:
+            base_model = AutoModel.from_config(config)
+        else:
+            base_model = AutoModel.from_pretrained(
+                model_name_or_path,
+                config=config,
+                token=token,
+                torch_dtype=torch_dtype,
+                **kwargs
+            )
+
+        # Check and align vocabulary size if token embeddings were expanded during training
+        if loaded_state_dict is not None:
+            emb_weight = loaded_state_dict.get("base_model.embeddings.tok_embeddings.weight", None)
+            if emb_weight is not None and base_model.get_input_embeddings().weight.shape[0] != emb_weight.shape[0]:
+                base_model.resize_token_embeddings(emb_weight.shape[0])
+
+        model = cls(
+            config=config,
+            base_model=base_model,
+            num_layers_to_fuse=num_layers_to_fuse
+        )
 
         if loaded_state_dict is not None:
             model.load_state_dict(loaded_state_dict, strict=False)

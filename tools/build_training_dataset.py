@@ -63,6 +63,75 @@ def load_gold_set_exclusion(gold_path: Path) -> set:
         return set()
 
 
+def expand_stimulus_anchors(xml_content: str) -> str:
+    """
+    Expands compact self-closing stimulus anchors:
+        <stimulus id="..." start_anchor="..." end_anchor="..." />
+    into full paired XML tags:
+        <stimulus>passage_text</stimulus>
+    so that parse_xml_annotations() extracts them as genuine stimulus spans
+    rather than discarding them and marking reading comprehension tokens as 'O'.
+    """
+    import html
+    matches = list(re.finditer(r"<stimulus\b([^>]*?)/>", xml_content))
+    if not matches:
+        return xml_content
+
+    modified_xml = xml_content
+    # Process backwards so character modifications do not invalidate earlier offsets
+    for m in reversed(matches):
+        attr_str = m.group(1)
+        s_m = re.search(r'start_anchor="([^"]*)"', attr_str)
+        e_m = re.search(r'end_anchor="([^"]*)"', attr_str)
+        tag_start, tag_end = m.span()
+
+        if not (s_m and e_m):
+            modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+            continue
+
+        start_a = html.unescape(s_m.group(1)).strip()
+        end_a = html.unescape(e_m.group(1)).strip()
+
+        s_words = [w for w in re.sub(r"[\*_#]", " ", start_a).split() if len(w) > 1]
+        e_words = [w for w in re.sub(r"[\*_#]", " ", end_a).split() if len(w) > 1]
+        if not s_words or not e_words:
+            continue
+
+        search_region = modified_xml[tag_start:]
+        s_probe = s_words[:min(4, len(s_words))]
+        s_pat = r"\s*".join(re.escape(w) for w in s_probe)
+        s_match = re.search(s_pat, search_region, re.IGNORECASE)
+        if not s_match:
+            s_pat = r"\s*".join(re.escape(w) for w in s_probe[:2])
+            s_match = re.search(s_pat, search_region, re.IGNORECASE)
+
+        if not s_match:
+            continue
+
+        abs_passage_start = tag_start + s_match.start()
+        after_start_region = modified_xml[abs_passage_start:]
+        e_probe = e_words[max(0, len(e_words) - 4):]
+        e_pat = r"\s*".join(re.escape(w) for w in e_probe)
+        e_match = re.search(e_pat, after_start_region, re.IGNORECASE)
+        if not e_match:
+            e_pat = r"\s*".join(re.escape(w) for w in e_probe[-2:])
+            e_match = re.search(e_pat, after_start_region, re.IGNORECASE)
+
+        if not e_match:
+            continue
+
+        abs_passage_end = abs_passage_start + e_match.end()
+        passage_text = modified_xml[abs_passage_start:abs_passage_end]
+        wrapped = f"<stimulus>{passage_text}</stimulus>"
+
+        before_tag = modified_xml[:tag_start]
+        between_tag_and_passage = modified_xml[tag_end:abs_passage_start]
+        after_passage = modified_xml[abs_passage_end:]
+        modified_xml = before_tag + between_tag_and_passage + wrapped + after_passage
+
+    return modified_xml
+
+
 def tokenize_with_offsets(text: str) -> Tuple[List[str], List[Tuple[int, int]]]:
     """Tokenizes text into words and punctuation tokens with (start, end) character offsets."""
     tokens = []
@@ -383,6 +452,7 @@ def process_real_annotated_documents(
                 continue
 
             xml_content = xml_file.read_text(encoding="utf-8")
+            xml_content = expand_stimulus_anchors(xml_content)
             raw_text, spans = parse_xml_annotations(xml_content)
             if not raw_text.strip() or not spans:
                 continue
@@ -510,6 +580,7 @@ def process_gold_benchmark_documents(
             continue
         try:
             xml_content = xml_file.read_text(encoding="utf-8")
+            xml_content = expand_stimulus_anchors(xml_content)
             raw_text, spans = parse_xml_annotations(xml_content)
             if not raw_text.strip() or not spans:
                 continue
