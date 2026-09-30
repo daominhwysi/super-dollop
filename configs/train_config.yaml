@@ -27,8 +27,7 @@ head:
   multi_sample_dropout: true
   dropout_prob: 0.20                     # Base dropout rate
   dropout_samples: 5                     # Number of parallel dropout masks averaged
-  loss_type: "focal"                     # "focal" or "cross_entropy"
-  focal_gamma: 1.5                       # Focusing parameter for down-weighting easy background 'O' tokens
+  focal_gamma: 1.0                       # Calibrated focusing parameter for balanced class gradients
   label_smoothing: 0.0                   # 0.0 for crisp BIO token boundaries (v1 Run 4 lesson: non-zero blurs B/I transitions)
 
 # ------------------------------------------------------------------------------
@@ -43,7 +42,7 @@ dataset:
   val_ratio: 0.0                        # 0.0: No internal train split; 100% of chunks used for training
   test_ratio: 0.0                       # Test set evaluated via val_bio_chunks_file (the 63 Gold Docs)
   seed: 42
-  
+
   # Multi-scale sliding window configurations (512 to 2048 tokens)
   sliding_windows:
     - [512, 128]
@@ -56,9 +55,9 @@ dataset:
 # ------------------------------------------------------------------------------
 training:
   output_dir: "results/mmbert_seqlabel_v2"
-  learning_rate: 2.5e-5                  # Backbone encoder learning rate
-  head_learning_rate: 5.0e-5             # Classifier head learning rate
-  weight_decay: 0.01                     # Weight decay (excluding bias and LayerNorm)
+  learning_rate: 1.5e-5                  # Conservative backbone LR to prevent catastrophic forgetting
+  head_learning_rate: 5.0e-5             # Fast classifier head learning rate
+  weight_decay: 0.05                     # Stronger regularization to prevent boundary overfitting
   per_device_train_batch_size: 4         # Batch size per GPU/device
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4         # Effective batch size = 16
@@ -66,16 +65,16 @@ training:
   lr_scheduler_type: "cosine"            # Cosine annealing with warmup
   warmup_ratio: 0.10                     # 10% warmup steps
   max_grad_norm: 1.0                     # Gradient clipping threshold
-  
+
   # Precision & Accelerator Settings
   bf16: false                            # bfloat16 mixed precision (only on Ampere+ e.g. A100/H100)
   fp16: true                             # Enable fp16 mixed precision with GradScaler (recommended for NVIDIA T4/V100)
   dataloader_num_workers: 2              # 2 workers per GPU prevents memory fragmentation in DDP
   dataloader_pin_memory: true
-  
+
   # Checkpointing & Validation
   eval_strategy: "steps"
-  eval_steps: 250                        # Evaluate every 250 optimization steps
+  eval_steps: 1000                        # Evaluate every 250 optimization steps
   save_strategy: "steps"
   save_steps: 1000                       # Save rolling mid-epoch checkpoint every 1000 optimization steps (~1.2 hours)
   save_total_limit: 1                    # Keep 1 rolling checkpoint to prevent disk exhaustion on Kaggle/Colab (20GB quota)
@@ -90,6 +89,6 @@ training:
 logging:
   report_to: "none"                      # "none", "wandb", or "tensorboard"
   wandb_project: "vietnamese-sequence-labelling-v2"
-  logging_steps: 25
+  logging_steps: 15
   mlflow_experiment_name: "vietnamese-sequence-labelling"
   # Override the tracking store with MLFLOW_TRACKING_URI when needed.

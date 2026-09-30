@@ -382,7 +382,10 @@ class EnhancedBertForTokenClassification(nn.Module):
         torch_dtype: Optional[torch.dtype] = None,
         **kwargs
     ) -> "EnhancedBertForTokenClassification":
+        revision = kwargs.get("revision", None)
         config_kwargs = {}
+        if revision is not None:
+            config_kwargs["revision"] = revision
         if num_labels is not None:
             config_kwargs["num_labels"] = num_labels
         if id2label is not None:
@@ -410,18 +413,18 @@ class EnhancedBertForTokenClassification(nn.Module):
         else:
             try:
                 from transformers.utils.hub import cached_file
-                meta_file = cached_file(str(model_name_or_path), "enhanced_head_config.json", token=token)
+                meta_file = cached_file(str(model_name_or_path), "enhanced_head_config.json", token=token, revision=revision)
             except Exception:
                 meta_file = None
             try:
                 from transformers.utils.hub import cached_file
-                safetensors_file = cached_file(str(model_name_or_path), "model.safetensors", token=token)
+                safetensors_file = cached_file(str(model_name_or_path), "model.safetensors", token=token, revision=revision)
             except Exception:
                 safetensors_file = None
             if not safetensors_file:
                 try:
                     from transformers.utils.hub import cached_file
-                    model_bin_file = cached_file(str(model_name_or_path), "pytorch_model.bin", token=token)
+                    model_bin_file = cached_file(str(model_name_or_path), "pytorch_model.bin", token=token, revision=revision)
                 except Exception:
                     model_bin_file = None
 

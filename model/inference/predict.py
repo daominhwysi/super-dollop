@@ -119,7 +119,7 @@ reconstruct_xml_from_predictions = build_tagged_xml
 
 
 
-def load_label_mapping(model_dir: Union[str, Path]) -> Tuple[Dict[str, int], Dict[int, str]]:
+def load_label_mapping(model_dir: Union[str, Path], revision: Optional[str] = None) -> Tuple[Dict[str, int], Dict[int, str]]:
     """Loads tag-to-id and id-to-tag mappings from model directory or dataset outputs."""
     model_path = Path(model_dir)
     mapping_candidates = [
@@ -140,7 +140,7 @@ def load_label_mapping(model_dir: Union[str, Path]) -> Tuple[Dict[str, int], Dic
     if not os.path.isdir(str(model_dir)):
         try:
             from transformers.utils.hub import cached_file
-            cached_map = cached_file(str(model_dir), "label_mapping.json")
+            cached_map = cached_file(str(model_dir), "label_mapping.json", revision=revision)
             if cached_map and os.path.exists(cached_map):
                 with open(cached_map, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -171,11 +171,12 @@ def predict_text(
     max_length: int = 1024,
     stride: int = 256,
     batch_size: int = 8,
-    mask_latex: bool = False
+    mask_latex: bool = False,
+    use_viterbi: bool = True
 ) -> Dict[str, Any]:
     """
     Runs sequence labeling on a raw text document with sliding window, batched GPU execution,
-    and center-weighted overlapping logit pooling.
+    center-weighted overlapping logit pooling, and Constrained Viterbi BIO decoding.
     """
     model.eval()
     clean_text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -218,29 +219,58 @@ def predict_text(
         processed_text = clean_text
         map_idx = lambda x: x
 
-    tokenized = tokenizer(
+    enc = tokenizer(
         processed_text,
         return_offsets_mapping=True,
-        truncation=True,
-        max_length=max_length,
-        stride=stride,
-        return_overflowing_tokens=True
+        add_special_tokens=False
     )
+    all_input_ids = enc["input_ids"]
+    all_offsets = enc["offset_mapping"]
+    all_attention_mask = enc.get("attention_mask", [1] * len(all_input_ids))
 
-    num_chunks = len(tokenized["input_ids"])
+    chunks_ids = []
+    chunks_offsets = []
+    chunks_attention_mask = []
+
+    idx = 0
+    n = len(all_input_ids)
+    if n == 0:
+        chunks_ids = [[]]
+        chunks_offsets = [[]]
+        chunks_attention_mask = [[]]
+    else:
+        while idx < n:
+            end = min(idx + max_length, n)
+            chunks_ids.append(all_input_ids[idx:end])
+            chunks_offsets.append(all_offsets[idx:end])
+            chunks_attention_mask.append(all_attention_mask[idx:end])
+            if end >= n:
+                break
+            idx += stride
+
+    num_chunks = len(chunks_ids)
     span_logits: Dict[Tuple[int, int], List[Tuple[torch.Tensor, float]]] = {}
 
     with torch.no_grad():
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         for b_start in range(0, num_chunks, batch_size):
             b_end = min(b_start + batch_size, num_chunks)
-            b_input_ids = torch.tensor(tokenized["input_ids"][b_start:b_end], dtype=torch.long, device=device)
-            b_attention_mask = torch.tensor(tokenized["attention_mask"][b_start:b_end], dtype=torch.long, device=device)
+            chunk_slice_ids = chunks_ids[b_start:b_end]
+            chunk_slice_att = chunks_attention_mask[b_start:b_end]
+            b_max_len = max(len(c) for c in chunk_slice_ids) if chunk_slice_ids else 0
+
+            b_input_ids = torch.full((len(chunk_slice_ids), b_max_len), fill_value=pad_id, dtype=torch.long, device=device)
+            b_attention_mask = torch.zeros((len(chunk_slice_ids), b_max_len), dtype=torch.long, device=device)
+
+            for i, (inp, att) in enumerate(zip(chunk_slice_ids, chunk_slice_att)):
+                b_input_ids[i, :len(inp)] = torch.tensor(inp, dtype=torch.long, device=device)
+                b_attention_mask[i, :len(att)] = torch.tensor(att, dtype=torch.long, device=device)
 
             outputs = model(input_ids=b_input_ids, attention_mask=b_attention_mask)
             b_logits = outputs.logits.cpu()  # [B, seq_len, num_labels]
 
             for chunk_offset_in_batch, chunk_idx in enumerate(range(b_start, b_end)):
-                chunk_offsets = tokenized["offset_mapping"][chunk_idx]
+                chunk_offsets = chunks_offsets[chunk_idx]
                 logits = b_logits[chunk_offset_in_batch]
                 chunk_len = len(chunk_offsets)
 
@@ -263,7 +293,15 @@ def predict_text(
 
     # Weighted average logits for overlapping subwords
     sorted_spans = sorted(span_logits.keys(), key=lambda x: x[0])
-    token_predictions = []
+    if not sorted_spans:
+        return {
+            "raw_text": clean_text,
+            "xml_text": clean_text,
+            "spans": [],
+            "num_tokens": 0
+        }
+
+    stacked_logits = []
     for span in sorted_spans:
         items = span_logits[span]
         total_w = sum(w for _, w in items)
@@ -271,7 +309,17 @@ def predict_text(
             weighted_logits = sum(l * w for l, w in items) / total_w
         else:
             weighted_logits = items[0][0]
-        pred_id = int(torch.argmax(weighted_logits).item())
+        stacked_logits.append(weighted_logits)
+
+    if use_viterbi:
+        from model.inference.viterbi import ConstrainedViterbiDecoder
+        decoder = ConstrainedViterbiDecoder(id_to_tag)
+        pred_ids = decoder.decode(torch.stack(stacked_logits))
+    else:
+        pred_ids = [int(torch.argmax(l).item()) for l in stacked_logits]
+
+    token_predictions = []
+    for span, pred_id in zip(sorted_spans, pred_ids):
         tag = id_to_tag.get(pred_id, "O")
         token_predictions.append({
             "start": span[0],
@@ -279,6 +327,22 @@ def predict_text(
             "tag": tag,
             "text": clean_text[span[0]:span[1]]
         })
+
+    # Word-level BIO consistency:
+    # A continuation subword inside an alphanumeric word cannot start a new entity or switch labels.
+    for i in range(1, len(token_predictions)):
+        prev_tok = token_predictions[i - 1]
+        curr_tok = token_predictions[i]
+        if curr_tok["start"] == prev_tok["end"]:
+            if (curr_tok["start"] > 0 and 
+                clean_text[curr_tok["start"] - 1].isalnum() and 
+                clean_text[curr_tok["start"]].isalnum()):
+                prev_tag = prev_tok["tag"]
+                if prev_tag != "O":
+                    prev_label = prev_tag.split("-")[-1]
+                    curr_tok["tag"] = f"I-{prev_label}"
+                else:
+                    curr_tok["tag"] = "O"
 
     # Group BIO tokens into entity segments
     segments = []
@@ -347,13 +411,15 @@ class SequenceLabelPredictor:
         max_length: int = 1024,
         stride: int = 256,
         batch_size: int = 8,
-        mask_latex: bool = False
+        mask_latex: bool = False,
+        use_viterbi: bool = True
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_length = max_length
         self.stride = stride
         self.batch_size = batch_size
         self.mask_latex = mask_latex
+        self.use_viterbi = use_viterbi
         self.model_dir = Path(model_dir)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
@@ -375,7 +441,8 @@ class SequenceLabelPredictor:
             max_length=self.max_length,
             stride=self.stride,
             batch_size=self.batch_size,
-            mask_latex=self.mask_latex
+            mask_latex=self.mask_latex,
+            use_viterbi=self.use_viterbi
         )
 
 
@@ -389,6 +456,7 @@ def main():
     parser.add_argument("--stride", type=int, default=256, help="Sliding window stride")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for sliding window chunks")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--no-viterbi", action="store_true", default=False, help="Disable Constrained Viterbi decoding and use naive argmax")
     args = parser.parse_args()
 
     input_text = args.text
@@ -416,7 +484,8 @@ def main():
         device=args.device,
         max_length=args.max_length,
         stride=args.stride,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        use_viterbi=not args.no_viterbi
     )
 
     print("\n--- Predicted XML Output ---")

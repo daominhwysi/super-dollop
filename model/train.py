@@ -69,7 +69,7 @@ def parse_args():
 
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=None, help="Backbone learning rate")
+    parser.add_argument("--lr", "--backbone-lr", "--backbone_lr", type=float, default=None, help="Backbone learning rate")
     parser.add_argument("--head-lr", "--head_lr", type=float, default=None, help="Classifier head learning rate")
     parser.add_argument("--batch-size", "--batch_size", type=int, default=None, help="Per-device train batch size")
     parser.add_argument("--eval-batch-size", "--eval_batch_size", type=int, default=None, help="Per-device eval batch size")
@@ -83,6 +83,7 @@ def parse_args():
 
     # Checkpoint and Hub options
     parser.add_argument("--resume-from-checkpoint", "--resume_from_checkpoint", type=str, default=None, help="Resume training from checkpoint ('auto', directory path, or Hugging Face Hub repo ID)")
+    parser.add_argument("--eval-steps", "--eval_steps", type=int, default=None, help="Evaluate validation set every N optimization steps (0 to disable mid-epoch evaluation)")
     parser.add_argument("--save-steps", "--save_steps", type=int, default=None, help="Save a rolling checkpoint every N steps (0 to disable)")
     parser.add_argument("--save-total-limit", "--save_total_limit", type=int, default=None, help="Maximum number of rolling step checkpoints to keep (default: 2)")
     parser.add_argument("--push-to-hub", "--push_to_hub", action="store_true", default=False, help="Push checkpoint to Hugging Face Hub during and after training")
@@ -481,6 +482,178 @@ def push_checkpoint_to_hub(
         print(f"Notice: Failed to push checkpoint to Hugging Face Hub: {e}")
 
 
+def run_evaluation(
+    model: torch.nn.Module,
+    val_loader: Any,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    id_to_tag: Dict[int, str],
+    tag_to_id: Dict[str, int],
+    tokenizer: Any,
+    optimizer: Any,
+    scheduler: Any,
+    scaler: Any,
+    epoch: int,
+    epochs: int,
+    global_step: int,
+    output_dir: Path,
+    is_main_process: bool,
+    is_distributed: bool,
+    best_macro_f1: float,
+    patience_counter: int,
+    max_patience: int,
+    args: Any,
+    mlflow_client: Any = None,
+    eval_title: str = "Evaluation",
+    force_push_hub: bool = False
+) -> Tuple[float, int, bool]:
+    """
+    Runs full evaluation over the validation/gold test set, computes entity-level metrics,
+    logs results to console and MLflow, and saves the best model checkpoint if Macro F1 peaks.
+    
+    Returns:
+        (best_macro_f1, patience_counter, stop_training)
+    """
+    model.eval()
+    val_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            if use_amp and device.type == "cuda":
+                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+            val_loss += outputs.loss.item()
+
+            preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
+            lbls = labels.cpu().numpy()
+
+            for p_seq, l_seq in zip(preds, lbls):
+                seq_pred = []
+                seq_lbl = []
+                for p, l in zip(p_seq, l_seq):
+                    if l != -100:
+                        seq_pred.append(id_to_tag.get(p, "O"))
+                        seq_lbl.append(id_to_tag.get(l, "O"))
+                all_preds.append(seq_pred)
+                all_labels.append(seq_lbl)
+
+    stop_training = False
+    if is_main_process:
+        avg_val_loss = val_loss / max(1, len(val_loader))
+        metrics = compute_entity_metrics(all_preds, all_labels)
+        current_macro_f1 = metrics["macro_f1"]
+
+        print(
+            f"\n[{eval_title} (Gold Test Set)] Step {global_step} | Val Loss: {avg_val_loss:.4f} "
+            f"| Macro F1: {current_macro_f1 * 100:.2f}% | Precision: {metrics['precision'] * 100:.2f}% | Recall: {metrics['recall'] * 100:.2f}%"
+        )
+        if mlflow_client is not None:
+            try:
+                mlflow_client.log_metrics(
+                    {
+                        "validation/loss": avg_val_loss,
+                        "validation/macro_f1": metrics["macro_f1"],
+                        "validation/precision": metrics["precision"],
+                        "validation/recall": metrics["recall"],
+                        "validation/micro_f1": metrics["micro_f1"],
+                        "epoch": epoch,
+                        "best_validation/macro_f1": max(best_macro_f1, current_macro_f1),
+                    },
+                    step=global_step,
+                )
+            except Exception as e:
+                print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
+                try:
+                    mlflow_client.end_run(status="FAILED")
+                except Exception:
+                    pass
+                mlflow_client = None
+
+        is_best = current_macro_f1 > best_macro_f1
+        if is_best:
+            best_macro_f1 = current_macro_f1
+            patience_counter = 0
+            print(f"  --> New best model checkpoint! Macro F1: {best_macro_f1 * 100:.2f}%. Saving to '{output_dir}'...")
+            save_training_checkpoint(
+                save_dir=output_dir,
+                model=model,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_macro_f1=best_macro_f1,
+                patience_counter=patience_counter,
+                tag_to_id=tag_to_id,
+                id_to_tag=id_to_tag,
+                is_main_process=is_main_process
+            )
+            update_latest_checkpoint_link(output_dir, output_dir, is_main_process=is_main_process)
+
+            if args.push_to_hub and args.hub_model_id:
+                push_checkpoint_to_hub(
+                    repo_id=args.hub_model_id,
+                    folder_path=output_dir,
+                    commit_message=f"Step {global_step} (Epoch {epoch}/{epochs}) - Best Macro F1: {best_macro_f1 * 100:.2f}%",
+                    metrics=metrics,
+                    args=args,
+                    tag_to_id=tag_to_id,
+                    epoch=epoch
+                )
+        else:
+            patience_counter += 1
+            if patience_counter >= max_patience and not args.dry_run:
+                print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
+                stop_training = True
+
+            save_training_checkpoint(
+                save_dir=output_dir / "latest_checkpoint",
+                model=model,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_macro_f1=best_macro_f1,
+                patience_counter=patience_counter,
+                tag_to_id=tag_to_id,
+                id_to_tag=id_to_tag,
+                is_main_process=is_main_process
+            )
+            if force_push_hub and args.push_to_hub and args.hub_model_id:
+                push_checkpoint_to_hub(
+                    repo_id=args.hub_model_id,
+                    folder_path=output_dir,
+                    commit_message=f"Epoch {epoch}/{epochs} End - Macro F1: {current_macro_f1 * 100:.2f}% (Best: {best_macro_f1 * 100:.2f}%)",
+                    metrics=metrics,
+                    args=args,
+                    tag_to_id=tag_to_id,
+                    epoch=epoch
+                )
+
+    if is_distributed:
+        best_tensor = torch.tensor([best_macro_f1, float(patience_counter), 1.0 if stop_training else 0.0], device=device)
+        torch.distributed.broadcast(best_tensor, src=0)
+        best_macro_f1 = float(best_tensor[0].item())
+        patience_counter = int(best_tensor[1].item())
+        stop_training = bool(best_tensor[2].item() == 1.0)
+
+    model.train()
+    return best_macro_f1, patience_counter, stop_training
+
+
 def main():
     args = parse_args()
 
@@ -576,6 +749,7 @@ def main():
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16 and torch.cuda.is_available()))
     max_length = args.max_length or 2048
     save_steps = args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 0))
+    eval_steps = args.eval_steps if args.eval_steps is not None else int(train_cfg.get("eval_steps", 0))
     save_total_limit = args.save_total_limit if args.save_total_limit is not None else int(train_cfg.get("save_total_limit", 2))
     logging_cfg = cfg.get("logging", {})
 
@@ -604,6 +778,8 @@ def main():
         print(f"  Max Sequence Length  : {max_length}")
         if save_steps > 0:
             print(f"  Save Checkpoints     : Every {save_steps} steps (Keep last {save_total_limit})")
+        if eval_steps > 0:
+            print(f"  Eval Validation      : Every {eval_steps} steps")
         if args.resume_from_checkpoint:
             print(f"  Resume Source        : {args.resume_from_checkpoint}")
         free_gb = get_free_disk_space_gb(output_dir)
@@ -1107,6 +1283,9 @@ def main():
                         pass
                     mlflow_client = None
 
+    last_eval_step = -1
+    stop_training = False
+
     for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -1190,6 +1369,37 @@ def main():
                     update_latest_checkpoint_link(output_dir, step_dir, is_main_process=is_main_process)
                     prune_checkpoints(output_dir, save_total_limit, is_main_process=is_main_process)
 
+                # Periodic mid-epoch validation evaluation
+                if eval_steps > 0 and global_step % eval_steps == 0:
+                    best_macro_f1, patience_counter, stop_training = run_evaluation(
+                        model=model,
+                        val_loader=val_loader,
+                        device=device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        id_to_tag=id_to_tag,
+                        tag_to_id=tag_to_id,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        epoch=epoch,
+                        epochs=epochs,
+                        global_step=global_step,
+                        output_dir=output_dir,
+                        is_main_process=is_main_process,
+                        is_distributed=is_distributed,
+                        best_macro_f1=best_macro_f1,
+                        patience_counter=patience_counter,
+                        max_patience=max_patience,
+                        args=args,
+                        mlflow_client=mlflow_client,
+                        eval_title=f"Step {global_step} Evaluation"
+                    )
+                    last_eval_step = global_step
+                    if stop_training:
+                        break
+
             if is_main_process and ((step + 1) % progress_interval == 0 or (step + 1) == len(train_loader)):
                 avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
                 current_lr = scheduler.get_last_lr()[0]
@@ -1219,128 +1429,38 @@ def main():
                     print("Dry run test steps completed!")
                 break
 
-        # Validation at end of epoch
-        model.eval()
-        val_loss = 0.0
-        all_preds = []
-        all_labels = []
+        if stop_training:
+            break
 
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                labels = batch["labels"].to(device)
-
-                if use_amp and device.type == "cuda":
-                    with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                else:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-                val_loss += outputs.loss.item()
-
-                preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
-                lbls = labels.cpu().numpy()
-
-                for p_seq, l_seq in zip(preds, lbls):
-                    seq_pred = []
-                    seq_lbl = []
-                    for p, l in zip(p_seq, l_seq):
-                        if l != -100:
-                            seq_pred.append(id_to_tag.get(p, "O"))
-                            seq_lbl.append(id_to_tag.get(l, "O"))
-                    all_preds.append(seq_pred)
-                    all_labels.append(seq_lbl)
-
-        stop_training = False
-        if is_main_process:
-            avg_val_loss = val_loss / max(1, len(val_loader))
-            metrics = compute_entity_metrics(all_preds, all_labels)
-            current_macro_f1 = metrics["macro_f1"]
-
-            print(f"\n[Epoch {epoch} Evaluation (Gold Test Set)] Val Loss: {avg_val_loss:.4f} | Macro F1: {current_macro_f1 * 100:.2f}% | Precision: {metrics['precision'] * 100:.2f}% | Recall: {metrics['recall'] * 100:.2f}%")
-            if mlflow_client is not None:
-                try:
-                    mlflow_client.log_metrics(
-                        {
-                            "validation/loss": avg_val_loss,
-                            "validation/macro_f1": metrics["macro_f1"],
-                            "validation/precision": metrics["precision"],
-                            "validation/recall": metrics["recall"],
-                            "validation/micro_f1": metrics["micro_f1"],
-                            "epoch": epoch,
-                            "best_validation/macro_f1": max(best_macro_f1, current_macro_f1),
-                        },
-                        step=global_step,
-                    )
-                except Exception as e:
-                    print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
-                    try:
-                        mlflow_client.end_run(status="FAILED")
-                    except Exception:
-                        pass
-                    mlflow_client = None
-
-            is_best = current_macro_f1 > best_macro_f1
-            if is_best:
-                best_macro_f1 = current_macro_f1
-                patience_counter = 0
-                print(f"  --> New best model checkpoint! Saving to '{output_dir}'...")
-                save_training_checkpoint(
-                    save_dir=output_dir,
-                    model=model,
-                    tokenizer=tokenizer,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    best_macro_f1=best_macro_f1,
-                    patience_counter=patience_counter,
-                    tag_to_id=tag_to_id,
-                    id_to_tag=id_to_tag,
-                    is_main_process=is_main_process
-                )
-                update_latest_checkpoint_link(output_dir, output_dir, is_main_process=is_main_process)
-            else:
-                patience_counter += 1
-                if patience_counter >= max_patience and not args.dry_run:
-                    print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
-                    stop_training = True
-
-                # Only save to latest_checkpoint if output_dir was not updated with a new best
-                save_training_checkpoint(
-                    save_dir=output_dir / "latest_checkpoint",
-                    model=model,
-                    tokenizer=tokenizer,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    best_macro_f1=best_macro_f1,
-                    patience_counter=patience_counter,
-                    tag_to_id=tag_to_id,
-                    id_to_tag=id_to_tag,
-                    is_main_process=is_main_process
-                )
-
-            # Auto-sync to Hugging Face Hub at end of each epoch if push_to_hub is active
-            if args.push_to_hub and args.hub_model_id:
-                push_checkpoint_to_hub(
-                    repo_id=args.hub_model_id,
-                    folder_path=output_dir,
-                    commit_message=f"Epoch {epoch}/{epochs} - Macro F1: {current_macro_f1 * 100:.2f}% (Best: {best_macro_f1 * 100:.2f}%)",
-                    metrics=metrics,
-                    args=args,
-                    tag_to_id=tag_to_id,
-                    epoch=epoch
-                )
-
-        if is_distributed:
-            stop_tensor = torch.tensor(1 if stop_training else 0, device=device)
-            torch.distributed.broadcast(stop_tensor, src=0)
-            stop_training = bool(stop_tensor.item() == 1)
+        # End of epoch evaluation (run if not already evaluated on this exact global_step)
+        if global_step != last_eval_step:
+            best_macro_f1, patience_counter, stop_training = run_evaluation(
+                model=model,
+                val_loader=val_loader,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                id_to_tag=id_to_tag,
+                tag_to_id=tag_to_id,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                epochs=epochs,
+                global_step=global_step,
+                output_dir=output_dir,
+                is_main_process=is_main_process,
+                is_distributed=is_distributed,
+                best_macro_f1=best_macro_f1,
+                patience_counter=patience_counter,
+                max_patience=max_patience,
+                args=args,
+                mlflow_client=mlflow_client,
+                eval_title=f"Epoch {epoch} Milestone",
+                force_push_hub=True
+            )
+            last_eval_step = global_step
 
         if stop_training:
             break

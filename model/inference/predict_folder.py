@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=1024, help="Sliding window token length")
     parser.add_argument("--stride", type=int, default=256, help="Sliding window stride")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for sliding window chunks")
+    parser.add_argument("--revision", type=str, default=None, help="Model revision (branch, tag, or commit hash)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of files to process")
     args = parser.parse_args()
@@ -46,16 +47,18 @@ def main():
         files = files[:args.limit]
 
     print(f"Found {len(files)} files to process in '{args.input_dir}'.")
-    print(f"Loading model from '{args.model_dir}' onto {args.device} (batch_size: {args.batch_size})...")
+    rev_str = f" (revision: {args.revision})" if args.revision else ""
+    print(f"Loading model from '{args.model_dir}'{rev_str} onto {args.device} (batch_size: {args.batch_size})...")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    tag_to_id, id_to_tag = load_label_mapping(args.model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, revision=args.revision)
+    tag_to_id, id_to_tag = load_label_mapping(args.model_dir, revision=args.revision)
 
     model = EnhancedBertForTokenClassification.from_pretrained(
         args.model_dir,
         num_labels=len(tag_to_id),
         id2label=id_to_tag,
-        label2id=tag_to_id
+        label2id=tag_to_id,
+        revision=args.revision
     ).to(args.device)
 
     for file_idx, f in enumerate(files, start=1):
