@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Any
+from typing import Optional, Any, Sequence, Tuple, List, Dict
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -82,6 +82,9 @@ def chat(
     provider: Optional[str] = None,
     max_tokens: Optional[int] = None,
     messages: Optional[Any] = None,
+    image_bytes: Optional[bytes] = None,
+    image_filename: Optional[str] = None,
+    images: Optional[Sequence[Tuple[str, bytes]]] = None,
 ) -> str:
     """
     Call the LLM chat API using model and provider configured in config.yaml.
@@ -228,6 +231,9 @@ def chat(
             model=target_model,
             thinking=thinking,
             messages=chat_messages,
+            image_bytes=image_bytes,
+            image_filename=image_filename,
+            images=images,
         )
         duration_sec = time.time() - start_time
 

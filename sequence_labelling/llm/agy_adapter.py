@@ -109,6 +109,7 @@ def chat_with_agy(
     messages: Optional[List[Dict[str, Any]]] = None,
     image_bytes: Optional[bytes] = None,
     image_filename: Optional[str] = None,
+    images: Optional[List[Tuple[str, bytes]]] = None,
     conversation_id: Optional[str] = None,
     timeout: Optional[float] = None,
 ) -> Tuple[str, Optional[str], Dict[str, Any]]:
@@ -121,19 +122,36 @@ def chat_with_agy(
     system_text, user_text = format_messages_to_prompt(messages=messages, prompt=prompt, system=system)
     print_timeout_arg = f"{int(timeout)}s" if timeout is not None else "24h"
 
+    # Normalize attached images
+    resolved_images: List[Tuple[str, bytes]] = []
+    if images:
+        resolved_images.extend(images)
+    elif image_bytes:
+        resolved_images.append((image_filename or "target_image.png", image_bytes))
+
     # ─────────────────────────────────────────────────────────────────────────────
-    # Mode 1: Sandboxed Vision Mode (If Image is Attached)
+    # Mode 1: Sandboxed Vision Mode (If Image(s) Attached)
     # ─────────────────────────────────────────────────────────────────────────────
-    if image_bytes:
-        filename = image_filename or "target_image.png"
+    if resolved_images:
         with tempfile.TemporaryDirectory(prefix="agy_vision_sandbox_") as sandbox_dir:
-            image_path = Path(sandbox_dir) / filename
-            image_path.write_bytes(image_bytes)
+            sandbox_path = Path(sandbox_dir)
+            filenames = []
+            for fname, fbytes in resolved_images:
+                img_path = sandbox_path / fname
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                img_path.write_bytes(fbytes)
+                filenames.append(fname)
+
+            if len(filenames) == 1:
+                inspection_target = f"the image '{filenames[0]}'"
+            else:
+                formatted_list = ", ".join(f"'{f}'" for f in filenames)
+                inspection_target = f"the document images: {formatted_list}"
 
             vision_prompt = (
                 f"System instruction: {system_text}\n\n"
-                f"Inspect the image '{filename}' located in your current workspace directory. "
-                f"{user_text}\n"
+                f"Inspect {inspection_target} located in your current workspace directory.\n\n"
+                f"{user_text}\n\n"
                 "Output strictly the final response. Do NOT output conversational greetings or schedule tasks."
             )
 

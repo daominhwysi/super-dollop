@@ -99,7 +99,7 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default=str(WORKSPACE_DIR / "data" / "sequence_labelling_input_data"), help="Output directory for OCR markdown files")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output .md files")
     parser.add_argument("--model", type=str, default=None, help="OCR Vision LLM model identifier")
-    parser.add_argument("--provider", type=str, default=None, help="OCR Provider (e.g. xah, commandcode, nvidia, deepseek, vilao)")
+    parser.add_argument("--provider", type=str, default=None, help="OCR Provider (e.g. agy, codex, xah, commandcode, nvidia, deepseek, vilao)")
     parser.add_argument("--concurrency", type=int, default=None, help="Number of parallel OCR batch requests")
     parser.add_argument("--batch-size", type=int, default=None, help="Number of images per OCR batch request")
     args = parser.parse_args()

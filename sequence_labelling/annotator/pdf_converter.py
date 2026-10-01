@@ -5,6 +5,7 @@ import os
 import random
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Sequence, Union
@@ -39,6 +40,7 @@ from sequence_labelling.annotator.figure_detector import (
     FigureDetection,
     RFDETRFigureDetector,
 )
+from sequence_labelling.llm.agy_adapter import chat_with_agy
 
 
 SYSTEM_PROMPT_LONG_CONTEXT = (
@@ -73,6 +75,16 @@ def prune_think_tags(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
     return cleaned.strip()
+
+
+def prune_code_blocks(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    match = re.match(r"^```(?:xml|markdown|md)?\s*\n?(.*?)\n?```$", stripped, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return stripped
 
 
 def normalize_batch_metadata(batch_text: str, start_page_num: int) -> str:
@@ -280,16 +292,29 @@ class PDFOCRConverter:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        thinking: Optional[Any] = None,
         batch_size: Optional[int] = None,
         concurrency: Optional[int] = None,
         examples_dir: Optional[Union[str, Path]] = None,
         enable_figure_detection: Optional[bool] = None,
         figure_detector: Optional[RFDETRFigureDetector] = None,
     ):
-        self.model = model or OCR_MODEL
-        self.provider = provider or OCR_PROVIDER or "xah"
+        self.provider = (provider or OCR_PROVIDER or "xah").strip().lower()
+        if self.provider in ["agy", "antigravity"]:
+            if model:
+                self.model = model
+            elif OCR_PROVIDER in ["agy", "antigravity"] and OCR_MODEL:
+                self.model = OCR_MODEL
+            else:
+                self.model = "gemini-3.8-flash"
+            self.thinking = thinking
+            self.concurrency = min(concurrency if concurrency is not None else OCR_CONCURRENCY, 2)
+        else:
+            self.model = model or OCR_MODEL
+            self.thinking = thinking
+            self.concurrency = concurrency if concurrency is not None else OCR_CONCURRENCY
+
         self.batch_size = batch_size if batch_size is not None else OCR_BATCH_SIZE
-        self.concurrency = concurrency if concurrency is not None else OCR_CONCURRENCY
 
         self.base_url = (
             base_url
@@ -318,7 +343,7 @@ class PDFOCRConverter:
             )
         self.last_figures: list[dict[str, Any]] = []
         self.client = None
-        if self.api_key:
+        if self.provider not in ["agy", "antigravity"] and self.api_key:
             self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
         # Load few-shot examples
@@ -365,6 +390,7 @@ class PDFOCRConverter:
         # Render and detect in absolute page order before concurrent OCR starts. This
         # makes figure IDs stable regardless of which OCR batch finishes first.
         page_images: List[str] = []
+        page_image_bytes: List[bytes] = []
         page_figures: list[list[FigureDetection]] = []
         next_figure_number = 1
         active_detector = self.figure_detector
@@ -400,6 +426,7 @@ class PDFOCRConverter:
                     print(f"  [Figure Detection Warning] Disabled after page {idx + 1}: {error}")
                     active_detector = None
             page_figures.append(numbered_detections)
+            page_image_bytes.append(img_bytes)
             page_images.append(base64.b64encode(img_bytes).decode("utf-8"))
         doc.close()
         self.last_figures = [
@@ -428,44 +455,40 @@ class PDFOCRConverter:
             b_id, s_idx, e_idx = batch_info
             print(f"  [OCR Batch {b_id + 1}/{len(batches)}] Processing pages {s_idx + 1} to {e_idx}...")
 
-            if self.client is None:
-                raise RuntimeError(
-                    f"Vision LLM API client is not configured for OCR model '{self.model}'. "
-                    f"Please verify API key and provider configuration."
-                )
-
-            try:
-                system_prompt = SYSTEM_PROMPT_LONG_CONTEXT
-                content_parts = [{"type": "text", "text": system_prompt}]
-
+            if self.provider in ["agy", "antigravity"]:
+                batch_images = [
+                    (f"page_{idx + 1}.jpg", page_image_bytes[idx])
+                    for idx in range(s_idx, e_idx)
+                ]
+                page_prompts = []
                 for idx in range(s_idx, e_idx):
-                    page_num = idx + 1
-                    content_parts.append(
-                        {
-                            "type": "text",
-                            "text": (
-                                f"--- Document Page {page_num} ---\n"
-                                f"{format_figure_inventory(page_figures[idx])}"
-                            ),
-                        }
+                    p_num = idx + 1
+                    page_prompts.append(
+                        f"--- Document Page {p_num} (File: page_{p_num}.jpg) ---\n"
+                        f"{format_figure_inventory(page_figures[idx])}"
                     )
-                    content_parts.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{page_images[idx]}"},
-                        }
-                    )
+                batch_user_prompt = "\n\n".join(page_prompts)
 
                 start_ocr_t = time.time()
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                )
+                try:
+                    raw_result, _, usage = chat_with_agy(
+                        prompt=batch_user_prompt,
+                        system=SYSTEM_PROMPT_LONG_CONTEXT,
+                        model=self.model,
+                        thinking=self.thinking,
+                        images=batch_images,
+                        timeout=300,
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"AGY Vision execution failed for batch {b_id + 1} (pages {s_idx + 1}-{e_idx}): {e}"
+                    ) from e
+
                 duration_ocr_sec = time.time() - start_ocr_t
                 try:
                     from sequence_labelling.llm.token_tracker import log_response
                     log_response(
-                        response,
+                        {"usage": usage, "model": self.model},
                         model=self.model,
                         provider=self.provider,
                         caller="pdf_vision_ocr",
@@ -473,18 +496,68 @@ class PDFOCRConverter:
                     )
                 except Exception:
                     pass
-                raw_result = response.choices[0].message.content
-                batch_result = prune_think_tags(raw_result)
-                batch_result = normalize_batch_metadata(batch_result, s_idx + 1)
-                batch_result = project_figures_to_llm_output(
-                    batch_result, page_figures[s_idx:e_idx]
-                )
-                return (b_id, batch_result)
 
-            except Exception as e:
-                raise RuntimeError(
-                    f"Vision LLM API failed for batch {b_id + 1} (pages {s_idx + 1}-{e_idx}): {e}"
-                ) from e
+            else:
+                if self.client is None:
+                    raise RuntimeError(
+                        f"Vision LLM API client is not configured for OCR model '{self.model}'. "
+                        f"Please verify API key and provider configuration."
+                    )
+
+                try:
+                    system_prompt = SYSTEM_PROMPT_LONG_CONTEXT
+                    content_parts = [{"type": "text", "text": system_prompt}]
+
+                    for idx in range(s_idx, e_idx):
+                        page_num = idx + 1
+                        content_parts.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"--- Document Page {page_num} ---\n"
+                                    f"{format_figure_inventory(page_figures[idx])}"
+                                ),
+                            }
+                        )
+                        content_parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{page_images[idx]}"},
+                            }
+                        )
+
+                    messages = list(self.few_shot_messages) + [{"role": "user", "content": content_parts}]
+
+                    start_ocr_t = time.time()
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                    )
+                    duration_ocr_sec = time.time() - start_ocr_t
+                    try:
+                        from sequence_labelling.llm.token_tracker import log_response
+                        log_response(
+                            response,
+                            model=self.model,
+                            provider=self.provider,
+                            caller="pdf_vision_ocr",
+                            duration_sec=duration_ocr_sec,
+                        )
+                    except Exception:
+                        pass
+                    raw_result = response.choices[0].message.content or ""
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Vision LLM API failed for batch {b_id + 1} (pages {s_idx + 1}-{e_idx}): {e}"
+                    ) from e
+
+            batch_result = prune_think_tags(raw_result)
+            batch_result = prune_code_blocks(batch_result)
+            batch_result = normalize_batch_metadata(batch_result, s_idx + 1)
+            batch_result = project_figures_to_llm_output(
+                batch_result, page_figures[s_idx:e_idx]
+            )
+            return (b_id, batch_result)
 
         # Run batches concurrently and print one progress line per completed batch.
         results = [None] * len(batches)
