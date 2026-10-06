@@ -1,7 +1,7 @@
 # ==============================================================================
 # VIETNAMESE SEQUENCE LABELLING v2 - TRAINING CONFIGURATION
 # ==============================================================================
-# Fine-tuning configuration for jhu-clsp/mmBERT-base (280M params, 8192 context)
+# Fine-tuning configuration for aisingapore/SEA-LION-ModernBERT-300M (300M params, 8192 context)
 # Full parameter fine-tuning (no LoRA) with Multi-Scale Sliding Windows & Focal Loss.
 # ==============================================================================
 
@@ -11,24 +11,44 @@ version: "2.0"
 # 1. Base Model & Architecture
 # ------------------------------------------------------------------------------
 model:
-  name_or_path: "jhu-clsp/mmBERT-base"
-  tokenizer_name: "jhu-clsp/mmBERT-base"
+  name_or_path: "aisingapore/SEA-LION-ModernBERT-300M"
+  tokenizer_name: "aisingapore/SEA-LION-ModernBERT-300M"
   max_sequence_length: 8192
-  use_lora: false                        # Full fine-tuning of all 280M parameters (no LoRA)
+  use_lora: false                        # Full fine-tuning of all parameters (no LoRA)
   latex_placeholder: "[LATEX]"
   mask_latex_during_inference: true
 
 # ------------------------------------------------------------------------------
 # 2. Classification Head & Loss Function
 # ------------------------------------------------------------------------------
+loss:
+  type: "focal"
+  focal_gamma: 2.0                    # Calibrated from 1.0 -> 2.0 based on 5.27M dataset study
+  focal_alpha: "smoothed_inverse_freq" # Smoothing power = 0.25
+  label_smoothing: 0.05
+
+model_head:
+  layer_pooling: "sigmoid"            # Replaces softmax
+  num_pooling_layers: 4
+  use_conv_refinement: true           # 1D Depthwise Conv (kernel size = 7)
+  conv_kernel_size: 7
+  dropout_rates: [0.05, 0.10, 0.15, 0.20, 0.25] # Tightened MSD
+  per_branch_focal_loss: true         # Fix ensemble smoothing
+
+# Backward compatibility alias
 head:
-  type: "enhanced"                       # "enhanced" (WeightedLayerPooling + MSD) or "standard"
-  layers_to_pool: 4                      # Softmax weighted pooling across top-4 transformer layers
+  type: "enhanced"                       # "enhanced" (SigmoidWeightedLayerPooling + Conv1D + Tightened MSD)
+  layers_to_pool: 4
+  layer_pooling: "sigmoid"
+  use_conv_refinement: true
+  conv_kernel_size: 7
   multi_sample_dropout: true
-  dropout_prob: 0.20                     # Base dropout rate
-  dropout_samples: 5                     # Number of parallel dropout masks averaged
-  focal_gamma: 1.0                       # Calibrated focusing parameter for balanced class gradients
-  label_smoothing: 0.0                   # 0.0 for crisp BIO token boundaries (v1 Run 4 lesson: non-zero blurs B/I transitions)
+  dropout_rates: [0.05, 0.10, 0.15, 0.20, 0.25]
+  dropout_prob: 0.10
+  dropout_samples: 5
+  focal_gamma: 2.0                       # Calibrated parameter
+  label_smoothing: 0.05
+  per_branch_focal_loss: true
 
 # ------------------------------------------------------------------------------
 # 3. Dataset & Sliding Window Contexts

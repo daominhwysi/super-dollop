@@ -230,7 +230,7 @@ def parse_xml_annotations(tagged_text: str) -> Tuple[str, List[Dict[str, Any]]]:
     raw_chars = []
     spans = []
 
-    tag_pattern = re.compile(r"<(/)?([a-zA-Z_0-9\-]+)(?:\s+([^>]*))?>")
+    tag_pattern = re.compile(r"<(/)?([a-zA-Z_][a-zA-Z0-9_\-]*)(?:\s+([^>]*))?>")
     pos = 0
     tag_stack = []
 

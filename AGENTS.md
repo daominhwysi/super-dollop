@@ -52,3 +52,49 @@ A full audit of the project's deterministic (DET) components confirms:
 
 * **Gating on Major Defects**: A document with unaddressed `CRITICAL` or `MAJOR` issues (e.g. unannotated questions, corrupted stimuli) must never be bypassed to `PASS` purely because of a high composite score.
 * **Deterministic Confirmation Accounting**: When deterministic issues are confirmed by the LLM reviewer as true positives, they must be factored into the penalty and routing pipeline.
+
+---
+
+## 4. Research Reports & Artifacts Storage Convention
+
+> [!IMPORTANT]
+> **All research reports, benchmark analyses, evaluation documents, and exploratory artifacts MUST be written to `artifacts/reports/`.**
+> 
+> Future agent sessions, subagents, and automated research workflows must strictly adhere to the following file layout rules:
+> 1. Store all research reports, architectural assessments, and model evaluation documents in `artifacts/reports/<topic_slug>.md`.
+> 2. Do NOT save exploratory research notes or benchmark evaluations in the repository root or arbitrary directories.
+> 3. Maintain clean separation between research artifacts (`artifacts/reports/`), raw OCR logs (`artifacts/ocr_logs/`), and pipeline batch outputs (`data/sequence_labelling_annotated/`).
+
+---
+
+## 5. Hardware Pre-Flight Check Before Computational Workloads
+
+> [!CAUTION]
+> **ALWAYS check system hardware capabilities BEFORE launching tasks that consume substantial computational power.**
+> 
+> Before executing model fine-tuning, whole-dataset evaluation, sliding-window transformer inferences, or embeddings generation:
+> 1. **Check GPU Availability**: Run a fast hardware inspection (e.g. `torch.cuda.is_available()`, device count, GPU memory).
+> 2. **Never Run Unconstrained Heavy Transformer Loops on CPU**:
+>    - Evaluating a 300M+ parameter model over 60+ documents or thousands of sliding-window chunks on host CPU will throttle CPU cores for 15+ minutes and lock up the workspace.
+>    - If CUDA is absent or CPU-only:
+>      - **Prohibited**: Running unconstrained full-dataset neural inference or training.
+>      - **Required Alternative**: Use `--limit 1` / smoke tests, mocked passes, or fast deterministic evaluation (`DeterministicParser` / `--use_det` which finishes in milliseconds).
+>    - Full model fine-tuning and massive benchmark inference runs are strictly reserved for GPU accelerators (T4 / V100 / A100 / H100).
+
+---
+
+## 6. Default Transformer Backbone: `aisingapore/SEA-LION-ModernBERT-300M`
+
+> [!IMPORTANT]
+> **The canonical default transformer backbone for sequence labelling is `aisingapore/SEA-LION-ModernBERT-300M`.**
+> 
+> (Upgraded from legacy `jhu-clsp/mmBERT-base`).
+> 
+> - **Rationale**:
+>   - ModernBERT architecture with 8192 token context window, Unpad + FlashAttention, and Rotary Embeddings (RoPE).
+>   - Significantly superior tokenization compression and preservation for Vietnamese examination delimiters (`## Câu`, choice markers `A.`, `B.`) compared to mmBERT.
+>   - Sub-millisecond sequence labelling latency budget.
+> - **Configuration Invariant**:
+>   - All default configs (`configs/train_config.yaml`), training scripts (`model/train.py`), and model loaders must target `aisingapore/SEA-LION-ModernBERT-300M`.
+>   - If an agent or script forgets, switch the backbone back to `aisingapore/SEA-LION-ModernBERT-300M`.
+

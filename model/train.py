@@ -261,7 +261,7 @@ def generate_model_readme(
     recall = metrics.get("recall", 0.0)
     micro_f1 = metrics.get("micro_f1", 0.0)
 
-    base_model = base_model_name or (getattr(args, "model_name_or_path", "jhu-clsp/mmBERT-base") if args else "jhu-clsp/mmBERT-base")
+    base_model = base_model_name or (getattr(args, "model_name_or_path", "aisingapore/SEA-LION-ModernBERT-300M") if args else "aisingapore/SEA-LION-ModernBERT-300M")
     lr = getattr(args, "learning_rate", 3e-5) if args else 3e-5
     batch_size = getattr(args, "batch_size", 16) if args else 16
     epochs_val = total_epochs or (getattr(args, "epochs", 10) if args else 10)
@@ -462,7 +462,7 @@ def push_checkpoint_to_hub(
                 tag_to_id=tag_to_id,
                 epoch=epoch,
                 total_epochs=getattr(args, "epochs", None) if args else None,
-                base_model_name=getattr(args, "model_name_or_path", "jhu-clsp/mmBERT-base") if args else "jhu-clsp/mmBERT-base"
+                base_model_name=getattr(args, "model_name_or_path", "aisingapore/SEA-LION-ModernBERT-300M") if args else "aisingapore/SEA-LION-ModernBERT-300M"
             )
             readme_file = folder_path / "README.md"
             readme_file.write_text(readme_content, encoding="utf-8")
@@ -690,11 +690,13 @@ def main():
                 print(f"Warning: Could not parse config '{cfg_path}': {e}")
 
     model_cfg = cfg.get("model", {})
+    loss_cfg = cfg.get("loss", {})
+    model_head_cfg = cfg.get("model_head", {})
     head_cfg = cfg.get("head", {})
     data_cfg = cfg.get("dataset", {})
     train_cfg = cfg.get("training", {})
 
-    model_name = args.model_name or model_cfg.get("name_or_path", "jhu-clsp/mmBERT-base")
+    model_name = args.model_name or model_cfg.get("name_or_path", "aisingapore/SEA-LION-ModernBERT-300M")
     output_dir = Path(args.output_dir or train_cfg.get("output_dir", "results/mmbert_seqlabel_v2"))
     epochs = args.epochs or train_cfg.get("num_train_epochs", 4)
     lr = args.lr or float(train_cfg.get("learning_rate", 2.5e-5))
@@ -705,8 +707,8 @@ def main():
     weight_decay = args.weight_decay or float(train_cfg.get("weight_decay", 0.01))
     scheduler_type = args.lr_scheduler_type or train_cfg.get("lr_scheduler_type", "cosine")
     warmup_ratio = args.warmup_ratio or float(train_cfg.get("warmup_ratio", 0.10))
-    focal_gamma = args.focal_gamma if args.focal_gamma is not None else float(head_cfg.get("focal_gamma", 1.5))
-    label_smoothing = args.label_smoothing if args.label_smoothing is not None else float(head_cfg.get("label_smoothing", 0.0))
+    focal_gamma = args.focal_gamma if args.focal_gamma is not None else float(loss_cfg.get("focal_gamma", head_cfg.get("focal_gamma", 2.0)))
+    label_smoothing = args.label_smoothing if args.label_smoothing is not None else float(loss_cfg.get("label_smoothing", head_cfg.get("label_smoothing", 0.05)))
     seed = args.seed or int(data_cfg.get("seed", 42))
 
     # Determine Mixed Precision (AMP)
@@ -956,7 +958,10 @@ def main():
 
     # 4b. Optional Class Weights for Severe Tag Imbalance (e.g. B-STIMULUS, B-SECTION)
     class_weights = None
-    if args.balance_class_weights or train_cfg.get("balance_class_weights", False):
+    if (args.balance_class_weights 
+        or train_cfg.get("balance_class_weights", False) 
+        or loss_cfg.get("focal_alpha") == "smoothed_inverse_freq"
+        or head_cfg.get("focal_alpha") == "smoothed_inverse_freq"):
         manifest_file = chunks_file.parent / "dataset_manifest.json"
         if manifest_file.exists():
             try:
@@ -968,27 +973,37 @@ def main():
                     for i in range(num_labels):
                         tag_name = id_to_tag.get(i, "O")
                         cnt = tag_dist.get(tag_name.upper(), tag_dist.get(tag_name, 1))
-                        # Smooth inverse frequency with power 0.3
-                        w = (total_cnt / max(cnt, 1)) ** 0.3
+                        # Smooth inverse frequency with power 0.25 (calibrated RFC specification)
+                        w = (total_cnt / max(cnt, 1)) ** 0.25
                         weights.append(w)
                     weights_tensor = torch.tensor(weights, dtype=torch.float)
                     weights_tensor = weights_tensor / weights_tensor.mean()
                     class_weights = weights_tensor.to(device)
                     if is_main_process:
-                        print("Balanced class weights enabled. Normalized weights per tag:")
+                        print("Balanced class weights enabled (power=0.25). Normalized weights per tag:")
                         for i in range(num_labels):
                             print(f"  {id_to_tag[i]:<18}: {class_weights[i].item():.3f}")
             except Exception as e:
                 if is_main_process:
                     print(f"Warning: Could not compute balanced class weights from {manifest_file}: {e}")
 
+    num_layers_to_fuse = int(model_head_cfg.get("num_pooling_layers", head_cfg.get("layers_to_pool", 4)))
+    use_conv_refinement = bool(model_head_cfg.get("use_conv_refinement", head_cfg.get("use_conv_refinement", True)))
+    conv_kernel_size = int(model_head_cfg.get("conv_kernel_size", head_cfg.get("conv_kernel_size", 7)))
+    dropout_rates = tuple(model_head_cfg.get("dropout_rates", head_cfg.get("dropout_rates", [0.05, 0.10, 0.15, 0.20, 0.25])))
+    per_branch_focal_loss = bool(model_head_cfg.get("per_branch_focal_loss", head_cfg.get("per_branch_focal_loss", True)))
+
     model = EnhancedBertForTokenClassification(
         config=config,
         base_model=base_model,
-        num_layers_to_fuse=int(head_cfg.get("layers_to_pool", 4)),
+        num_layers_to_fuse=num_layers_to_fuse,
         focal_gamma=focal_gamma,
         label_smoothing=label_smoothing,
-        class_weights=class_weights
+        class_weights=class_weights,
+        dropout_rates=dropout_rates,
+        use_conv_refinement=use_conv_refinement,
+        conv_kernel_size=conv_kernel_size,
+        per_branch_focal_loss=per_branch_focal_loss
     ).to(device)
 
     # 5b. Checkpoint Resume Resolution (Auto, Local Path, or Hugging Face Hub)

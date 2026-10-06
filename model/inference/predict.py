@@ -162,6 +162,15 @@ def load_label_mapping(model_dir: Union[str, Path], revision: Optional[str] = No
 
 
 
+def generate_hann_window(chunk_len: int) -> torch.Tensor:
+    """Generate Hann taper window: 1.0 in center, smooth cosine falloff at boundaries."""
+    if chunk_len <= 1:
+        return torch.ones(chunk_len, dtype=torch.float32)
+    n = torch.arange(chunk_len, dtype=torch.float32)
+    window = 0.5 * (1.0 - torch.cos(2.0 * torch.pi * (n + 0.5) / chunk_len))
+    return torch.clamp(window, min=0.1, max=1.0)
+
+
 def predict_text(
     text: str,
     model: Any,
@@ -172,38 +181,41 @@ def predict_text(
     stride: int = 256,
     batch_size: int = 8,
     mask_latex: bool = False,
-    use_viterbi: bool = True
+    use_viterbi: bool = True,
+    use_typed_latex: bool = True
 ) -> Dict[str, Any]:
     """
     Runs sequence labeling on a raw text document with sliding window, batched GPU execution,
-    center-weighted overlapping logit pooling, and Constrained Viterbi BIO decoding.
+    Hann window cosine overlapping logit blending, and Constrained Viterbi BIO decoding.
     """
     model.eval()
     clean_text = text.replace("\r\n", "\n").replace("\r", "\n")
     
     if mask_latex:
+        from model.module.dataset import classify_latex
         latex_spans = get_latex_spans(clean_text)
         processed_text = ""
         last_idx = 0
-        for start, end in latex_spans:
-            processed_text += clean_text[last_idx:start] + "[LATEX]"
-            last_idx = end
-        processed_text += clean_text[last_idx:]
-
-        # Precompute interval mapping boundaries for O(log M) binary search
         mod_intervals = []
         cur_mod = 0
         cur_orig = 0
-        latex_len = len("[LATEX]")
-        for o_start, o_end in latex_spans:
-            text_seg_len = o_start - cur_orig
+        for start, end in latex_spans:
+            latex_raw = clean_text[start:end]
+            placeholder = classify_latex(latex_raw) if use_typed_latex else "[LATEX]"
+            placeholder_len = len(placeholder)
+
+            text_seg_len = start - cur_orig
             if text_seg_len > 0:
                 mod_intervals.append((cur_mod, cur_mod + text_seg_len, cur_orig, False))
                 cur_mod += text_seg_len
-                cur_orig = o_start
-            mod_intervals.append((cur_mod, cur_mod + latex_len, cur_orig, True))
-            cur_mod += latex_len
-            cur_orig = o_end
+                cur_orig = start
+            mod_intervals.append((cur_mod, cur_mod + placeholder_len, cur_orig, True))
+            cur_mod += placeholder_len
+            cur_orig = end
+            processed_text += clean_text[last_idx:start] + placeholder
+            last_idx = end
+
+        processed_text += clean_text[last_idx:]
         mod_intervals.append((cur_mod, float("inf"), cur_orig, False))
         mod_starts = [x[0] for x in mod_intervals]
 
@@ -273,6 +285,7 @@ def predict_text(
                 chunk_offsets = chunks_offsets[chunk_idx]
                 logits = b_logits[chunk_offset_in_batch]
                 chunk_len = len(chunk_offsets)
+                hann_weights = generate_hann_window(chunk_len)
 
                 for tok_idx, (start, end) in enumerate(chunk_offsets):
                     if start == end:
@@ -282,9 +295,8 @@ def predict_text(
                     if orig_start >= orig_end:
                         continue
 
-                    # Center-weighted pooling: edge tokens receive lower weight than central tokens
-                    dist_to_edge = min(tok_idx, chunk_len - 1 - tok_idx)
-                    weight = min(1.0, (dist_to_edge + 1) / 32.0)
+                    # Hann window cosine taper: smooth transition at chunk boundaries
+                    weight = float(hann_weights[tok_idx].item())
 
                     key = (orig_start, orig_end)
                     if key not in span_logits:

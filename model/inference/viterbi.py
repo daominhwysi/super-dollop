@@ -121,18 +121,27 @@ def _get_compiled_c_lib():
 
 def build_bio_transition_matrix(
     id_to_tag: Dict[int, str],
-    impossible_penalty: float = -1e6
+    impossible_penalty: float = -10.0,
+    soft_impossible_penalty: Optional[float] = None,
+    use_soft_constraints: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Constructs an exact BIO constraint transition matrix M [K, K] and start penalty vector [K].
+    Constructs a BIO constraint transition matrix M [K, K] and start penalty vector [K].
+    With soft penalty theta = -10.0, severe invalid transitions are heavily discouraged
+    but can be overridden if the emission confidence difference exceeds the threshold.
     
     Invariants enforced:
-    1. An I-{label} tag CANNOT start a sequence (start_trans = -1e6).
-    2. An I-{label} tag CANNOT follow O.
-    3. An I-{label} tag CANNOT follow B-{other} or I-{other} for other != label.
-    4. An I-{label} tag CAN ONLY follow B-{label} or I-{label}.
+    1. An I-{label} tag is penalized at sequence start (start_trans = penalty).
+    2. An I-{label} tag following O is penalized.
+    3. An I-{label} tag following B-{other} or I-{other} for other != label is penalized.
+    4. An I-{label} tag transitions from B-{label} or I-{label} have zero penalty.
     5. All other transitions (O -> B-*, B-* -> O, B-* -> B-*, O -> O) are structurally legal.
     """
+    if soft_impossible_penalty is not None:
+        penalty = soft_impossible_penalty if use_soft_constraints else -1e6
+    else:
+        penalty = impossible_penalty if use_soft_constraints else -1e6
+
     K = len(id_to_tag)
     M = np.zeros((K, K), dtype=np.float32)
     start_trans = np.zeros(K, dtype=np.float32)
@@ -144,7 +153,7 @@ def build_bio_transition_matrix(
 
         # Step 0 constraint: sequence cannot start with I-
         if is_i_i:
-            start_trans[i] = impossible_penalty
+            start_trans[i] = penalty
 
         for j in range(K):
             tag_j = id_to_tag[j]
@@ -155,7 +164,7 @@ def build_bio_transition_matrix(
             if is_j_i:
                 # I-X can ONLY follow B-X or I-X
                 if tag_i == "O" or label_i != label_j:
-                    M[i, j] = impossible_penalty
+                    M[i, j] = penalty
 
     return M, start_trans
 
@@ -163,11 +172,41 @@ def build_bio_transition_matrix(
 class ConstrainedViterbiDecoder:
     """
     High-throughput Constrained Viterbi Decoder with C acceleration & NumPy fallback.
+    Supports soft impossible transition penalty (theta = -10.0) to prevent catastrophic
+    path abandons on OCR boundary noise while preserving BIO syntax.
     """
-    def __init__(self, id_to_tag: Dict[int, str], impossible_penalty: float = -1e6):
+    def __init__(
+        self,
+        id_to_tag: Optional[Dict[int, str]] = None,
+        impossible_penalty: Optional[float] = None,
+        bio_labels: Optional[Union[List[str], Dict[int, str]]] = None,
+        soft_impossible_penalty: float = -10.0,
+        use_soft_constraints: bool = True
+    ):
+        if id_to_tag is None and bio_labels is not None:
+            if isinstance(bio_labels, dict):
+                id_to_tag = bio_labels
+            else:
+                id_to_tag = {i: tag for i, tag in enumerate(bio_labels)}
+        elif id_to_tag is None:
+            raise ValueError("Either id_to_tag or bio_labels must be provided.")
+
         self.id_to_tag = id_to_tag
+        self.labels = [id_to_tag[i] for i in range(len(id_to_tag))]
+        self.num_labels = len(id_to_tag)
         self.K = len(id_to_tag)
-        self.transition_matrix, self.start_trans = build_bio_transition_matrix(id_to_tag, impossible_penalty)
+
+        if impossible_penalty is not None:
+            eff_penalty = impossible_penalty if use_soft_constraints else -1e6
+        else:
+            eff_penalty = soft_impossible_penalty if use_soft_constraints else -1e6
+
+        self.penalty = eff_penalty
+        self.transition_matrix, self.start_trans = build_bio_transition_matrix(
+            id_to_tag,
+            impossible_penalty=eff_penalty,
+            use_soft_constraints=use_soft_constraints
+        )
         
         # Load compiled C library
         self._c_lib = _get_compiled_c_lib()
