@@ -1,7 +1,7 @@
 import unittest
 import random
 import re
-from tools.build_training_dataset import augment_real_document
+from tools.dataset.build_training_dataset import augment_real_document
 
 
 class TestRealDataAugmentation(unittest.TestCase):

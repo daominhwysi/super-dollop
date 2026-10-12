@@ -265,7 +265,7 @@ def test_edit_review_set_branch_dir_saving(tmp_path):
     from unittest.mock import MagicMock
     from pathlib import Path
     from sequence_labelling.annotator.revision_loop import RevisionLoopResult
-    from tools.edit_review_set import process_single_revision
+    from tools.review.edit_review_set import process_single_revision
 
     annotated_dir = tmp_path / "sequence_labelling_annotated"
     annotated_dir.mkdir(parents=True)
@@ -357,7 +357,7 @@ def test_edit_review_set_reuse_prerun_logs(tmp_path):
     from pathlib import Path
     from sequence_labelling.annotator.revision_loop import RevisionLoopResult
     from sequence_labelling.annotator.reviewer import ReviewReport, ReviewDecision
-    from tools.edit_review_set import process_single_revision
+    from tools.review.edit_review_set import process_single_revision
 
     mock_loop = MagicMock()
     mock_loop.run.return_value = RevisionLoopResult(
@@ -438,7 +438,7 @@ def test_edit_review_set_saves_unresolved_candidate_and_checkpoint(tmp_path):
     from pathlib import Path
     from unittest.mock import MagicMock
     from sequence_labelling.annotator.revision_loop import RevisionLoopResult
-    from tools.edit_review_set import process_single_revision
+    from tools.review.edit_review_set import process_single_revision
 
     annotated_dir = tmp_path / "annotated"
     exam_dir = annotated_dir / "exam_003"
@@ -493,7 +493,7 @@ def test_edit_review_set_saves_unresolved_candidate_and_checkpoint(tmp_path):
 
 def test_edit_review_set_resumes_compatible_branch_candidate(tmp_path):
     from pathlib import Path
-    from tools.edit_review_set import apply_branch_resume, _sha256_file
+    from tools.review.edit_review_set import apply_branch_resume, _sha256_file
 
     original = tmp_path / "original.xml"
     raw = tmp_path / "original.md"

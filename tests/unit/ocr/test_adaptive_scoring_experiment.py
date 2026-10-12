@@ -1,7 +1,7 @@
 """Unit tests for the experimental adaptive scoring system."""
 
 import pytest
-from tools.benchmarks.eval_adaptive_scoring_experiment import (
+from tools.evaluation.eval_adaptive_scoring_experiment import (
     DocumentScaleContext,
     ScoringEvaluator,
     CATEGORY_PENALTY_CAPS,

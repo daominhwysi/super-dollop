@@ -201,10 +201,18 @@ def generate_parser_summary_report(
     return "\n".join(md)
 
 
+import argparse
+
 def main():
-    default_ocr_file = "/home/daominhwysi/project/azozo-experiment/tests/ocr_benchmarks/results/ocr_input_20260722_222013.md"
-    args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
-    ocr_file = args[0] if args else default_ocr_file
+    parser = argparse.ArgumentParser(description="Parser Visualization Tool for Azozo Long-Context Parser Engine")
+    parser.add_argument("ocr_file", nargs="?", default=None, help="Path to OCR markdown file")
+    args = parser.parse_args()
+
+    ocr_file = args.ocr_file
+    if not ocr_file or not os.path.exists(ocr_file):
+        print(f"Error: OCR markdown file '{ocr_file}' does not exist.")
+        print("Usage: uv run python tools/visualize/visualize_parser.py <path_to_ocr_markdown>")
+        sys.exit(1)
 
     input_stem = os.path.splitext(os.path.basename(ocr_file))[0]
     base_code_dir = os.path.dirname(os.path.abspath(__file__))

@@ -383,7 +383,7 @@ class OnlineAugmentedDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         from synthetic_exam_generator.reconstructor import reconstruct_exam, ReconstructorConfig
-        from tools.build_training_dataset import align_spans_to_bio
+        from tools.dataset.build_training_dataset import align_spans_to_bio
 
         if not self.index_map:
             doc_idx = idx

@@ -846,7 +846,7 @@ def main():
     if not chunks_file.exists():
         if is_main_process:
             print(f"Error: BIO chunks file '{chunks_file}' does not exist.")
-            print("Please pass --dataset_repo_id or run 'tools/build_training_dataset.py' first.")
+            print("Please pass --dataset_repo_id or run 'tools/dataset/build_training_dataset.py' first.")
         sys.exit(1)
 
     # 4. Load Datasets
