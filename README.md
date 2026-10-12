@@ -23,7 +23,6 @@ Important components:
 - `sequence_labelling/annotator/reviewer.py`: deterministic auditing, LLM semantic review, scoring, and routing.
 - `sequence_labelling/annotator/editor.py`: exact Search/Replace XML repair.
 - `sequence_labelling/annotator/revision_loop.py`: isolated editor/reviewer rounds.
-- `review_studio/`: browser-based audit and editing interface.
 - `sequence_labelling/api.py`: OCR/job and OpenAI-compatible worker API.
 
 ## Requirements and setup
@@ -31,7 +30,6 @@ Important components:
 - Python 3.10 or newer
 - [`uv`](https://docs.astral.sh/uv/)
 - Credentials for the providers/models you use
-- Optional: `jinja2` for Review Studio; it is imported by the Studio but is not currently declared in `pyproject.toml`
 
 Install the project environment:
 
@@ -112,7 +110,7 @@ An annotated document commonly contains:
 ### 1. OCR PDFs or images
 
 ```bash
-uv run python tools/batch_ocr_raw_dataset.py \
+uv run python tools/ocr/batch_ocr_raw_dataset.py \
   --raw-dir data/sequence_labelling_input_data_raw \
   --out-dir data/sequence_labelling_input_data \
   --provider codex \
@@ -124,7 +122,7 @@ Use `--overwrite` only when intentionally regenerating existing Markdown. The OC
 ### 2. Annotate OCR Markdown
 
 ```bash
-uv run python tools/annotate_sequence_labelling_dataset.py \
+uv run python tools/annotation/annotate_sequence_labelling_dataset.py \
   --input_dir data/sequence_labelling_input_data \
   --output_dir data/sequence_labelling_annotated \
   --provider agy \
@@ -137,7 +135,7 @@ The tool skips documents with existing `merged.json` unless `--overwrite` is sup
 ### 3. Audit the annotated dataset
 
 ```bash
-uv run python tools/batch_review_annotated.py \
+uv run python tools/review/batch_review_annotated.py \
   --annotated-dir data/sequence_labelling_annotated \
   --raw-dir data/sequence_labelling_input_data \
   --provider codex \
@@ -151,7 +149,7 @@ The reviewer writes a Markdown report and a JSON report beside the requested out
 For a fast deterministic-only audit:
 
 ```bash
-uv run python tools/batch_review_annotated.py \
+uv run python tools/review/batch_review_annotated.py \
   --annotated-dir data/sequence_labelling_annotated \
   --raw-dir data/sequence_labelling_input_data \
   --no-llm
@@ -162,7 +160,7 @@ uv run python tools/batch_review_annotated.py \
 The editor/reviewer loop never overwrites the canonical annotated directory. It writes candidates and checkpoint artifacts to the branch directory.
 
 ```bash
-uv run python tools/edit_review_set.py \
+uv run python tools/review/edit_review_set.py \
   --report data/review_report.json \
   --filter needs_revision \
   --concurrency 4 \
@@ -198,7 +196,7 @@ The aggregate report is checkpointed as documents finish. To keep a long run ali
 
 ```bash
 tmux new-session -d -s sequence-review \
-  'uv run python tools/edit_review_set.py --report data/review_report.json --filter needs_revision --concurrency 4 --reuse-prerun-logs --auto-save --branch-dir data/sequence_labelling_annotated_branch --out-report artifacts/revision_resolution_report.json 2>&1 | tee artifacts/full_revision_loop.log'
+  'uv run python tools/review/edit_review_set.py --report data/review_report.json --filter needs_revision --concurrency 4 --reuse-prerun-logs --auto-save --branch-dir data/sequence_labelling_annotated_branch --out-report artifacts/revision_resolution_report.json 2>&1 | tee artifacts/full_revision_loop.log'
 
 tmux attach -t sequence-review
 ```
@@ -206,7 +204,7 @@ tmux attach -t sequence-review
 ### 5. Reparse failed documents
 
 ```bash
-uv run python tools/reparse_review_set.py \
+uv run python tools/review/reparse_review_set.py \
   --report data/review_report.json \
   --filter all_failures \
   --raw-dir data/sequence_labelling_input_data \
@@ -218,7 +216,7 @@ uv run python tools/reparse_review_set.py \
 For a combined reparse-and-review workflow:
 
 ```bash
-uv run python tools/reparse_and_review.py \
+uv run python tools/review/reparse_and_review.py \
   --report data/review_report.json \
   --filter all_failures \
   --stage all \
@@ -230,7 +228,7 @@ Use `--stage reparse-only`, `--stage review-only`, `--doc-id`, `--limit`, or `--
 ### 6. Re-merge annotation chunks
 
 ```bash
-uv run python tools/remerge_annotated_dataset.py \
+uv run python tools/annotation/remerge_annotated_dataset.py \
   --input data/sequence_labelling_annotated \
   --concurrency 8
 ```
@@ -313,25 +311,6 @@ curl -X POST http://localhost:8100/v1/jobs \
 ```
 
 Jobs are held in process memory. They are not a durable queue and disappear when the worker restarts.
-
-### Review Studio
-
-Start the interactive reviewer/editor backend:
-
-```bash
-PYTHONPATH=. uv run uvicorn review_studio.review_studio:app \
-  --host 0.0.0.0 \
-  --port 8200
-```
-
-Open `http://localhost:8200/`. The Studio supports document browsing, deterministic audits, auto-fix preview, XML editing, and saving updated `merged.xml`/`merged.json` files. Configure alternate locations with:
-
-```bash
-export SEQUENCE_LABEL_DATA_DIR=/path/to/data
-export SEQUENCE_LABEL_REVIEW_REPORT=/path/to/review_report.json
-```
-
-The Studio save endpoint writes to the selected document path, so use it against a branch or disposable copy when preserving canonical annotations is required.
 
 ## Configuration and providers
 

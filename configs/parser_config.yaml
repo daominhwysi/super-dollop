@@ -62,16 +62,16 @@ models:
     description: "Passage-locked greedy chunker token budget (12k-16k tokens per chunk)"
 
   reviewer:
-    model_name: "gpt-5.6-luna"
-    provider: "codex"
-    thinking: high
+    model_name: "gemini-3.8-flash"
+    provider: "agy"
+    thinking: low
     min_score_threshold: 75
     description: "Reviewer agent for rating sequence labelling XML quality and discarding malfunctioned documents"
 
   editor:
     model_name: "gemini-3.8-flash"
     provider: "agy"
-    thinking: high
+    thinking: low
     description: "Precision surgical editor agent using Search/Replace diff blocks"
 
 logging:
