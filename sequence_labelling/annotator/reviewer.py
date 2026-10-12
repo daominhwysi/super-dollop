@@ -20,6 +20,7 @@ from sequence_labelling.config import (
     get_provider_api_key,
 )
 from sequence_labelling.llm.deepseek_client import chat
+from sequence_labelling.llm.agy_rate_limiter import is_quota_or_cap_error
 from sequence_labelling.parser.deterministic_parser import parse_chunk_deterministic
 
 # Allowed tag schema for sequence labelling & embedded markdown/HTML structure
@@ -644,6 +645,16 @@ class DeterministicAuditor:
         if len(det_questions) == 0:
             return issues, 100.0, metrics
 
+        # Extract option labels and sections from XML to avoid false positives for sub-questions or sections
+        xml_option_labels = {
+            re.sub(r"[^\w\s]", "", m.group(1)).strip().lower()
+            for m in re.finditer(r"<option_label>(.*?)</option_label>", xml_content, re.DOTALL)
+        }
+        xml_sections = {
+            re.sub(r"[^\w\s]", "", m.group(1)).strip().lower()
+            for m in re.finditer(r"<section>(.*?)</section>", xml_content, re.DOTALL)
+        }
+
         # 3. Align DET questions against XML questions
         matched_det_indices = set()
         unannotated_questions = []
@@ -651,6 +662,7 @@ class DeterministicAuditor:
         for d_idx, q_det in enumerate(det_questions):
             d_label = q_det["label"]
             d_nums = re.findall(r"\d+", d_label)
+            d_int_nums = [int(n) for n in d_nums]
             d_clean_label = re.sub(r"[^\w\s]", "", d_label).strip().lower()
             d_stem_norm = re.sub(r"\s+", " ", q_det["stem"]).strip().lower()
             d_stem_prefix = d_stem_norm[:50]
@@ -659,11 +671,12 @@ class DeterministicAuditor:
             for x_idx, q_xml in enumerate(xml_questions):
                 x_label = q_xml["label"]
                 x_nums = re.findall(r"\d+", x_label)
+                x_int_nums = [int(n) for n in x_nums]
                 x_clean_label = re.sub(r"[^\w\s]", "", x_label).strip().lower()
                 x_stem_norm = re.sub(r"\s+", " ", q_xml["stem"]).strip().lower()
 
-                # Strategy A: Question numbers match and labels align
-                if d_nums and x_nums and d_nums == x_nums:
+                # Strategy A: Question numbers match (handling leading zeros e.g. Câu 03 vs Câu 3)
+                if (d_nums and x_nums and d_nums == x_nums) or (d_int_nums and x_int_nums and d_int_nums == x_int_nums):
                     # If numbers match, verify stem isn't completely contradictory if both stems exist
                     if len(d_stem_prefix) >= 15 and len(x_stem_norm) >= 15:
                         sim = SequenceMatcher(None, d_stem_prefix, x_stem_norm[:60]).ratio()
@@ -688,6 +701,14 @@ class DeterministicAuditor:
                     if sim >= 0.75:
                         is_matched = True
                         break
+
+            # Strategy D: If DET matched a sub-question (1), 2), a)) that is legitimately tagged in <option_label>
+            # or an exam section (Phần 1, Phần II) legitimately tagged in <section>, mark as matched
+            if not is_matched:
+                if d_clean_label in xml_option_labels:
+                    is_matched = True
+                elif any(d_clean_label in s or s in d_clean_label for s in xml_sections if len(s) >= 4):
+                    is_matched = True
 
             if is_matched:
                 matched_det_indices.add(d_idx)
@@ -1582,6 +1603,10 @@ When reporting issues, you MUST categorize each error using one of the following
 3. **Question Labels without Stems (Cloze / Fill-in Exams)**: A `<question_label>` does NOT need to be followed by a `<stem>`. In cloze tests, fill-in-the-blank items, or passage items where the blank/prompt is embedded in a reading passage or stimulus, questions legitimately contain only `<question_label>` followed immediately by `<option_label>`. These are completely VALID. NEVER report `missing_stem` for cloze items or questions with valid choices.
 4. **Format Invariance**: Non-consecutive question numbering, essay/short-answer questions without choices, and non-exam reference documents with 0 questions in both raw text and XML are completely VALID.
 5. **Terminal Sentinel (<|END|>)**: Annotated XML documents are stored WITHOUT `<|END|>` (it is automatically stripped after generation). Normal documents end with standard XML closing tags (such as `</explanation>`, `</option_text>`, or `</stem>`). The absence of `<|END|>` is completely EXPECTED and NORMAL. You MUST NEVER report missing `<|END|>` as an error, truncation, or defect. (If `<|END|>` happens to be present, it is also harmless and must not be flagged as a syntax error).
+6. **Markdown Headers inside Question Labels (## Câu X)**: In markdown-formatted OCR exams, question labels legitimately include markdown heading hashes (e.g. `<question_label>## Câu 1.</question_label>` or `<question_label>## Bài 1:</question_label>`). This is 100% VALID and EXPECTED. NEVER flag markdown header hashes inside `<question_label>` as `mislabelled_element` or formatting errors! Tagging individual question headers as `<section>` instead of `<question_label>` IS a `mislabelled_element` defect.
+7. **Grading Guides & Solution Keys (HƯỚNG DẪN CHẤM)**: All scoring guides, rubric tables, and answer keys belong in `<explanation>...</explanation>`. Tagging scoring guide rows as new exam questions (`<question_label>`, `<stem>`) is a `mislabelled_element` defect.
+8. **LaTeX Math Comparisons & Angle Brackets**: Mathematical comparisons such as `$x < 0$`, `$a > b$`, `$\\alpha < \\beta$`, or fractions inside LaTeX math spans are literal source text, NEVER XML tags. NEVER report unclosed angle brackets inside LaTeX formulas as `broken_system_tag`!
+9. **Severity Calibration on Isolated Errors**: If a formatting discrepancy is an isolated one-off occurrence (e.g. 1 question label or 1 option tag in a 40+ question document), rate it as MINOR, NOT MAJOR, to prevent compound penalty distortion on otherwise high-quality documents.
 
 ---
 
@@ -1662,7 +1687,7 @@ Respond ONLY with a valid JSON object with NO markdown codeblocks or extra text:
         deterministic_metrics: Dict[str, Any],
         raw_ocr_text: Optional[str] = None,
         deterministic_issues: Optional[List[Dict[str, Any]]] = None,
-        max_xml_chars: int = 80000,
+        max_xml_chars: int = 40000,
     ) -> Optional[Dict[str, Any]]:
         """
         Calls DeepSeek / LLM to semantically rate annotation quality and detect subtle malfunctions.
@@ -1762,6 +1787,8 @@ Respond ONLY with a valid JSON object with NO markdown codeblocks or extra text:
                     print(f"[Reviewer Warning] DeepSeek LLM JSON parse failed: {parse_err}")
                     return None
         except Exception as e:
+            if is_quota_or_cap_error(e):
+                raise e
             print(f"[Reviewer Warning] DeepSeek LLM evaluation call failed: {e}")
             return None
 
@@ -2117,22 +2144,55 @@ class AnnotationReviewerAgent:
         raw_content = None
         raw_p = Path(raw_path) if raw_path else None
 
-        # Auto-discover matching raw .md file if not provided
-        if not raw_p or not raw_p.exists():
-            # Check parallel folder under sequence_labelling_input_data
-            str_path = str(xml_p)
-            if "sequence_labelling_annotated" in str_path:
-                candidate_raw_str = str_path.replace(
-                    "sequence_labelling_annotated", "sequence_labelling_input_data"
-                )
-                candidate_p = Path(candidate_raw_str)
-                # If path was .../exam_123/merged.xml, candidate is .../exam_123.md
-                if candidate_p.name in ["merged.xml", "merged.json"]:
-                    candidate_md = candidate_p.parent.with_suffix(".md")
-                    if candidate_md.exists():
-                        raw_p = candidate_md
+        # Sibling .json check for chunk-level files (100% exact verbatim ground truth)
+        if xml_p.name.startswith("chunk_") or (xml_p.parent.is_dir() and xml_p.parent.name == "chunks"):
+            sibling_json = xml_p.with_suffix(".json")
+            if sibling_json.exists():
+                try:
+                    with open(sibling_json, "r", encoding="utf-8", errors="replace") as f_cj:
+                        c_data = json.load(f_cj)
+                        if isinstance(c_data, dict) and c_data.get("raw_chunk_text"):
+                            raw_content = c_data["raw_chunk_text"]
+                            if not raw_p:
+                                raw_p = sibling_json
+                except Exception:
+                    pass
 
-        if raw_p and raw_p.exists():
+        # If raw_p was provided directly and is a chunk JSON
+        if raw_content is None and raw_p and raw_p.exists() and raw_p.suffix == ".json":
+            try:
+                with open(raw_p, "r", encoding="utf-8", errors="replace") as f_raw:
+                    c_data = json.load(f_raw)
+                    if isinstance(c_data, dict) and c_data.get("raw_chunk_text"):
+                        raw_content = c_data["raw_chunk_text"]
+            except Exception:
+                pass
+
+        # Auto-discover matching raw .md file if not provided and not a chunk
+        if raw_content is None and (not raw_p or not raw_p.exists()):
+            str_path = str(xml_p)
+            for candidate_folder in ["batch_500_diverse_raw", "sequence_labelling_input_data"]:
+                if "sequence_labelling_annotated" in str_path:
+                    candidate_raw_str = str_path.replace(
+                        "sequence_labelling_annotated", candidate_folder
+                    )
+                    candidate_p = Path(candidate_raw_str)
+                    if candidate_p.name in ["merged.xml", "merged.json"]:
+                        candidate_md = candidate_p.parent.parent / f"{candidate_p.parent.name}.md"
+                        if not candidate_md.exists():
+                            candidate_md = candidate_p.parent.with_suffix(".md")
+                        if candidate_md.exists():
+                            raw_p = candidate_md
+                            break
+                    else:
+                        candidate_md = candidate_p.parent / f"{candidate_p.stem}.md"
+                        if not candidate_md.exists():
+                            candidate_md = candidate_p.with_suffix(".md")
+                        if candidate_md.exists():
+                            raw_p = candidate_md
+                            break
+
+        if raw_content is None and raw_p and raw_p.exists():
             with open(raw_p, "r", encoding="utf-8", errors="replace") as f:
                 raw_content = f.read()
 
@@ -2154,7 +2214,14 @@ class AnnotationReviewerAgent:
                 except Exception:
                     pass
 
-        doc_id = xml_p.parent.name if xml_p.name in ["merged.xml", "merged.json"] else xml_p.stem
+        if xml_p.name in ["merged.xml", "merged.json"]:
+            doc_id = xml_p.parent.name
+        elif xml_p.parent.is_dir() and xml_p.parent.name == "chunks" and xml_p.name.startswith("chunk_"):
+            doc_id = f"{xml_p.parent.parent.name}::{xml_p.stem}"
+        elif xml_p.name.startswith("chunk_") and "::" not in xml_p.stem:
+            doc_id = f"{xml_p.parent.name}::{xml_p.stem}"
+        else:
+            doc_id = xml_p.stem
 
         # Check if existing audit report has cached LLM result to preserve
         cached_llm = None
@@ -2300,20 +2367,33 @@ class AnnotationReviewerAgent:
         return result
 
     @staticmethod
+    def _chunk_sort_key(p: Path) -> int:
+        m = re.search(r"chunk_(\d+)", p.name)
+        return int(m.group(1)) if m else 999
+
+    @staticmethod
     def discover_review_targets(
         annotated_dir: Union[str, Path],
-        max_merged_tokens: int = 500_000,
+        granularity: str = "auto",
+        max_merged_tokens: int = 15_000,
     ) -> List[Path]:
         """
-        Discovers XML files for review following the threshold rule:
-        - If a document is <= max_merged_tokens (~500k tokens), review the merged.xml version.
-        - If a document exceeds max_merged_tokens, fallback to chunk level (chunk_*.xml).
-        - Never review both merged and chunk versions for the same document.
+        Discovers XML files for review according to granularity mode:
+        - 'chunk': Audits individual chunk XMLs (chunk_*.xml). Enforces token budget <= 15k tokens.
+        - 'document': Audits monolithic merged.xml documents.
+        - 'auto': Checks estimated token size:
+            * > max_merged_tokens (~15k tokens) and has chunks -> Chunk level (chunk_*.xml)
+            * <= max_merged_tokens or single-chunk -> Document level (merged.xml)
         - Standalone XML files are reviewed as-is.
+        - Never reviews both merged and chunk versions for the same document.
         """
         base_dir = Path(annotated_dir)
         if base_dir.is_file():
             return [base_dir]
+
+        granularity = (granularity or "auto").strip().lower()
+        if granularity not in {"chunk", "document", "auto"}:
+            raise ValueError(f"Invalid granularity: {granularity}. Must be 'chunk', 'document', or 'auto'.")
 
         targets: List[Path] = []
 
@@ -2325,26 +2405,40 @@ class AnnotationReviewerAgent:
             exam_dir = m_file.parent
             exam_dirs_with_merged.add(exam_dir)
 
-            try:
-                content = m_file.read_text(encoding="utf-8", errors="replace")
-                # Estimate tokens: approx 3.5 chars per token
-                est_tokens = len(content) / 3.5
-            except Exception:
-                est_tokens = 0
-
             chunks_dir = exam_dir / "chunks"
-            chunk_files = sorted(chunks_dir.glob("chunk_*.xml")) if chunks_dir.exists() else []
+            chunk_files = (
+                sorted(
+                    [c for c in chunks_dir.glob("chunk_*.xml") if not c.name.endswith(".audit.xml")],
+                    key=AnnotationReviewerAgent._chunk_sort_key,
+                )
+                if chunks_dir.exists()
+                else []
+            )
 
-            if est_tokens > max_merged_tokens and chunk_files:
-                # Fallback to chunk level if document exceeds 500k token threshold
-                targets.extend(chunk_files)
-            else:
-                # Process merged level
+            if granularity == "chunk":
+                if chunk_files:
+                    targets.extend(chunk_files)
+                else:
+                    targets.append(m_file)
+            elif granularity == "document":
                 targets.append(m_file)
+            else:  # auto
+                try:
+                    content = m_file.read_text(encoding="utf-8", errors="replace")
+                    est_tokens = len(content) / 3.5
+                except Exception:
+                    est_tokens = 0
+
+                if est_tokens > max_merged_tokens and chunk_files:
+                    targets.extend(chunk_files)
+                else:
+                    targets.append(m_file)
 
         # 2. Find any chunk files in folders that DO NOT have merged.xml
         all_chunks = sorted(base_dir.rglob("chunk_*.xml"))
         for c_file in all_chunks:
+            if c_file.name.endswith(".audit.xml"):
+                continue
             exam_dir = c_file.parent.parent if c_file.parent.name == "chunks" else c_file.parent
             if exam_dir not in exam_dirs_with_merged:
                 targets.append(c_file)
@@ -2352,12 +2446,247 @@ class AnnotationReviewerAgent:
         # 3. Find any standalone .xml files (not named merged.xml and not chunk_*.xml)
         all_xml = sorted(base_dir.rglob("*.xml"))
         for x_file in all_xml:
-            if x_file.name == "merged.xml" or x_file.name.startswith("chunk_"):
+            if x_file.name == "merged.xml" or x_file.name.startswith("chunk_") or x_file.name.endswith(".audit.xml"):
                 continue
             targets.append(x_file)
 
-        targets.sort()
+        def _sort_target(p: Path) -> Tuple[str, int, str]:
+            m = re.search(r"chunk_(\d+)", p.name)
+            idx = int(m.group(1)) if m else -1
+            return (str(p.parent), idx, p.name)
+
+        targets.sort(key=_sort_target)
         return targets
+
+    def rollup_chunk_audits(
+        self,
+        exam_dir: Union[str, Path],
+        chunk_reports: Optional[List[ReviewReport]] = None,
+        branch_dir: Optional[Union[str, Path]] = None,
+        save_audit_json: bool = True,
+        reconcile_merged: bool = True,
+    ) -> Optional[ReviewReport]:
+        """
+        Synthesizes a document-level ReviewReport and reconciles merged.xml from chunk audits.
+        When all chunks for an examination achieve PASS:
+        1. Loads branch chunks (falling back to original chunks for untouched clean ones).
+        2. Reconciles chunks via sequence_reconciler.merge_chunk_xmls.
+        3. Verifies source text fidelity invariant: remove_annotation_tags(merged_xml) == original_text.
+        4. Runs deterministic audit on reconciled merged.xml for numbering continuity.
+        5. Saves reconciled merged.xml, merged.json, and audit_report.json to branch (or exam_dir).
+        """
+        exam_p = Path(exam_dir).resolve()
+        exam_name = exam_p.name
+        chunks_dir = exam_p / "chunks"
+        if not chunks_dir.exists():
+            return None
+
+        chunk_xmls = sorted(
+            [c for c in chunks_dir.glob("chunk_*.xml") if not c.name.endswith(".audit.xml")],
+            key=self._chunk_sort_key,
+        )
+        if not chunk_xmls:
+            return None
+
+        # Gather reports for each chunk
+        reports_by_chunk: Dict[str, ReviewReport] = {}
+        if chunk_reports:
+            for r in chunk_reports:
+                if r.doc_id.startswith(f"{exam_name}::"):
+                    c_name = r.doc_id.split("::", 1)[1]
+                    reports_by_chunk[c_name] = r
+                elif r.file_path:
+                    fp = Path(r.file_path)
+                    if fp.stem in [cx.stem for cx in chunk_xmls] and exam_name in str(fp):
+                        reports_by_chunk[fp.stem] = r
+
+        resolved_chunk_reports: List[ReviewReport] = []
+        for c_xml in chunk_xmls:
+            c_stem = c_xml.stem
+            rep = reports_by_chunk.get(c_stem)
+            if not rep and branch_dir:
+                branch_aud = Path(branch_dir) / exam_name / "chunks" / f"{c_stem}.audit.json"
+                if branch_aud.exists():
+                    try:
+                        aud_data = json.loads(branch_aud.read_text(encoding="utf-8"))
+                        rep = ReviewReport.model_validate(aud_data)
+                    except Exception:
+                        pass
+            if not rep:
+                orig_aud = c_xml.with_suffix(".audit.json")
+                if orig_aud.exists():
+                    try:
+                        aud_data = json.loads(orig_aud.read_text(encoding="utf-8"))
+                        rep = ReviewReport.model_validate(aud_data)
+                    except Exception:
+                        pass
+            if not rep:
+                # Fallback to fast deterministic audit on chunk
+                rep = self.review_file(c_xml, use_llm=False, save_audit_json=False)
+
+            resolved_chunk_reports.append(rep)
+
+        # Composite score and decisions
+        total_chunks = len(resolved_chunk_reports)
+        avg_score = round(sum(r.overall_score for r in resolved_chunk_reports) / total_chunks, 1)
+        avg_det = round(sum(r.deterministic_score for r in resolved_chunk_reports) / total_chunks, 1)
+        llm_scores = [r.llm_score for r in resolved_chunk_reports if r.llm_score is not None]
+        avg_llm = round(sum(llm_scores) / len(llm_scores), 1) if llm_scores else None
+
+        # Gating logic
+        if any(r.decision == ReviewDecision.DISCARD for r in resolved_chunk_reports):
+            rollup_decision = ReviewDecision.DISCARD
+        elif any(r.decision == ReviewDecision.NEEDS_REVISION for r in resolved_chunk_reports):
+            rollup_decision = ReviewDecision.NEEDS_REVISION
+        else:
+            rollup_decision = ReviewDecision.PASS
+
+        # Aggregate issues and discard reasons
+        aggregated_issues: List[AuditIssue] = []
+        aggregated_discard_reasons: List[str] = []
+        total_questions = 0
+
+        for r in resolved_chunk_reports:
+            c_tag = r.doc_id.split("::")[-1] if "::" in r.doc_id else Path(r.file_path).stem if r.file_path else "chunk"
+            total_questions += r.metrics.get("questions_count", 0)
+            for iss in r.issues:
+                iss_dict = iss.model_dump()
+                iss_dict["message"] = f"[{c_tag}] {iss.message}"
+                aggregated_issues.append(AuditIssue(**iss_dict))
+            for dr in r.discard_reasons:
+                aggregated_discard_reasons.append(f"[{c_tag}] {dr}")
+
+        out_exam_dir = Path(branch_dir) / exam_name if branch_dir else exam_p
+        out_exam_dir.mkdir(parents=True, exist_ok=True)
+        reconciled_merged_xml_path = out_exam_dir / "merged.xml"
+
+        # Reconcile if all pass or reconcile_merged requested
+        is_fidelity_ok = True
+        reconcile_diagnostics = {}
+        if reconcile_merged and rollup_decision == ReviewDecision.PASS:
+            try:
+                from sequence_labelling.parser.long_parser.sequence_reconciler import (
+                    merge_chunk_xmls,
+                    reconcile_parser_chunk_results,
+                )
+                from sequence_labelling.parser.long_parser.source_merger.serializer_validator import remove_annotation_tags
+
+                chunk_results_for_reconcile = []
+                chunk_xml_contents: List[str] = []
+                raw_chunk_inputs: List[str] = []
+
+                for c_xml in chunk_xmls:
+                    branch_chunk = (Path(branch_dir) / exam_name / "chunks" / c_xml.name) if branch_dir else None
+                    if branch_chunk and branch_chunk.exists():
+                        c_text = branch_chunk.read_text(encoding="utf-8")
+                    else:
+                        c_text = c_xml.read_text(encoding="utf-8")
+                    chunk_xml_contents.append(c_text)
+
+                    # Get raw chunk text from sibling json
+                    c_json = c_xml.with_suffix(".json")
+                    raw_text = ""
+                    c_dict = None
+                    if c_json.exists():
+                        try:
+                            jd = json.loads(c_json.read_text(encoding="utf-8"))
+                            if isinstance(jd, dict):
+                                c_dict = dict(jd)
+                                raw_text = jd.get("raw_chunk_text", "")
+                        except Exception:
+                            pass
+                    if not raw_text:
+                        raw_text = remove_annotation_tags(c_text)
+                    raw_chunk_inputs.append(raw_text)
+
+                    if c_dict is not None and "chunk_index" in c_dict and c_dict.get("page_offset_ranges"):
+                        c_dict["raw_xml"] = c_text
+                        c_dict["raw_chunk_text"] = raw_text
+                        chunk_results_for_reconcile.append(c_dict)
+
+                if len(chunk_results_for_reconcile) == len(chunk_xmls):
+                    reconcile_res = reconcile_parser_chunk_results(chunk_results_for_reconcile)
+                else:
+                    reconcile_res = merge_chunk_xmls(chunk_xml_contents, raw_chunk_inputs)
+                merged_xml = reconcile_res["merged_xml"]
+                structured_questions = reconcile_res.get("structured_questions", [])
+                structured_stimuli = reconcile_res.get("structured_stimuli", [])
+                reconcile_diagnostics = reconcile_res.get("diagnostics", {})
+
+                # Invariant check: remove_annotation_tags(merged_xml) == canonical_original_text
+                stripped = remove_annotation_tags(merged_xml)
+                is_fidelity_ok = (stripped == reconcile_res.get("original_text"))
+
+                # Write reconciled merged.xml
+                reconciled_merged_xml_path.write_text(merged_xml, encoding="utf-8")
+
+                # Write accompanying merged.json
+                branch_json_path = out_exam_dir / "merged.json"
+                merged_json_data = {
+                    "document_id": exam_name,
+                    "total_chunks": total_chunks,
+                    "reconciled_at": datetime.now().isoformat(),
+                    "questions_count": len(structured_questions),
+                    "stimuli_count": len(structured_stimuli),
+                    "questions": structured_questions,
+                    "stimuli": structured_stimuli,
+                    "source_fidelity_ok": is_fidelity_ok,
+                    "diagnostics": reconcile_diagnostics,
+                }
+                branch_json_path.write_text(
+                    json.dumps(merged_json_data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                total_questions = len(structured_questions)
+
+                # Deterministic continuity audit on reconciled merged.xml
+                det_issues, det_sc, det_metrics = DeterministicAuditor.check_question_and_option_structure(merged_xml)
+                if not det_metrics.get("continuity_ok", True):
+                    aggregated_issues.extend(det_issues)
+            except Exception as e:
+                aggregated_issues.append(
+                    AuditIssue(
+                        category="reconciliation",
+                        severity=IssueSeverity.CRITICAL,
+                        message=f"Reconciliation error across chunks: {e}",
+                    )
+                )
+
+        summary_text = (
+            f"Dual-Granularity Rollup ({total_chunks} chunks). Composite Score: {avg_score:.1f}/100. "
+            f"Decision: {rollup_decision.value}. "
+            f"{'Source-grounded merged.xml successfully reconciled.' if rollup_decision == ReviewDecision.PASS else 'Awaiting repairs on defective chunks.'}"
+        )
+
+        rollup_report = ReviewReport(
+            doc_id=exam_name,
+            overall_score=avg_score,
+            deterministic_score=avg_det,
+            llm_score=avg_llm,
+            decision=rollup_decision,
+            grade=compute_grade(avg_score),
+            issues=aggregated_issues,
+            summary=summary_text,
+            discard_reasons=aggregated_discard_reasons,
+            file_path=str(reconciled_merged_xml_path),
+            metrics={
+                "questions_count": total_questions,
+                "total_chunks": total_chunks,
+                "reconciled": rollup_decision == ReviewDecision.PASS,
+                "source_fidelity_ok": is_fidelity_ok,
+            },
+            reviewer_model=self.model,
+            reviewer_provider=self.provider,
+        )
+
+        if save_audit_json:
+            audit_path = out_exam_dir / "audit_report.json"
+            audit_path.write_text(
+                json.dumps(rollup_report.model_dump(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        return rollup_report
 
     def batch_review(
         self,
@@ -2368,17 +2697,23 @@ class AnnotationReviewerAgent:
         save_audit_json: bool = True,
         use_llm: bool = True,
         concurrency: int = 4,
-        max_merged_tokens: int = 500_000,
+        granularity: str = "auto",
+        max_merged_tokens: int = 15_000,
+        rollup_documents: bool = True,
+        branch_dir: Optional[Union[str, Path]] = None,
         output_report_path: Optional[Union[str, Path]] = None,
         progress_callback=None,
         overwrite: bool = False,
         filter_decision: Optional[str] = None,
         limit: Optional[int] = None,
+        pattern: Optional[str] = None,
     ) -> BatchReviewSummary:
         """
         Performs batch review across all XML documents in a directory.
-        Processes merged.xml by default if <= 500k tokens, falling back to chunk level if > 500k tokens.
-        Never processes both chunk and merged versions for the same document.
+        Supports dual granularity:
+        - chunk: Audits individual chunk XMLs (chunk_*.xml) strictly within <= 15,000 token budget.
+        - document: Audits monolithic merged.xml documents.
+        - auto: Automatically switches multi-chunk docs > 15,000 tokens to chunk level.
         Scans and resumes from existing audit_report.json unless overwrite is True.
         Saves progress, Markdown report, and JSON summary on the fly as documents finish.
         """
@@ -2387,9 +2722,26 @@ class AnnotationReviewerAgent:
         if not base_dir.exists():
             raise FileNotFoundError(f"Annotated directory not found: {annotated_dir}")
 
-        # Gather target xml files following 500k token merged-vs-chunk rule
-        all_targets = self.discover_review_targets(base_dir, max_merged_tokens=max_merged_tokens)
+        # Gather target xml files according to granularity
+        all_targets = self.discover_review_targets(
+            base_dir,
+            granularity=granularity,
+            max_merged_tokens=max_merged_tokens,
+        )
         all_targets.sort()
+
+        if pattern:
+            import fnmatch
+            pat_clean = pattern.strip("*")
+            all_targets = [
+                t for t in all_targets
+                if fnmatch.fnmatch(t.name, pattern)
+                or fnmatch.fnmatch(t.parent.name, pattern)
+                or (t.parent.name == "chunks" and fnmatch.fnmatch(t.parent.parent.name, pattern))
+                or fnmatch.fnmatch(str(t), pattern)
+                or fnmatch.fnmatch(str(t), f"*{pattern}*")
+                or (pat_clean and pat_clean in str(t))
+            ]
 
         if limit is not None and limit > 0:
             all_targets = all_targets[:limit]
@@ -2482,9 +2834,13 @@ class AnnotationReviewerAgent:
                         if rel.parent == Path("."):
                             candidate = Path(raw_dir) / f"{base_dir.name}.md"
                         else:
-                            candidate = Path(raw_dir) / rel.parent.with_suffix(".md")
+                            candidate = Path(raw_dir) / f"{rel.parent.name}.md"
+                            if not candidate.exists():
+                                candidate = Path(raw_dir) / rel.parent.with_suffix(".md")
                     else:
-                        candidate = Path(raw_dir) / rel.with_suffix(".md")
+                        candidate = Path(raw_dir) / f"{rel.stem}.md"
+                        if not candidate.exists():
+                            candidate = Path(raw_dir) / rel.with_suffix(".md")
                     if candidate.exists():
                         raw_file = candidate
                 except Exception:
@@ -2590,9 +2946,22 @@ class AnnotationReviewerAgent:
                                 with open(progress_path, "w", encoding="utf-8") as f_pr:
                                     json.dump(prog_payload, f_pr, indent=2, ensure_ascii=False)
 
+                            print(
+                                f"[{completed}/{total_docs}] ({pct:.1f}%) {rep.doc_id[:42]}... "
+                                f"-> {rep.decision.value} (Score: {rep.overall_score:.1f} | LLM: {rep.llm_score})"
+                            )
+
                         if progress_callback:
                             progress_callback(completed, total_docs, rep)
                     except Exception as e:
+                        if is_quota_or_cap_error(e):
+                            print("\n" + "=" * 70)
+                            print(f"🛑 [FATAL QUOTA LIMIT DETECTED] Reviewer hit quota cap on {f.name}!")
+                            print(f"   Reason: {e}")
+                            print("   HALTING Reviewer immediately to protect remaining documents from being skipped.")
+                            print("=" * 70)
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            sys.exit(2)
                         pass
         else:
             # All files were cached / done
@@ -2653,6 +3022,25 @@ class AnnotationReviewerAgent:
             json_report_path = Path(output_report_path).with_suffix(".json")
             with open(json_report_path, "w", encoding="utf-8") as f_j:
                 json.dump(final_summary.model_dump(), f_j, indent=2, ensure_ascii=False)
+
+        # Automatic document-level rollup if chunks were audited
+        if rollup_documents:
+            chunk_exam_dirs = set()
+            for t in all_targets:
+                if t.name.startswith("chunk_") and t.parent.name == "chunks":
+                    chunk_exam_dirs.add(t.parent.parent)
+
+            for exam_dir in sorted(chunk_exam_dirs, key=lambda p: p.name):
+                try:
+                    self.rollup_chunk_audits(
+                        exam_dir=exam_dir,
+                        chunk_reports=reports,
+                        branch_dir=branch_dir,
+                        save_audit_json=save_audit_json,
+                        reconcile_merged=True,
+                    )
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Error during rollup for {exam_dir.name}: {e}")
 
         return final_summary
 
@@ -2826,6 +3214,38 @@ def main():
         help="Quarantine folder for discarded documents",
     )
 
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default=None,
+        help="Glob pattern or substring to filter document directories (e.g. 'doc_*')",
+    )
+    parser.add_argument(
+        "--granularity",
+        choices=["chunk", "document", "auto"],
+        default="auto",
+        help="Audit granularity: chunk (individual chunk XMLs <=15k tokens), document (monolithic merged.xml), auto (>15k tokens -> chunk, <=15k -> document; default: auto)",
+    )
+    parser.add_argument(
+        "--max-merged-tokens",
+        type=int,
+        default=15_000,
+        help="Token threshold for auto granularity switching to chunk level (default: 15000)",
+    )
+    parser.add_argument(
+        "--no-rollup",
+        dest="rollup_documents",
+        action="store_false",
+        default=True,
+        help="Disable automatic rollup of chunk audits into document audit_report.json",
+    )
+    parser.add_argument(
+        "--branch-dir",
+        type=str,
+        default=None,
+        help="Branch output directory when writing reconciled files (optional)",
+    )
+
     args = parser.parse_args()
 
     agent = AnnotationReviewerAgent(
@@ -2843,8 +3263,12 @@ def main():
     print(f"  Reviewer Model      : {agent.model}")
     print(f"  Thinking Effort     : {agent.llm_reviewer.thinking}")
     print(f"  Concurrency         : {args.concurrency} worker thread(s)")
+    print(f"  Granularity Mode    : {args.granularity.upper()} (threshold: {args.max_merged_tokens} tokens)")
+    print(f"  Chunk Auto-Rollup   : {'Enabled' if args.rollup_documents else 'Disabled'}")
     print(f"  LLM Semantic Audit  : {'Disabled (Deterministic Only)' if args.no_llm else 'Enabled'}")
     print(f"  Overwrite Mode      : {'Enabled' if args.overwrite else 'Disabled (Resume from cache)'}")
+    if args.pattern:
+        print(f"  Filter Pattern      : {args.pattern}")
     if args.filter_decision:
         print(f"  Filter Decision     : {args.filter_decision}")
     if args.limit:
@@ -2859,10 +3283,15 @@ def main():
         auto_discard=args.auto_discard,
         use_llm=not args.no_llm,
         concurrency=args.concurrency,
+        granularity=args.granularity,
+        max_merged_tokens=args.max_merged_tokens,
+        rollup_documents=args.rollup_documents,
+        branch_dir=args.branch_dir,
         output_report_path=args.output_report,
         overwrite=args.overwrite,
         filter_decision=args.filter_decision,
         limit=args.limit,
+        pattern=args.pattern,
     )
 
     print("\n" + "=" * 65)

@@ -478,6 +478,8 @@ class PDFOCRConverter:
                         thinking=self.thinking,
                         images=batch_images,
                         timeout=300,
+                        caller="pdf_vision_ocr",
+                        auto_log=True,
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -485,17 +487,6 @@ class PDFOCRConverter:
                     ) from e
 
                 duration_ocr_sec = time.time() - start_ocr_t
-                try:
-                    from sequence_labelling.llm.token_tracker import log_response
-                    log_response(
-                        {"usage": usage, "model": self.model},
-                        model=self.model,
-                        provider=self.provider,
-                        caller="pdf_vision_ocr",
-                        duration_sec=duration_ocr_sec,
-                    )
-                except Exception:
-                    pass
 
             else:
                 if self.client is None:

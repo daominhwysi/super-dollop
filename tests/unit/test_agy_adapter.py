@@ -59,18 +59,18 @@ class TestAgyAdapter(unittest.TestCase):
 
         # Case 1: Model with -high suffix
         m, e = _resolve_model_and_effort("gemini-3.8-flash-high", None)
-        self.assertEqual(m, "gemini-3.8-flash")
-        self.assertEqual(e, "high")
+        self.assertEqual(m, "gemini-3.8-flash-high")
+        self.assertIsNone(e)
 
         # Case 2: Base model with explicit thinking
         m, e = _resolve_model_and_effort("gemini-3.8-flash", "medium")
-        self.assertEqual(m, "gemini-3.8-flash")
-        self.assertEqual(e, "medium")
+        self.assertEqual(m, "gemini-3.8-flash-medium")
+        self.assertIsNone(e)
 
         # Case 3: Base model without thinking defaults to high for gemini
         m, e = _resolve_model_and_effort("gemini-3.8-flash", None)
-        self.assertEqual(m, "gemini-3.8-flash")
-        self.assertEqual(e, "high")
+        self.assertEqual(m, "gemini-3.8-flash-high")
+        self.assertIsNone(e)
 
     @patch("sequence_labelling.llm.agy_adapter.subprocess.run")
     def test_chat_with_agy_multi_image_sandbox(self, mock_subproc):
@@ -100,8 +100,6 @@ class TestAgyAdapter(unittest.TestCase):
         cmd = mock_subproc.call_args[0][0]
         self.assertIn("agy", cmd)
         self.assertIn("--sandbox", cmd)
-        self.assertIn("--agent", cmd)
-        self.assertIn("research", cmd)
         # Check that -p vision prompt mentions both pages
         p_idx = cmd.index("-p")
         prompt_arg = cmd[p_idx + 1]

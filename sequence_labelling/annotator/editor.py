@@ -23,6 +23,9 @@ from sequence_labelling.config import (
     EDITOR_MODEL,
     EDITOR_PROVIDER,
     EDITOR_THINKING,
+    REVIEWER_MODEL,
+    REVIEWER_PROVIDER,
+    REVIEWER_THINKING,
     WORKSPACE_DIR,
 )
 from sequence_labelling.llm.deepseek_client import chat
@@ -446,6 +449,10 @@ If you include the block, assess only supplied issue IDs. A missing assessment m
 10. STRICT XML-ONLY IN SEARCH: The text inside <<<<<<< SEARCH must copy character-for-character from CURRENT_ANNOTATED_XML, NEVER from RAW_SOURCE_TEXT. Even when repairing an unannotated question, your SEARCH block must target existing XML text surrounding that position.
 11. CONTIGUOUS SEARCH BLOCKS: Keep SEARCH blocks reasonably sized (1 to 25 lines) and completely contiguous. Never truncate or omit middle lines with ellipses (...) or placeholders inside SEARCH.
 12. UNANNOTATED QUESTION INSERTION PATTERN: When inserting a missed/unannotated question, select the immediately preceding or following question or stimulus tag in CURRENT_ANNOTATED_XML as your SEARCH anchor. In REPLACE, provide the anchor PLUS the newly annotated question.
+13. MARKDOWN QUESTION HEADER NORMALIZATION (ERR-01): If raw markdown headers for questions (e.g. '## Câu 1.') were mislabelled as `<section>## Câu 1.</section>` or duplicated `<section>## Câu 1.</section><question_label>Câu 1.</question_label>`, replace them with a single clean `<question_label>## Câu 1.</question_label>`.
+14. SUB-QUESTION & TRUE/FALSE SEGMENTATION (ERR-02): When sub-items a), b), c), d) were absorbed into `<stem>`, split them out cleanly into `<stem>Prompt...</stem>` followed by `<option_label>a)</option_label> <option_text>Statement...</option_text>`.
+15. SOLUTION & GRADING KEY WRAPPING (ERR-03): If grading guides, answer key tables, or scoring rubrics ('HƯỚNG DẪN CHẤM', 'ĐÁP ÁN') were erroneously tagged as exam questions, replace them with `<explanation>...</explanation>`.
+16. LATEX DELIMITER REPAIR (ERR-04): When LaTeX math choices have inverted tags like `$<option_text>...$</option_text>`, replace with `<option_text>$...$</option_text>`. If figure attributes have accidental self-closing delimiters like `x /> 0`, remove or escape the accidental delimiter.
 """
 
 
@@ -465,6 +472,10 @@ class EditorAgent:
         model: Optional[str] = None,
         provider: Optional[str] = None,
         thinking: Optional[str] = None,
+        reviewer_model: Optional[str] = None,
+        reviewer_provider: Optional[str] = None,
+        reviewer_thinking: Optional[str] = None,
+        reviewer: Optional[AnnotationReviewerAgent] = None,
     ):
         self.model = model.strip() if model else EDITOR_MODEL
         self.provider = provider.strip() if provider else EDITOR_PROVIDER
@@ -494,8 +505,10 @@ class EditorAgent:
             + few_shot_xml
         ).strip()
 
-        self.reviewer = AnnotationReviewerAgent(
-            model=self.model, provider=self.provider, thinking="medium"
+        self.reviewer = reviewer or AnnotationReviewerAgent(
+            model=reviewer_model or REVIEWER_MODEL,
+            provider=reviewer_provider or REVIEWER_PROVIDER,
+            thinking=reviewer_thinking or REVIEWER_THINKING or "medium",
         )
 
     def _format_diagnostics_block(self, issues: List[AuditIssue]) -> str:

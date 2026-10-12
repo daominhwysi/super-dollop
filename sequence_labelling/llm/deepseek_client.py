@@ -234,6 +234,8 @@ def chat(
             image_bytes=image_bytes,
             image_filename=image_filename,
             images=images,
+            caller="deepseek_client",
+            auto_log=False,
         )
         duration_sec = time.time() - start_time
 

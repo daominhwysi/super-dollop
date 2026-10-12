@@ -1265,3 +1265,116 @@ def test_cloze_question_labels_without_stems_valid():
     assert not any(iss.category == "missing_stem" for iss in report.issues)
     assert not any("empty <stem>" in iss.message for iss in report.issues)
 
+
+def test_discover_review_targets_dual_granularity(tmp_path):
+    """Verifies discover_review_targets under chunk, document, and auto modes."""
+    exam_dir = tmp_path / "exam_test"
+    exam_dir.mkdir()
+    (exam_dir / "merged.xml").write_text("<stem>Merged doc</stem>", encoding="utf-8")
+    chunks_dir = exam_dir / "chunks"
+    chunks_dir.mkdir()
+    c0 = chunks_dir / "chunk_0.xml"
+    c1 = chunks_dir / "chunk_1.xml"
+    c0.write_text("<stem>Chunk 0</stem>", encoding="utf-8")
+    c1.write_text("<stem>Chunk 1</stem>", encoding="utf-8")
+
+    # Mode 1: chunk granularity -> always selects chunks
+    chunk_targets = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="chunk")
+    assert chunk_targets == [c0, c1]
+
+    # Mode 2: document granularity -> always selects merged.xml
+    doc_targets = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="document")
+    assert doc_targets == [exam_dir / "merged.xml"]
+
+    # Mode 3: auto granularity with low threshold -> switches to chunks
+    auto_targets_low = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="auto", max_merged_tokens=2)
+    assert auto_targets_low == [c0, c1]
+
+    # Mode 4: auto granularity with high threshold -> keeps merged.xml
+    auto_targets_high = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="auto", max_merged_tokens=1000)
+    assert auto_targets_high == [exam_dir / "merged.xml"]
+
+
+def test_review_file_chunk_raw_json_resolution(tmp_path):
+    """Verifies review_file reads raw_chunk_text from sibling chunk.json and assigns namespaced doc_id."""
+    exam_dir = tmp_path / "exam_101"
+    chunks_dir = exam_dir / "chunks"
+    chunks_dir.mkdir(parents=True)
+
+    chunk_xml = chunks_dir / "chunk_0.xml"
+    chunk_json = chunks_dir / "chunk_0.json"
+
+    raw_text = "Câu 1. Một câu hỏi kiểm tra.\nA. Lựa chọn 1\nB. Lựa chọn 2"
+    xml_text = (
+        "<question_label>Câu 1.</question_label> <stem>Một câu hỏi kiểm tra.</stem>\n"
+        "<option_label>A.</option_label> <option_text>Lựa chọn 1</option_text>\n"
+        "<option_label>B.</option_label> <option_text>Lựa chọn 2</option_text>"
+    )
+
+    chunk_xml.write_text(xml_text, encoding="utf-8")
+    chunk_json.write_text(json.dumps({"chunk_index": 0, "raw_chunk_text": raw_text}), encoding="utf-8")
+
+    agent = AnnotationReviewerAgent()
+    report = agent.review_file(chunk_xml, use_llm=False)
+
+    # Verifies namespaced doc_id
+    assert report.doc_id == "exam_101::chunk_0"
+    assert report.decision == ReviewDecision.PASS
+    # Audit report saved as chunk_0.audit.json
+    assert (chunks_dir / "chunk_0.audit.json").exists()
+
+
+def test_rollup_chunk_audits_pass_and_reconciliation(tmp_path):
+    """Verifies rollup_chunk_audits synthesizes merged.xml, merged.json, and audit_report.json."""
+    exam_dir = tmp_path / "exam_202"
+    chunks_dir = exam_dir / "chunks"
+    chunks_dir.mkdir(parents=True)
+
+    c0_xml = (
+        "<question_label>Câu 1.</question_label> <stem>Nội dung câu 1.</stem>\n"
+        "<option_label>A.</option_label> <option_text>Đáp án A1</option_text>\n"
+        "<option_label>B.</option_label> <option_text>Đáp án B1</option_text>"
+    )
+    c0_raw = "Câu 1. Nội dung câu 1.\nA. Đáp án A1\nB. Đáp án B1"
+
+    c1_xml = (
+        "\n<question_label>Câu 2.</question_label> <stem>Nội dung câu 2.</stem>\n"
+        "<option_label>A.</option_label> <option_text>Đáp án A2</option_text>\n"
+        "<option_label>B.</option_label> <option_text>Đáp án B2</option_text>"
+    )
+    c1_raw = "\nCâu 2. Nội dung câu 2.\nA. Đáp án A2\nB. Đáp án B2"
+
+    c0_ranges = [{"page_id": 1, "local_start": 0, "local_end": len(c0_raw), "global_start": 0, "global_end": len(c0_raw), "is_overlap": False}]
+    c1_ranges = [{"page_id": 2, "local_start": 0, "local_end": len(c1_raw), "global_start": len(c0_raw), "global_end": len(c0_raw) + len(c1_raw), "is_overlap": False}]
+
+    (chunks_dir / "chunk_0.xml").write_text(c0_xml, encoding="utf-8")
+    (chunks_dir / "chunk_0.json").write_text(json.dumps({"chunk_index": 0, "raw_chunk_text": c0_raw, "page_offset_ranges": c0_ranges}), encoding="utf-8")
+
+    (chunks_dir / "chunk_1.xml").write_text(c1_xml, encoding="utf-8")
+    (chunks_dir / "chunk_1.json").write_text(json.dumps({"chunk_index": 1, "raw_chunk_text": c1_raw, "page_offset_ranges": c1_ranges}), encoding="utf-8")
+
+    branch_dir = tmp_path / "branch"
+
+    agent = AnnotationReviewerAgent()
+    # Review both chunks
+    rep0 = agent.review_file(chunks_dir / "chunk_0.xml", use_llm=False)
+    rep1 = agent.review_file(chunks_dir / "chunk_1.xml", use_llm=False)
+
+    rollup = agent.rollup_chunk_audits(exam_dir, chunk_reports=[rep0, rep1], branch_dir=branch_dir, reconcile_merged=True)
+
+    assert rollup is not None
+    assert rollup.decision == ReviewDecision.PASS
+    assert rollup.metrics["questions_count"] == 2
+    assert rollup.metrics["reconciled"] is True
+
+    # Check files in branch
+    branch_exam = branch_dir / "exam_202"
+    assert (branch_exam / "merged.xml").exists()
+    assert (branch_exam / "merged.json").exists()
+    assert (branch_exam / "audit_report.json").exists()
+
+    merged_content = (branch_exam / "merged.xml").read_text(encoding="utf-8")
+    assert "<question_label>Câu 1.</question_label>" in merged_content
+    assert "<question_label>Câu 2.</question_label>" in merged_content
+
+

@@ -17,8 +17,11 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from sequence_labelling.llm.agy_rate_limiter import Agy5HourCapError, CapLimitDetector
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +40,13 @@ def format_messages_to_prompt(
     Formats messages list or prompt+system into a unified instruction prompt.
     Returns (system_instruction, combined_user_prompt).
     """
-    system_text = system or "You are a helpful assistant"
+    system_text = (system or "You are a helpful assistant").replace("\x00", "")
     user_parts: List[str] = []
 
     if messages:
         for msg in messages:
             role = msg.get("role", "")
-            content = str(msg.get("content", "")).strip()
+            content = str(msg.get("content", "")).replace("\x00", "").strip()
             if role == "system":
                 system_text = content
             elif role == "user":
@@ -51,11 +54,11 @@ def format_messages_to_prompt(
             elif role == "assistant":
                 user_parts.append(f"Assistant: {content}")
         if not user_parts and prompt:
-            user_parts.append(prompt.strip())
+            user_parts.append(prompt.replace("\x00", "").strip())
     elif prompt:
-        user_parts.append(prompt.strip())
+        user_parts.append(prompt.replace("\x00", "").strip())
 
-    combined_user_text = "\n\n".join(user_parts)
+    combined_user_text = "\n\n".join(user_parts).replace("\x00", "")
     return system_text, combined_user_text
 
 
@@ -90,13 +93,15 @@ def _resolve_model_and_effort(model: Optional[str], thinking: Optional[Any]) -> 
 
     for suffix in ("high", "medium", "low"):
         if raw_model.endswith(f"-{suffix}"):
-            if effort is None:
-                effort = suffix
-            base_model = raw_model[: -(len(suffix) + 1)]
-            return base_model, effort
+            # Model name already has effort suffix built-in (e.g. 'gemini-3.8-flash-low')
+            return raw_model, None
 
     if effort is None and ("flash" in raw_model or "gemini" in raw_model or "pro" in raw_model):
         effort = "high"
+
+    # For gemini models in agy CLI, hyphenated model names are canonical (e.g. gemini-3.8-flash-high)
+    if "gemini" in raw_model and effort:
+        return f"{raw_model}-{effort}", None
 
     return raw_model, effort
 
@@ -112,15 +117,20 @@ def chat_with_agy(
     images: Optional[List[Tuple[str, bytes]]] = None,
     conversation_id: Optional[str] = None,
     timeout: Optional[float] = None,
+    caller: Optional[str] = None,
+    auto_log: bool = True,
 ) -> Tuple[str, Optional[str], Dict[str, Any]]:
     """
     Synchronously calls agy CLI under the active Antigravity subscription.
     Returns (response_text, new_conversation_id, usage_metadata).
     timeout: Optional timeout in seconds. None means no timeout.
+    caller: Optional calling component name for telemetry attribution.
+    auto_log: Whether to automatically persist token usage to token_tracker ledger.
     """
     target_model, effort = _resolve_model_and_effort(model=model, thinking=thinking)
     system_text, user_text = format_messages_to_prompt(messages=messages, prompt=prompt, system=system)
     print_timeout_arg = f"{int(timeout)}s" if timeout is not None else "24h"
+    start_time = time.time()
 
     # Normalize attached images
     resolved_images: List[Tuple[str, bytes]] = []
@@ -150,15 +160,17 @@ def chat_with_agy(
 
             vision_prompt = (
                 f"System instruction: {system_text}\n\n"
-                f"Inspect {inspection_target} located in your current workspace directory.\n\n"
+                f"CRITICAL WORKFLOW INSTRUCTION:\n"
+                f"1. You MUST call `view_file` on {inspection_target} to inspect the image.\n"
+                f"2. You are strictly FORBIDDEN from calling `run_command` or any other tool.\n"
+                f"3. Immediately after viewing the file, produce the required response.\n\n"
                 f"{user_text}\n\n"
                 "Output strictly the final response. Do NOT output conversational greetings or schedule tasks."
-            )
+            ).replace("\x00", "")
 
             cmd = [
                 "agy",
                 "--sandbox",
-                "--agent", "research",
                 "--model", target_model,
                 "--print-timeout", print_timeout_arg,
                 "--dangerously-skip-permissions",
@@ -183,18 +195,38 @@ def chat_with_agy(
                     raise TimeoutError(f"Sandboxed agy vision execution timed out after {timeout}s")
 
             if proc.returncode != 0:
+                raw_err = f"{proc.stdout}\n{proc.stderr}".strip()
+                if CapLimitDetector.is_cap_limit(proc.returncode, proc.stdout, proc.stderr):
+                    cooldown = CapLimitDetector.parse_cooldown_seconds(raw_err)
+                    raise Agy5HourCapError(
+                        f"agy vision cap limit reached ({cooldown}s cooldown): {raw_err[:200]}",
+                        reset_after_sec=cooldown,
+                        raw_output=raw_err,
+                    )
                 raise RuntimeError(f"agy vision failed (exit {proc.returncode}): {proc.stderr.strip()}")
 
             raw_stdout = proc.stdout.strip()
-            return _parse_agy_json_output(raw_stdout)
+            resp_text, conv_id, usage = _parse_agy_json_output(raw_stdout)
+            duration_sec = time.time() - start_time
+            if auto_log and usage:
+                _auto_log_usage(
+                    model=target_model,
+                    usage=usage,
+                    duration_sec=duration_sec,
+                    caller=caller or "agy_adapter_vision",
+                )
+            return resp_text, conv_id, usage
 
     # ─────────────────────────────────────────────────────────────────────────────
-    # Mode 2: Fast Pure-Text Mode (Zero Tools, ~5s Turnaround)
+    # Mode 2: Fast Pure-Text Mode (Zero Tools, Isolated CWD)
     # ─────────────────────────────────────────────────────────────────────────────
     full_prompt = (
         f"System instruction: {system_text}\n\n"
+        f"CRITICAL WORKFLOW INSTRUCTION:\n"
+        f"You are strictly FORBIDDEN from calling any tools (such as run_command, view_file, write_to_file, manage_task, etc.).\n"
+        f"Immediately output ONLY the final text response directly without conversational filler or tool invocations.\n\n"
         f"{user_text}"
-    )
+    ).replace("\x00", "")
 
     cmd = [
         "agy",
@@ -208,23 +240,79 @@ def chat_with_agy(
     if conversation_id:
         cmd.extend(["--conversation", conversation_id])
 
-    with _AGY_LOCK:
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=full_prompt,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            raise TimeoutError(f"agy text execution timed out after {timeout}s")
+    max_retries = 3
+    proc = None
+    for attempt in range(max_retries + 1):
+        with tempfile.TemporaryDirectory(prefix="agy_text_sandbox_") as sandbox_dir:
+            with _AGY_LOCK:
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        input=full_prompt,
+                        cwd=sandbox_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise TimeoutError(f"agy text execution timed out after {timeout}s")
 
-    if proc.returncode != 0:
+        if proc.returncode == 0:
+            break
+
+        raw_err = f"{proc.stdout}\n{proc.stderr}".strip()
+        if CapLimitDetector.is_cap_limit(proc.returncode, proc.stdout, proc.stderr):
+            if attempt < max_retries:
+                backoff_sec = (attempt + 1) * 20
+                logger.warning(
+                    f"[agy Rate Limit] Transient rate limit / 429 detected on attempt {attempt + 1}/{max_retries + 1}. "
+                    f"Backing off {backoff_sec}s before retrying..."
+                )
+                time.sleep(backoff_sec)
+                continue
+            cooldown = CapLimitDetector.parse_cooldown_seconds(raw_err)
+            raise Agy5HourCapError(
+                f"agy text cap limit reached ({cooldown}s cooldown): {raw_err[:200]}",
+                reset_after_sec=cooldown,
+                raw_output=raw_err,
+            )
         raise RuntimeError(f"agy execution failed (exit {proc.returncode}): {proc.stderr.strip()}")
 
     raw_stdout = proc.stdout.strip()
-    return _parse_agy_json_output(raw_stdout)
+    resp_text, conv_id, usage = _parse_agy_json_output(raw_stdout)
+    duration_sec = time.time() - start_time
+    if auto_log and usage:
+        _auto_log_usage(
+            model=target_model,
+            usage=usage,
+            duration_sec=duration_sec,
+            caller=caller or "agy_adapter_text",
+        )
+    return resp_text, conv_id, usage
+
+
+def _auto_log_usage(
+    model: str,
+    usage: Dict[str, Any],
+    duration_sec: float,
+    caller: str,
+) -> None:
+    """Helper to safely record token metrics to token_tracker without raising."""
+    try:
+        from sequence_labelling.llm.token_tracker import log_token_usage
+        log_token_usage(
+            provider="agy",
+            model=model,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            reasoning_tokens=usage.get("thinking_tokens", 0) or usage.get("reasoning_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_tokens", 0),
+            total_tokens=usage.get("total_tokens"),
+            duration_sec=duration_sec,
+            caller=caller,
+        )
+    except Exception as exc:
+        logger.debug(f"Failed to auto-log agy token usage: {exc}")
 
 
 def _parse_agy_json_output(raw_stdout: str) -> Tuple[str, Optional[str], Dict[str, Any]]:
