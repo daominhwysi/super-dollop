@@ -256,7 +256,7 @@ class XMLChecker:
         clean_xml = re.sub(r"<\s*\|\s*endoftext\s*\|\s*>", "", clean_xml)
 
         # Regex matching tags with attribute-quote awareness (e.g. end_anchor="...</td>...")
-        tag_pattern = re.compile(r'<(/)?([a-zA-Z_0-9\-]+)(?:\s+((?:[^"\'>]|"[^"]*"|\'[^\']*\')*))?(/)?>')
+        tag_pattern = re.compile(r'<(/)?([a-zA-Z0-9_\-]+)(?:\s+((?:[^"\'>]|"[^"]*"|\'[^\']*\')*))?(/)?>')
 
         tag_stack: List[Tuple[str, int, int, str]] = []  # (tag_name, line_num, col_num, full_tag)
 

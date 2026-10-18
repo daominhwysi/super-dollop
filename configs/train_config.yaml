@@ -1,8 +1,8 @@
 # ==============================================================================
 # VIETNAMESE SEQUENCE LABELLING v2 - TRAINING CONFIGURATION
 # ==============================================================================
-# Fine-tuning configuration for jhu-clsp/mmBERT-base (280M params, 8192 context)
-# Full parameter fine-tuning (no LoRA) with Multi-Scale Sliding Windows & Focal Loss.
+# Fine-tuning configuration for aisingapore/SEA-LION-ModernBERT-300M (300M params, 8192 context)
+# Full parameter fine-tuning (no LoRA) with word-level sliding windows & Focal Loss.
 # ==============================================================================
 
 version: "2.0"
@@ -11,24 +11,45 @@ version: "2.0"
 # 1. Base Model & Architecture
 # ------------------------------------------------------------------------------
 model:
-  name_or_path: "jhu-clsp/mmBERT-base"
-  tokenizer_name: "jhu-clsp/mmBERT-base"
+  name_or_path: "aisingapore/SEA-LION-ModernBERT-300M"
+  tokenizer_name: "aisingapore/SEA-LION-ModernBERT-300M"
   max_sequence_length: 8192
-  use_lora: false                        # Full fine-tuning of all 280M parameters (no LoRA)
+  attn_implementation: "sdpa"            # Enforce PyTorch Native SDPA (supports NVIDIA T4 Turing sm_75 & Ampere+)
+  use_lora: false                        # Full fine-tuning of all parameters (no LoRA)
   latex_placeholder: "[LATEX]"
   mask_latex_during_inference: true
 
 # ------------------------------------------------------------------------------
 # 2. Classification Head & Loss Function
 # ------------------------------------------------------------------------------
+loss:
+  type: "focal"
+  focal_gamma: 2.0                    # Calibrated from 1.0 -> 2.0 based on 5.27M dataset study
+  focal_alpha: "smoothed_inverse_freq" # Smoothing power = 0.25
+  label_smoothing: 0.05
+
+model_head:
+  layer_pooling: "sigmoid"            # Replaces softmax
+  num_pooling_layers: 4
+  use_conv_refinement: true           # 1D Depthwise Conv (kernel size = 7)
+  conv_kernel_size: 7
+  dropout_rates: [0.05, 0.10, 0.15, 0.20, 0.25] # Tightened MSD
+  per_branch_focal_loss: true         # Fix ensemble smoothing
+
+# Backward compatibility alias
 head:
-  type: "enhanced"                       # "enhanced" (WeightedLayerPooling + MSD) or "standard"
-  layers_to_pool: 4                      # Softmax weighted pooling across top-4 transformer layers
+  type: "enhanced"                       # "enhanced" (SigmoidWeightedLayerPooling + Conv1D + Tightened MSD)
+  layers_to_pool: 4
+  layer_pooling: "sigmoid"
+  use_conv_refinement: true
+  conv_kernel_size: 7
   multi_sample_dropout: true
-  dropout_prob: 0.20                     # Base dropout rate
-  dropout_samples: 5                     # Number of parallel dropout masks averaged
-  focal_gamma: 1.0                       # Calibrated focusing parameter for balanced class gradients
-  label_smoothing: 0.0                   # 0.0 for crisp BIO token boundaries (v1 Run 4 lesson: non-zero blurs B/I transitions)
+  dropout_rates: [0.05, 0.10, 0.15, 0.20, 0.25]
+  dropout_prob: 0.10
+  dropout_samples: 5
+  focal_gamma: 2.0                       # Calibrated parameter
+  label_smoothing: 0.05
+  per_branch_focal_loss: true
 
 # ------------------------------------------------------------------------------
 # 3. Dataset & Sliding Window Contexts
@@ -37,21 +58,17 @@ dataset:
   data_dir: "data/training_dataset"
   spans_file: "data/training_dataset/train_spans.jsonl"
   bio_chunks_file: "data/training_dataset/train_bio_chunks.jsonl"
-  val_bio_chunks_file: "data/training_dataset/test_bio_chunks.jsonl"
+  val_bio_chunks_file: "data/training_dataset/test_bio_chunks.jsonl"  # Gold benchmark: final report only
   gold_set: "data/benchmark_gold_set.json"
-  val_ratio: 0.0                        # 0.0: No internal train split; 100% of chunks used for training
-  test_ratio: 0.0                       # Test set evaluated via val_bio_chunks_file (the 63 Gold Docs)
+  dev_ratio: 0.05                       # Document-level dev split from the training file (checkpoint selection)
   seed: 42
 
-  # Multi-scale sliding window configurations (512 to 2048 tokens)
-  sliding_windows:
-    - [512, 128]
-    - [768, 192]
-    - [1024, 256]
-    - [2048, 512]
+  # Records longer than model.max_sequence_length are split into word-level windows that
+  # overlap by about this many subword tokens. Records that fit are used whole.
+  window_overlap_tokens: 1024
 
 # ------------------------------------------------------------------------------
-# 4. Optimization & Hyperparameters (Calibrated for mmBERT Full Fine-Tuning)
+# 4. Optimization & Hyperparameters (Calibrated for SEA-LION-ModernBERT Full Fine-Tuning)
 # ------------------------------------------------------------------------------
 training:
   output_dir: "results/mmbert_seqlabel_v2"
@@ -74,12 +91,13 @@ training:
 
   # Checkpointing & Validation
   eval_strategy: "steps"
-  eval_steps: 1000                        # Evaluate every 250 optimization steps
+  eval_steps: 1000                        # Evaluate the dev set every 1000 optimization steps
   save_strategy: "steps"
-  save_steps: 1000                       # Save rolling mid-epoch checkpoint every 1000 optimization steps (~1.2 hours)
+  save_steps: 1000                       # Save rolling mid-epoch checkpoint every 1000 optimization steps
   save_total_limit: 1                    # Keep 1 rolling checkpoint to prevent disk exhaustion on Kaggle/Colab (20GB quota)
+  # The best dev checkpoint is written to <output_dir>/best and is the one scored on the gold benchmark.
   load_best_model_at_end: true
-  metric_for_best_model: "eval_macro_f1"
+  metric_for_best_model: "eval_macro_f1"  # Selected on the dev split, never on the gold benchmark
   greater_is_better: true
   early_stopping_patience: 3             # Stop training after 3 evals without improvement
 

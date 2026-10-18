@@ -103,9 +103,9 @@ def main():
         )
         merge_result["source_authority"] = "original_chunk_text"
     else:
-        print("Warning: parser manifest missing; parsing raw text via _strip_xml for source-grounded merging.")
-        from sequence_labelling.parser.long_parser.source_merger.canonical_source import _strip_xml
-        raw_inputs = [_strip_xml(c) for c in chunk_contents]
+        print("Warning: parser manifest missing; parsing raw text via strip_canonical_markup for source-grounded merging.")
+        from sequence_labelling.parser.long_parser.source_merger.canonical_source import strip_canonical_markup
+        raw_inputs = [strip_canonical_markup(c)[0] for c in chunk_contents]
         merge_result = merge_chunk_xmls(
             chunk_contents,
             raw_chunk_inputs=raw_inputs,

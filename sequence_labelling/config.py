@@ -49,12 +49,12 @@ CHUNKER_TARGET_TOKENS = int(chunker_cfg.get("target_tokens", 12000))
 CHUNKER_MAX_TOKENS = int(chunker_cfg.get("max_tokens", 16000))
 CHUNKER_OVERLAP_PAGES = int(chunker_cfg.get("overlap_pages", 0))
 REVIEWER_MODEL = reviewer_cfg.get("model_name") or PARSER_MODEL
-REVIEWER_PROVIDER = reviewer_cfg.get("provider") or "deepseek"
-REVIEWER_THINKING = reviewer_cfg.get("thinking") or "medium"
+REVIEWER_PROVIDER = reviewer_cfg.get("provider") or "agy"
+REVIEWER_THINKING = reviewer_cfg.get("thinking") or "low"
 REVIEWER_MIN_SCORE = int(reviewer_cfg.get("min_score_threshold", 75))
 editor_cfg = models.get("editor", {})
-EDITOR_MODEL = editor_cfg.get("model_name") or PARSER_MODEL
-EDITOR_PROVIDER = editor_cfg.get("provider") or PARSER_PROVIDER
+EDITOR_MODEL = editor_cfg.get("model_name") or "gemini-3.8-flash"
+EDITOR_PROVIDER = editor_cfg.get("provider") or "agy"
 EDITOR_THINKING = editor_cfg.get("thinking") or "low"
 FIGURE_CFG = ocr_cfg.get("figure_detection", {})
 FIGURE_DETECTION_ENABLED = bool(FIGURE_CFG.get("enabled", True))
@@ -76,6 +76,7 @@ def get_provider_api_key(provider_name: str) -> str:
         "vilao": ("LLM_API_KEY",),
         "deepseek": ("DEEPSEEK_API_KEY",),
         "codex": ("CODEX_API_KEY", "OPENAI_API_KEY"),
+        "aixingialaire": ("AIXINGIALAIRE_GPT_API_KEY", "AIXINGIALAIRE_API_KEY"),
     }
     configured = providers.get(provider_name.lower(), {}).get("api_key_env")
     names = (configured,) if configured else aliases.get(provider_name.lower(), ())

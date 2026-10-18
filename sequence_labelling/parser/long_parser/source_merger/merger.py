@@ -73,16 +73,32 @@ def merge_chunks(chunks: List[ChunkInput]) -> MergeResult:
     try:
         validation_report = validate_result(canonical_text, merged_xml, selected)
     except MergeInvariantError as exc:
+        # First try dropping only the spans that were structurally unsound (unclosed or
+        # malformed in their chunk) so one bad tag does not erase the whole document.
+        sound = [s for s in selected if s.structural_quality >= 1.0 or s.is_self_closing]
         conflict_report.append({
             "type": "MERGE_INVARIANT_VIOLATION",
             "reason": str(exc),
-            "spans_discarded": len(selected),
+            "spans_discarded": len(selected) - len(sound),
         })
-        selected = []
-        merged_xml = canonical_text
-        validation_report = validate_result(canonical_text, merged_xml, selected)
-        validation_report["degraded"] = True
-        validation_report["degradation_reason"] = str(exc)
+        selected = sound
+        merged_xml = serialize_annotations(canonical_text, selected)
+        try:
+            validation_report = validate_result(canonical_text, merged_xml, selected)
+        except MergeInvariantError as retry_exc:
+            conflict_report.append({
+                "type": "MERGE_INVARIANT_VIOLATION",
+                "reason": str(retry_exc),
+                "spans_discarded": len(selected),
+            })
+            selected = []
+            merged_xml = canonical_text
+            validation_report = validate_result(canonical_text, merged_xml, selected)
+            validation_report["degraded"] = True
+            validation_report["degradation_reason"] = str(retry_exc)
+    validation_report["source_fidelity_mismatches"] = sum(
+        r.get("mismatched_chars", 0) for r in overlap_reports if r.get("status") == "FIDELITY_MISMATCH"
+    )
 
     stimuli = build_structured_stimuli(canonical_text, selected)
     questions = build_structured_questions(canonical_text, selected, stimuli)

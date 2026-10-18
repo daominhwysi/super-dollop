@@ -16,11 +16,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sequence_labelling.config import PARSER_MODEL, PARSER_PROVIDER, PARSER_THINKING
 from sequence_labelling.llm.deepseek_client import chat
-from sequence_labelling.annotator.annotate_ocr import (
-    clean_llm_response,
-    load_few_shot_examples_xml,
-)
 from sequence_labelling.parser.parser import parse_spans_into_structured_questions
+
 
 
 STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE = """# [System Config]
@@ -31,15 +28,15 @@ Annotate the raw OCR text with inline XML sequence tags and compact stimulus anc
 
 ## 🏷️ Complete Tag Dictionary:
 
-1. <section>...</section>: Wrap major section/part titles, headers, directions, and subject block titles (e.g. "<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn...</section>", "<section>## PART 5</section>", "<section>## Chủ đề Lịch sử có 17 câu hỏi từ 1 đến 17</section>"). Output full paired tags <section>...</section> containing verbatim text. Do NOT use anchor tags for section titles.
+1. <section>...</section>: Wrap major section/part titles, headers, directions, and subject block titles (e.g. "<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn...</section>", "<section>## PART 5</section>", "<section>## Chủ đề Lịch sử có 17 câu hỏi từ 1 đến 17</section>"). Output full paired tags <section>...</section> containing verbatim text. Do NOT use anchor tags for section titles. CRITICAL RULE: NEVER tag individual question headers (e.g. '## Câu 1.', '## Câu 2:', '## Bài 1.') as <section>! Markdown question headings belong exclusively inside <question_label>.
 2. <stimulus id="stim_1" start_anchor="..." end_anchor="..." />: For shared reading passages, emails, articles, tables, figures, multi-passage sets, and explicit context prompts (e.g. "Dựa vào thông tin sau đây để giải quyết bài 4, 5...", "Dựa vào thông tin dưới đây để trả lời các câu từ 515-517...").
    CRITICAL DEFINITION & MULTI-QUESTION RULE: A stimulus ONLY applies if it is intimately related to 2 OR MORE QUESTIONS (shared reading passage, dataset, table, or multi-question context). If a context or text block is only related to 1 single standalone question, do NOT tag it as a stimulus—include it inside that question's <stem> instead!
    CRITICAL ARCHITECTURAL CONSTRAINT: <stimulus> MUST NEVER wrap or enclose other system tags (<stem>, <question_label>, <option_label>, <option_text>, <explanation>). Output self-closing anchor tag with id, start_anchor (first 3-10 verbatim words), and end_anchor (last 3-10 verbatim words).
-3. <question_label>...</question_label>: Wrap question prefix indicators ONLY (e.g. "**101.**", "**131.**", "101.", "Câu 1.", "Câu 1:"). CRITICAL RULE: <question_label> must ONLY contain the short question number/label itself. NEVER wrap reading passage text, shared contexts, or multi-question instructions inside <question_label>!
+3. <question_label>...</question_label>: Wrap question prefix indicators ONLY (e.g. "**101.**", "**131.**", "101.", "Câu 1.", "Câu 1:", "## Câu 1.", "## Bài 1:"). CRITICAL RULE: <question_label> must ONLY contain the short question number/label itself. When raw text contains markdown headers for questions (e.g. '## Câu 1.', '## Câu 2:'), enclose the entire header inside <question_label>: e.g. <question_label>## Câu 1.</question_label>. NEVER split into <section>## Câu 1.</section><question_label>Câu 1.</question_label>! NEVER wrap reading passage text, shared contexts, or multi-question instructions inside <question_label>!
 4. <stem>...</stem>: Wrap the main text body of a question following the question label.
-5. <option_label>...</option_label>: Wrap choice letters/prefixes (A., B., (A)) AND sub-item/sub-question indicators (a), b), c), d)) in essay, constructed-response, or True/False questions.
-6. <option_text>...</option_text>: Wrap the textual content of choices or sub-question items following an <option_label>, or statement cells in tabular True/False questions.
-7. <explanation>...</explanation>: Wrap reference explanations, answers explanation texts, and solutions for questions.
+5. <option_label>...</option_label>: Wrap choice letters/prefixes (A., B., (A)) AND sub-item/sub-question indicators (a), b), c), d)) in essay, constructed-response, or True/False questions. VIETNAM GDPT 2018 TRUE/FALSE RULE: In Phần II (Trắc nghiệm đúng/sai) and structured questions, sub-item propositions 'a)', 'b)', 'c)', 'd)' MUST ALWAYS be tagged as <option_label>a)</option_label> <option_text>...</option_text>. NEVER absorb 'a)', 'b)', 'c)', 'd)' into <stem>!
+6. <option_text>...</option_text>: Wrap the textual content of choices or sub-question items following an <option_label>, or statement cells in tabular True/False questions. Ensure <option_text> wraps formulas cleanly (e.g. <option_label>A.</option_label> <option_text>$x = 1$</option_text>), NEVER outputting $<option_text>...$.
+7. <explanation>...</explanation>: Wrap reference explanations, answers explanation texts, and solutions for questions. GRADING GUIDES & ANSWER KEYS: Wrap all scoring guides, rubric tables, and answer keys ('HƯỚNG DẪN CHẤM', 'ĐÁP ÁN', 'BẢNG ĐÁP ÁN') in <explanation>...</explanation>. Never tag answer key items as new exam questions.
 
 ---
 
@@ -56,6 +53,7 @@ Annotate the raw OCR text with inline XML sequence tags and compact stimulus anc
 9. NO QUESTION_LABEL EXPANSION: <question_label> must start and close strictly around the question indicator (e.g. `<question_label>**Câu 1.**</question_label>`). Never extend <question_label> to encompass reading passages or stems.
 10. XML TAG MATCHING & INTEGRITY: Every opened tag (<section>, <question_label>, <stem>, <option_label>, <option_text>, <explanation>) MUST have its exact matching closing tag. NEVER produce mismatched closing tags (e.g. <stem>...</option_text>) or leave tags unclosed. Compact stimulus anchor tags <stimulus ... /> MUST be self-closing.
 11. ACCEPTABLE TEXT OMISSION: If extraneous non-question lecture notes or book study guides are omitted while all exam questions, stems, choices, and solutions are fully annotated, this is valid and acceptable.
+12. LATEX DELIMITER INTEGRITY: Ensure <option_text> cleanly wraps math formulas: e.g. <option_label>A.</option_label> <option_text>$3x - 1 = 0$</option_text>. NEVER place tags inside LaTeX delimiters like $<option_text>...$.
 """
 
 
@@ -146,6 +144,21 @@ def recover_text_from_anchors(
     return raw_text[start_pos:start_end], start_pos, start_end
 
 
+def clean_llm_response(text: str) -> str:
+    """Removes think tags and markdown code block wrappers from LLM response."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2:
+            if lines[-1].strip() == "```":
+                text = "\n".join(lines[1:-1])
+            else:
+                text = "\n".join(lines[1:])
+    return text.strip()
+
+
 def parse_xml_with_anchors(
     raw_ocr_text: str, tagged_xml: str
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str], List[Dict[str, Any]]]:
@@ -160,6 +173,7 @@ def parse_xml_with_anchors(
 
     # Clean XML output
     cleaned_xml = clean_llm_response(tagged_xml).replace("<|END|>", "").strip()
+
 
     # Regex matching tags including self-closing tags with attributes
     tag_re = re.compile(
@@ -296,8 +310,12 @@ class AnchoredXMLLLMExamParser:
         self.thinking = thinking if thinking is not None else PARSER_THINKING
         script_dir = Path(__file__).resolve().parent
         examples_dir = script_dir.parent.parent / "annotator" / "examples" / "annotator"
-        few_shot_xml = load_few_shot_examples_xml(examples_dir) if examples_dir.exists() else ""
+        few_shot_xml = ""
+        if examples_dir.exists():
+            from sequence_labelling.annotator.annotate_ocr import load_few_shot_examples_xml
+            few_shot_xml = load_few_shot_examples_xml(examples_dir)
         self.system_prompt = STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE.strip() + "\n" + few_shot_xml
+
 
     def parse_exam_chunk(
         self,

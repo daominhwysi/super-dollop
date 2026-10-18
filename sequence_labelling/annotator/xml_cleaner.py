@@ -256,7 +256,7 @@ class XMLCleaner:
         text_body = text.replace("<|END|>", "").rstrip()
 
         # Attribute-quote-aware tag regex
-        tag_pattern = re.compile(r'<(/)?([a-zA-Z_0-9\-]+)(?:\s+((?:[^"\'>]|"[^"]*"|\'[^\']*\')*))?(/)?>')
+        tag_pattern = re.compile(r'<(/)?([a-zA-Z_][a-zA-Z0-9_\-]*)(?:\s+((?:[^"\'>]|"[^"]*"|\'[^\']*\')*))?(/)?>')
 
         tokens: List[str] = []
         last_idx = 0

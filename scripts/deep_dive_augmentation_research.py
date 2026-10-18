@@ -29,13 +29,13 @@ if str(WORKSPACE_DIR) not in sys.path:
 
 from sequence_labelling.annotator.annotate_ocr import parse_xml_annotations
 from sequence_labelling.parser.deterministic_parser import parse_chunk_deterministic
-from tools.build_training_dataset import (
+from tools.dataset.build_training_dataset import (
     tokenize_with_offsets,
     align_spans_to_bio,
     chunk_bio_sequence,
     RECOGNIZED_TAGS
 )
-from tools.select_gold_benchmark import extract_structural_vector_and_tokens
+from tools.evaluation.select_gold_benchmark import extract_structural_vector_and_tokens
 from synthetic_exam_generator.reconstructor import (
     reconstruct_exam,
     spans_to_xml,

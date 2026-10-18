@@ -71,13 +71,13 @@ Your task is to annotate raw OCR text of exam papers by wrapping specific compon
 
 ## 🏷️ Tag Dictionary:
 
-1. <section>...</section>: Wrap major section/part titles, headers, directions, and subject block titles (e.g. "<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn...</section>", "<section>## PART 5</section>", "<section>## Chủ đề Địa lí có 17 câu hỏi từ 501 đến 517</section>"). Output full paired tags <section>...</section> containing verbatim text. Do NOT use anchor tags for section titles.
+1. <section>...</section>: Wrap major section/part titles, headers, directions, and subject block titles (e.g. "<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn...</section>", "<section>## PART 5</section>", "<section>## Chủ đề Địa lí có 17 câu hỏi từ 501 đến 517</section>"). Output full paired tags <section>...</section> containing verbatim text. Do NOT use anchor tags for section titles. CRITICAL RULE: NEVER tag individual question headers (e.g. '## Câu 1.', '## Câu 2:', '## Bài 1.') as <section>! Markdown question headings belong exclusively inside <question_label>.
 2. <stimulus id="stim_1" start_anchor="..." end_anchor="..." />: For shared reading passages, emails, articles, tables, figures, multi-passage sets, and explicit context prompts (e.g. "Dựa vào thông tin sau đây để giải quyết bài 4, 5...", "Dựa vào thông tin dưới đây để trả lời các câu từ 515-517..."). CRITICAL DEFINITION & MULTI-QUESTION RULE: A stimulus ONLY applies if it is intimately related to 2 OR MORE QUESTIONS (shared reading passage, dataset, table, or multi-question context). If a context or text block is only related to 1 single standalone question, do NOT tag it as a stimulus—include it inside that question's <stem> instead! A stimulus is a CRUCIAL, essential shared content block without which those 2+ questions CANNOT be answered. Output self-closing anchor tag with id, start_anchor (first 3-10 verbatim words), and end_anchor (last 3-10 verbatim words).
-3. <question_label>...</question_label>: Wrap question prefix indicators (e.g. "**101.**", "**131.**", "101.", "Câu 1:").
+3. <question_label>...</question_label>: Wrap question prefix indicators (e.g. "**101.**", "**131.**", "101.", "Câu 1.", "Câu 1:", "## Câu 1.", "## Bài 1:"). CRITICAL RULE: <question_label> must ONLY contain the short question number/label itself. When raw text contains markdown headers for questions (e.g. '## Câu 1.', '## Câu 2:'), enclose the entire header inside <question_label>: e.g. <question_label>## Câu 1.</question_label>. NEVER split into <section>## Câu 1.</section><question_label>Câu 1.</question_label>!
 4. <stem>...</stem>: Wrap the main text body of a question following the question label.
-5. <option_label>...</option_label>: Wrap choice letters/prefixes and sub-item/sub-question indicators (e.g. "(A)", "(B)", "(C)", "(D)", "A.", "B.", "a)", "b)", "c)", "d)", "a.", "b."). ESSAY & SUB-QUESTION RULE: In essay, long-answer, constructed-response, or multi-part questions where sub-items like "a)", "b)", "c)", "d)" appear without multiple-choice options to select, wrap the sub-item labels "a)", "b)" in <option_label>...</option_label> and their corresponding body text in <option_text>...</option_text>. Never absorb sub-item labels "a)", "b)" into <stem>!
-6. <option_text>...</option_text>: Wrap the textual content of choices or sub-question items following an <option_label>.
-7. <explanation>...</explanation>: Wrap reference explanations, answers explanation texts, and solutions for questions.
+5. <option_label>...</option_label>: Wrap choice letters/prefixes and sub-item/sub-question indicators (e.g. "(A)", "(B)", "(C)", "(D)", "A.", "B.", "a)", "b)", "c)", "d)", "a.", "b."). ESSAY & SUB-QUESTION RULE: In essay, long-answer, constructed-response, or multi-part questions where sub-items like "a)", "b)", "c)", "d)" appear without multiple-choice options to select, wrap the sub-item labels "a)", "b)" in <option_label>...</option_label> and their corresponding body text in <option_text>...</option_text>. VIETNAM GDPT 2018 TRUE/FALSE RULE: In Phần II (Trắc nghiệm đúng/sai) and structured questions, sub-item propositions 'a)', 'b)', 'c)', 'd)' MUST ALWAYS be tagged as <option_label>a)</option_label> <option_text>...</option_text>. Never absorb sub-item labels "a)", "b)" into <stem>!
+6. <option_text>...</option_text>: Wrap the textual content of choices or sub-question items following an <option_label>. Ensure <option_text> wraps formulas cleanly (e.g. <option_label>A.</option_label> <option_text>$x = 1$</option_text>), NEVER outputting $<option_text>...$.
+7. <explanation>...</explanation>: Wrap reference explanations, answers explanation texts, and solutions for questions. GRADING GUIDES & ANSWER KEYS: Wrap all scoring guides, rubric tables, and answer keys ('HƯỚNG DẪN CHẤM', 'ĐÁP ÁN', 'BẢNG ĐÁP ÁN') in <explanation>...</explanation>. Never tag answer key items as new exam questions.
 8. <figure id="fig_N" description="..." bbox="x1,y1,x2,y2" />: This is an immutable figure placeholder produced by the vision OCR stage and deterministic box projector. The bbox is in original rendered-page pixel coordinates using xyxy order. Preserve the complete self-closing tag, all three attributes, and its position exactly. It is source text, not a sequence-labelling tag.
 
 ---
@@ -99,6 +99,7 @@ Your task is to annotate raw OCR text of exam papers by wrapping specific compon
 13. **TABULAR & UNLABELED TRUE/FALSE SUB-QUESTIONS:** When sub-questions or True/False statements are presented inside HTML tables (`<table>...</table>`), Markdown tables, or lists without explicit option labels (such as `a)`, `b)` or `A.`), each statement cell or item text to be evaluated MUST still be tagged as `<option_text>...</option_text>` (e.g., `<td><option_text>Statement text...</option_text></td>`). Table formatting tags (`<table>`, `<tr>`, `<th>`, `<td>`), header titles ("Phát biểu", "Đúng", "Sai"), and choice indicators (`○`, `✓`, `[ ]`) remain un-tagged structure.
 14. **PAGE TAGS & METADATA PRUNING:** Prune and omit `<pages>`, `</pages>`, `<page>`, `</page>`, and `<page_metadata>...</page_metadata>` from the XML output. Do not retain page boundary tags or metadata blocks in the annotated XML. Maintain continuous elements (<stem>, <option_text>, <explanation>, <section>) seamlessly across page breaks without splitting them.
 15. **XML TAG MATCHING & INTEGRITY (NO MISMATCHED/UNCLOSED TAGS):** Every opened tag (`<section>`, `<question_label>`, `<stem>`, `<option_label>`, `<option_text>`, `<explanation>`) MUST have its exact matching closing tag (`</section>`, `</question_label>`, `</stem>`, `</option_label>`, `</option_text>`, `</explanation>`). NEVER produce mismatched closing tags (e.g. `<stem>...</option_text>`) or leave opening tags unclosed. Compact stimulus anchor tags `<stimulus ... />` and vision figures `<figure ... />` MUST always be formatted as self-closing tags with `/>`.
+16. **LATEX DELIMITER INTEGRITY:** Ensure <option_text> cleanly wraps math formulas: e.g. <option_label>A.</option_label> <option_text>$3x - 1 = 0$</option_text>. NEVER place tags inside LaTeX delimiters like $<option_text>...$.
 """
 
 
@@ -230,7 +231,7 @@ def parse_xml_annotations(tagged_text: str) -> Tuple[str, List[Dict[str, Any]]]:
     raw_chars = []
     spans = []
 
-    tag_pattern = re.compile(r"<(/)?([a-zA-Z_0-9\-]+)(?:\s+([^>]*))?>")
+    tag_pattern = re.compile(r"<(/)?([a-zA-Z_][a-zA-Z0-9_\-]*)(?:\s+([^>]*))?>")
     pos = 0
     tag_stack = []
 
@@ -1016,11 +1017,11 @@ def main():
     else:
         for root, _, files in os.walk(input_path):
             for file in files:
-                if file.lower().endswith(".md"):
+                if file.lower().endswith((".md", ".txt")):
                     md_files.append(Path(root) / file)
 
     if not md_files:
-        print(f"No .md files found in '{args.input}'.")
+        print(f"No .md or .txt files found in '{args.input}'.")
         sys.exit(0)
 
     if args.limit is not None:

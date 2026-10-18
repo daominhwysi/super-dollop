@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Any
+from typing import Optional, Any, Sequence, Tuple, List, Dict
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -70,6 +70,13 @@ commandcode_client = (
     else None
 )
 
+aixingialaire_key = get_provider_api_key("aixingialaire")
+aixingialaire_client = (
+    OpenAI(api_key=aixingialaire_key, base_url=get_provider_base_url("aixingialaire"))
+    if aixingialaire_key
+    else None
+)
+
 # Alias client for test mocking compatibility
 client = deepseek_client
 
@@ -82,6 +89,10 @@ def chat(
     provider: Optional[str] = None,
     max_tokens: Optional[int] = None,
     messages: Optional[Any] = None,
+    image_bytes: Optional[bytes] = None,
+    image_filename: Optional[str] = None,
+    images: Optional[Sequence[Tuple[str, bytes]]] = None,
+    stream: bool = False,
 ) -> str:
     """
     Call the LLM chat API using model and provider configured in config.yaml.
@@ -106,7 +117,7 @@ def chat(
     kwargs = {
         "messages": chat_messages,
         "model": target_model,
-        "stream": False,
+        "stream": stream,
     }
     if target_max_tokens:
         kwargs["max_tokens"] = target_max_tokens
@@ -228,6 +239,11 @@ def chat(
             model=target_model,
             thinking=thinking,
             messages=chat_messages,
+            image_bytes=image_bytes,
+            image_filename=image_filename,
+            images=images,
+            caller="deepseek_client",
+            auto_log=False,
         )
         duration_sec = time.time() - start_time
 
@@ -266,7 +282,12 @@ def chat(
         if commandcode_client is None:
             raise ValueError("Error: Model routes to CommandCode but neither CMD_API_KEY nor COMMANDCODE_API_KEY is set.")
         active_client = commandcode_client
-            
+
+    elif target_provider == "aixingialaire":
+        if aixingialaire_client is None:
+            raise ValueError("Error: Provider requires AIXINGIALAIRE_API_KEY but it is not set.")
+        active_client = aixingialaire_client
+
     else:
         if deepseek_client is None:
             raise ValueError("Error: DEEPSEEK_API_KEY is not set.")
@@ -283,20 +304,101 @@ def chat(
             kwargs["reasoning_effort"] = effort
 
     import time
-    start_time = time.time()
-    response = active_client.chat.completions.create(**kwargs)
-    duration_sec = time.time() - start_time
+    max_retries = 5
+    max_total_timeout = 1800.0  # 30 minutes max budget per request
+    overall_start_time = time.time()
+    base_backoff = 5.0
+    use_streaming = stream or target_provider == "aixingialaire"
+    reply_text = ""
+
+    for attempt in range(1, max_retries + 1):
+        elapsed = time.time() - overall_start_time
+        if elapsed >= max_total_timeout:
+            print(f"⏱️ [Timeout Exceeded] Total retry time {elapsed:.1f}s exceeded 30 minute limit for provider '{target_provider}'. Skipping.", flush=True)
+            raise TimeoutError(f"Provider '{target_provider}' exceeded 30 minute timeout limit ({elapsed:.1f}s elapsed)")
+
+        try:
+            start_time = time.time()
+            if use_streaming:
+                kwargs["stream"] = True
+                stream_resp = active_client.chat.completions.create(**kwargs)
+                collected = []
+                for chunk in stream_resp:
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        collected.append(chunk.choices[0].delta.content)
+                reply_text = "".join(collected)
+                duration_sec = time.time() - start_time
+                break
+            else:
+                response = active_client.chat.completions.create(**kwargs)
+                duration_sec = time.time() - start_time
+                reply_text = response.choices[0].message.content or ""
+                break
+        except Exception as e:
+            err_msg = str(e)
+            elapsed = time.time() - overall_start_time
+            is_524 = (
+                "524" in err_msg
+                or "origin_response_timeout" in err_msg
+                or "Proxy Read Timeout" in err_msg
+            )
+            is_retryable = (
+                is_524
+                or "429" in err_msg
+                or "rate limit" in err_msg.lower()
+                or "timeout" in err_msg.lower()
+                or "timed out" in err_msg.lower()
+                or "502" in err_msg
+                or "503" in err_msg
+                or "504" in err_msg
+                or "connection" in err_msg.lower()
+            )
+            if not is_retryable or attempt >= max_retries or elapsed >= max_total_timeout:
+                print(f"❌ [API Error] Provider '{target_provider}' stopped after attempt {attempt}/{max_retries} ({elapsed:.1f}s elapsed): {e}", flush=True)
+                raise
+
+            # Determine sleep delay
+            retry_after = None
+            if hasattr(e, "response") and e.response is not None:
+                retry_after_hdr = getattr(e.response, "headers", {}).get("retry-after")
+                if retry_after_hdr and retry_after_hdr.isdigit():
+                    retry_after = float(retry_after_hdr)
+
+            if retry_after is None:
+                m = re.search(r"['\"]retry_after['\"]\s*:\s*(\d+)", err_msg)
+                if m:
+                    retry_after = float(m.group(1))
+
+            if retry_after is not None:
+                sleep_sec = min(60.0, max(5.0, retry_after))
+            elif is_524:
+                # Cloudflare 524 origin read timeout: backoff capped at 60s
+                sleep_sec = min(60.0, 10.0 * attempt)
+            else:
+                sleep_sec = min(60.0, base_backoff * (1.5 ** (attempt - 1)))
+
+            # If sleep would exceed 30 minute max budget, cap it or abort
+            if elapsed + sleep_sec >= max_total_timeout:
+                print(f"⏱️ [Timeout Exceeded] Sleeping {sleep_sec:.1f}s would exceed 30 minute limit. Aborting retries.", flush=True)
+                raise TimeoutError(f"Provider '{target_provider}' exceeded 30 minute timeout limit")
+
+            print(
+                f"⚠️ [API Retry {attempt}/{max_retries}] Provider '{target_provider}' error ({'524 Cloudflare Origin Timeout' if is_524 else e}). "
+                f"Elapsed: {elapsed:.1f}s/1800s. Sleeping {sleep_sec:.1f}s before retry...",
+                flush=True
+            )
+            time.sleep(sleep_sec)
 
     from sequence_labelling.llm.llm_logger import log_llm_call
     log_llm_call(
         messages=kwargs.get("messages", []),
-        response=response,
+        response=reply_text,
         model=target_model,
         provider=target_provider,
         duration_sec=duration_sec
     )
 
-    return response.choices[0].message.content
+    return reply_text
 
 
 if __name__ == "__main__":

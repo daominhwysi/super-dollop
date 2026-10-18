@@ -177,19 +177,6 @@ def enforce_well_nesting(
         if stack and span.end > stack[-1].end:
             enclosing = stack[-1]
             clipped_end = enclosing.end
-            if clipped_end <= span.start:
-                conflict_reports.append({
-                    "type": "CROSSING_SPAN_DROPPED",
-                    "label": span.label,
-                    "rejected": span,
-                    "accepted": enclosing,
-                    "reason": (
-                        f"{span.label}[{span.start},{span.end}] crosses "
-                        f"{enclosing.label}[{enclosing.start},{enclosing.end}]"
-                    ),
-                })
-                continue
-
             conflict_reports.append({
                 "type": "CROSSING_SPAN_CLIPPED",
                 "label": span.label,

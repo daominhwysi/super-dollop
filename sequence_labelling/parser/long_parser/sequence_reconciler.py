@@ -155,18 +155,8 @@ def merge_chunk_xmls(
 
 
 def reconcile_parser_chunk_results(chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    try:
-        from sequence_labelling.parser.long_parser.source_merger.types import (
-            ChunkInput,
-            PageOffsetRange,
-        )
-        from sequence_labelling.parser.long_parser.source_merger.merger import merge_chunks
-    except ImportError:
-        from sequence_labelling.parser.long_parser.old.source_merger.types import (
-            ChunkInput,
-            PageOffsetRange,
-        )
-        from sequence_labelling.parser.long_parser.old.source_merger.merger import merge_chunks
+    from sequence_labelling.parser.long_parser.source_merger.types import ChunkInput, PageOffsetRange
+    from sequence_labelling.parser.long_parser.source_merger.merger import merge_chunks
 
     ordered = sorted(chunk_results, key=lambda item: int(item["chunk_index"]))
     expected = list(range(len(ordered)))

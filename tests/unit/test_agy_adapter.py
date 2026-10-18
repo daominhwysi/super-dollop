@@ -59,19 +59,77 @@ class TestAgyAdapter(unittest.TestCase):
 
         # Case 1: Model with -high suffix
         m, e = _resolve_model_and_effort("gemini-3.8-flash-high", None)
-        self.assertEqual(m, "gemini-3.8-flash")
-        self.assertEqual(e, "high")
+        self.assertEqual(m, "gemini-3.8-flash-high")
+        self.assertIsNone(e)
 
         # Case 2: Base model with explicit thinking
         m, e = _resolve_model_and_effort("gemini-3.8-flash", "medium")
-        self.assertEqual(m, "gemini-3.8-flash")
-        self.assertEqual(e, "medium")
+        self.assertEqual(m, "gemini-3.8-flash-medium")
+        self.assertIsNone(e)
 
         # Case 3: Base model without thinking defaults to high for gemini
         m, e = _resolve_model_and_effort("gemini-3.8-flash", None)
-        self.assertEqual(m, "gemini-3.8-flash")
-        self.assertEqual(e, "high")
+        self.assertEqual(m, "gemini-3.8-flash-high")
+        self.assertIsNone(e)
+
+    @patch("sequence_labelling.llm.agy_adapter.subprocess.run")
+    def test_chat_with_agy_multi_image_sandbox(self, mock_subproc):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = json.dumps({
+            "conversation_id": "conv-vision-1",
+            "status": "SUCCESS",
+            "response": "Vision OCR Markdown Result",
+            "usage": {"input_tokens": 200, "output_tokens": 50},
+        })
+        mock_subproc.return_value = mock_proc
+
+        images = [
+            ("page_1.jpg", b"img_bytes_1"),
+            ("page_2.jpg", b"img_bytes_2"),
+        ]
+        text, conv_id, usage = chat_with_agy(
+            prompt="Perform OCR on pages",
+            model="gemini-3.8-flash",
+            images=images,
+        )
+
+        self.assertEqual(text, "Vision OCR Markdown Result")
+        self.assertEqual(conv_id, "conv-vision-1")
+        cmd = mock_subproc.call_args[0][0]
+        self.assertTrue(any("agy" in arg for arg in cmd))
+        self.assertIn("--sandbox", cmd)
+        self.assertIn("--agent", cmd)
+        self.assertIn("vision-ocr", cmd)
+        call_kwargs = mock_subproc.call_args[1]
+        vision_input = call_kwargs.get("input", "")
+        self.assertIn("'page_1.jpg'", vision_input)
+        self.assertIn("'page_2.jpg'", vision_input)
+
+    @patch("sequence_labelling.llm.agy_adapter.subprocess.run")
+    def test_chat_with_agy_text_mode_agent(self, mock_subproc):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = json.dumps({
+            "conversation_id": "conv-text-1",
+            "status": "SUCCESS",
+            "response": "<question_label>Câu 1.</question_label>",
+            "usage": {"input_tokens": 50, "output_tokens": 10},
+        })
+        mock_subproc.return_value = mock_proc
+
+        text, conv_id, usage = chat_with_agy(
+            prompt="Annotate this question",
+            model="gemini-3.8-flash",
+        )
+
+        self.assertEqual(text, "<question_label>Câu 1.</question_label>")
+        cmd = mock_subproc.call_args[0][0]
+        self.assertIn("--agent", cmd)
+        self.assertIn("text-only", cmd)
+        self.assertIn("--disable-slash-commands", cmd)
 
 
 if __name__ == "__main__":
     unittest.main()
+

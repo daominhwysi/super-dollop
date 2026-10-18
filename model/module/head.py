@@ -38,7 +38,7 @@ class FocalLoss(nn.Module):
     """
     def __init__(
         self,
-        gamma: float = 1.5,
+        gamma: float = 2.0,
         weight: Optional[torch.Tensor] = None,
         ignore_index: int = -100,
         label_smoothing: float = 0.0
@@ -98,44 +98,150 @@ class FocalLoss(nn.Module):
         return focal_loss.mean()
 
 
-class WeightedLayerPooling(nn.Module):
+class SigmoidWeightedLayerPooling(nn.Module):
     """
-    Weighted Layer Pooling computes a softmax-weighted linear combination of representations
-    from the last K transformer layers.
+    Non-competing layer pooling. Uses independent sigmoid gates normalized after activation,
+    preventing early layer collapse caused by softmax zero-sum competition.
     """
-    def __init__(self, num_layers_to_fuse: int = 4):
+    def __init__(self, num_layers: int = 4):
         super().__init__()
-        self.num_layers_to_fuse = max(1, num_layers_to_fuse)
-        self.layer_weights = nn.Parameter(torch.ones(self.num_layers_to_fuse))
+        self.num_layers = max(1, num_layers)
+        # Initialize weights to 0.0 -> sigmoid(0.0) = 0.5 (equal weighting)
+        self.weights = nn.Parameter(torch.zeros(self.num_layers))
 
     def forward(
         self,
         hidden_states: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(hidden_states, (tuple, list)):
-            k = min(self.num_layers_to_fuse, len(hidden_states))
+            k = min(self.num_layers, len(hidden_states))
             selected_layers = hidden_states[-k:]
-            stacked = torch.stack(selected_layers, dim=0)  # Shape: [K, B, T, H]
-            weights = self.layer_weights[:k]
-            norm_weights = F.softmax(weights, dim=0).view(-1, 1, 1, 1)
-            return torch.sum(stacked * norm_weights, dim=0)
+            gates = torch.sigmoid(self.weights[:k])
+            norm_gates = gates / (torch.sum(gates) + 1e-8)
+            stacked = torch.stack(selected_layers, dim=0)  # Shape: [k, B, T, H]
+            fused = torch.einsum('l,lbth->bth', norm_gates, stacked)
+            return fused
         return hidden_states
 
 
-class MultiSampleDropout(nn.Module):
+# Backward-compatible alias
+WeightedLayerPooling = SigmoidWeightedLayerPooling
+
+
+class LocalConvRefinement(nn.Module):
     """
-    Multi-Sample Dropout applies multiple parallel dropout masks during training
-    and averages their projected logits, accelerating convergence and improving generalization.
+    1D Depthwise Separable Convolution for local boundary refinement.
+    - Kernel size: 7 tokens (~3-4 Vietnamese words receptive field)
+    - Depthwise (groups = hidden_size) + Pointwise (1x1)
+    - Dirac initialization ensures identity mapping at step 0.
     """
-    def __init__(self, dropout_rates: Tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5)):
+    def __init__(self, hidden_size: int = 768, kernel_size: int = 7, dropout_prob: float = 0.1):
+        super().__init__()
+        assert kernel_size % 2 == 1, "Kernel size must be odd for symmetric padding"
+        self.hidden_size = hidden_size
+        self.kernel_size = kernel_size
+        padding = kernel_size // 2
+
+        # Depthwise Conv (per-channel spatial pattern)
+        self.depthwise = nn.Conv1d(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=hidden_size,
+            bias=False
+        )
+        # Pointwise Conv (cross-channel projection)
+        self.pointwise = nn.Conv1d(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=1,
+            bias=True
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout_prob)
+
+        self._init_dirac_identity(hidden_size, kernel_size)
+
+    def _init_dirac_identity(self, hidden_size: int, kernel_size: int):
+        # Center impulse for depthwise kernel
+        nn.init.zeros_(self.depthwise.weight)
+        center_idx = kernel_size // 2
+        for i in range(hidden_size):
+            self.depthwise.weight.data[i, 0, center_idx] = 1.0
+
+        # Identity for pointwise projection
+        nn.init.eye_(self.pointwise.weight.data.view(hidden_size, hidden_size))
+        nn.init.zeros_(self.pointwise.bias)
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: [B, S, H]
+        residual = x
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).float()
+
+        x_trans = x.transpose(1, 2)  # [B, H, S]
+        x_conv = self.depthwise(x_trans)
+        x_conv = self.pointwise(x_conv)
+        x_conv = x_conv.transpose(1, 2)  # [B, S, H]
+
+        out = self.act(x_conv)
+        out = self.dropout(out)
+        out = self.norm(residual + out)
+        return out
+
+
+class TightenedMultiSampleDropout(nn.Module):
+    """
+    Multi-sample dropout with tightened schedule [0.05, 0.10, 0.15, 0.20, 0.25]
+    to preserve fine-grained token classification features.
+    """
+    def __init__(self, dropout_rates: Tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25)):
         super().__init__()
         self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropout_rates])
 
-    def forward(self, features: torch.Tensor, classifier: nn.Module) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, classifier: nn.Module) -> List[torch.Tensor]:
         if self.training and len(self.dropouts) > 1:
-            logits_list = [classifier(drop(features)) for drop in self.dropouts]
-            return torch.mean(torch.stack(logits_list, dim=0), dim=0)
-        return classifier(features)
+            return [classifier(drop(features)) for drop in self.dropouts]
+        return [classifier(features)]
+
+
+# Backward-compatible alias
+MultiSampleDropout = TightenedMultiSampleDropout
+
+
+class LayoutFeatureEmbedding(nn.Module):
+    """
+    2D Spatial & Indentation-Aware Layout Feature Embedding.
+    Injects column bucket, line-start, and blank-preceded indicators directly
+    into token representations.
+    Initialized with zeros to guarantee exact identity pass-through at step 0.
+    """
+    def __init__(self, hidden_size: int = 768, num_col_buckets: int = 5):
+        super().__init__()
+        self.col_embed = nn.Embedding(num_col_buckets, hidden_size)
+        self.line_start_embed = nn.Embedding(2, hidden_size)
+        self.blank_preceded_embed = nn.Embedding(2, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+
+        # Zero init ensures zero disruption to pretrained representations at step 0
+        nn.init.zeros_(self.col_embed.weight)
+        nn.init.zeros_(self.line_start_embed.weight)
+        nn.init.zeros_(self.blank_preceded_embed.weight)
+
+    def forward(
+        self,
+        col_buckets: torch.Tensor,
+        is_line_start: torch.Tensor,
+        is_blank_preceded: torch.Tensor
+    ) -> torch.Tensor:
+        emb = (
+            self.col_embed(col_buckets.long())
+            + self.line_start_embed(is_line_start.long())
+            + self.blank_preceded_embed(is_blank_preceded.long())
+        )
+        return self.norm(emb)
 
 
 class EnhancedTokenClassificationHead(nn.Module):
@@ -143,18 +249,24 @@ class EnhancedTokenClassificationHead(nn.Module):
     Enhanced dense token classification head.
     
     Architecture:
-    1. Weighted Layer Pooling: Softmax-weighted linear combination of the last K hidden states.
-    2. Dense Layer: Linear(H, H) -> GELU() -> LayerNorm(H).
-    3. Multi-Sample Dropout: K parallel dropout masks averaged during training.
-    4. Classification Projection: Linear(H, num_labels).
+    1. Sigmoid-Gated Layer Pooling across top-K transformer layers.
+    2. Optional 2D Layout Feature Embedding injection.
+    3. 1D Depthwise Separable Convolutional boundary refinement.
+    4. Dense GELU + LayerNorm projection.
+    5. Tightened Multi-Sample Dropout (MSD) with Per-Branch Focal Loss.
+    6. Classification Projection: Linear(H, num_labels).
     """
     def __init__(
         self,
         hidden_size: int = 768,
         num_labels: int = 15,
         num_layers_to_fuse: int = 4,
-        dropout_rates: Tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5),
-        intermediate_dim: Optional[int] = None
+        dropout_rates: Tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25),
+        intermediate_dim: Optional[int] = None,
+        use_conv_refinement: bool = True,
+        conv_kernel_size: int = 7,
+        use_layout_embeddings: bool = True,
+        pooling_type: str = "sigmoid"
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -162,22 +274,52 @@ class EnhancedTokenClassificationHead(nn.Module):
         self.num_layers_to_fuse = max(1, num_layers_to_fuse)
         inter_dim = intermediate_dim or hidden_size
 
-        # 1. Learnable layer pooling weights across the last K layers
-        self.layer_weights = nn.Parameter(torch.ones(self.num_layers_to_fuse))
+        # 1. Non-competing Layer Pooling (Sigmoid gating)
+        self.pooling_type = pooling_type
+        if pooling_type == "sigmoid":
+            self.layer_pooling = SigmoidWeightedLayerPooling(num_layers=self.num_layers_to_fuse)
+        else:
+            self.layer_pooling = WeightedLayerPooling(num_layers=self.num_layers_to_fuse)
 
-        # 2. Dense feature projection with LayerNorm & GELU
+        # 2. Optional Layout Feature Embedding
+        self.use_layout_embeddings = use_layout_embeddings
+        if use_layout_embeddings:
+            self.layout_embed = LayoutFeatureEmbedding(hidden_size=hidden_size)
+        else:
+            self.layout_embed = None
+
+        # 3. Local 1D Depthwise Separable Convolution Refinement
+        self.use_conv_refinement = use_conv_refinement
+        if use_conv_refinement:
+            self.conv_refinement = LocalConvRefinement(
+                hidden_size=hidden_size,
+                kernel_size=conv_kernel_size,
+                dropout_prob=dropout_rates[0] if dropout_rates else 0.1
+            )
+        else:
+            self.conv_refinement = None
+
+        # 4. Dense feature projection with LayerNorm & GELU
         self.dense = nn.Linear(hidden_size, inter_dim)
         self.act = nn.GELU()
         self.norm = nn.LayerNorm(inter_dim)
 
-        # 3. Multi-Sample Dropout (MSD)
-        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropout_rates])
+        # 5. Tightened Multi-Sample Dropout (MSD)
+        self.multi_sample_dropout = TightenedMultiSampleDropout(dropout_rates=dropout_rates)
+        self.dropouts = self.multi_sample_dropout.dropouts  # Backward compatibility
 
-        # 4. Final classification layer
+        # 6. Final classification projection
         self.classifier = nn.Linear(inter_dim, num_labels)
 
-        # Initialize weights
         self._init_weights()
+
+    @property
+    def layer_weights(self):
+        if hasattr(self.layer_pooling, "weights"):
+            return self.layer_pooling.weights
+        elif hasattr(self.layer_pooling, "layer_weights"):
+            return self.layer_pooling.layer_weights
+        return None
 
     def _init_weights(self):
         nn.init.xavier_uniform_(self.dense.weight)
@@ -189,39 +331,58 @@ class EnhancedTokenClassificationHead(nn.Module):
 
     def forward(
         self,
-        hidden_states: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor]
-    ) -> torch.Tensor:
-        if isinstance(hidden_states, (tuple, list)):
-            k = min(self.num_layers_to_fuse, len(hidden_states))
-            selected_layers = hidden_states[-k:]
-            stacked = torch.stack(selected_layers, dim=0)  # Shape: [K, B, T, H]
-            
-            # Slice or pad layer_weights to match actual K
-            weights = self.layer_weights[:k]
-            norm_weights = F.softmax(weights, dim=0).view(-1, 1, 1, 1)
-            
-            # Weighted average across layers
-            fused = torch.sum(stacked * norm_weights, dim=0)  # Shape: [B, T, H]
-        else:
-            fused = hidden_states
+        hidden_states: Union[Tuple[torch.Tensor, ...], List[torch.Tensor], torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        targets: Optional[torch.Tensor] = None,
+        loss_fct: Optional[nn.Module] = None,
+        layout_features: Optional[Dict[str, torch.Tensor]] = None
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        # 1. Pool top-K layers
+        fused = self.layer_pooling(hidden_states)
 
-        # Intermediate non-linear projection
+        # 2. Inject 2D Layout Features if provided
+        if self.layout_embed is not None and layout_features is not None:
+            col_buckets = layout_features.get("col_buckets")
+            is_line_start = layout_features.get("is_line_start")
+            is_blank_preceded = layout_features.get("is_blank_preceded")
+            if col_buckets is not None and is_line_start is not None and is_blank_preceded is not None:
+                fused = fused + self.layout_embed(col_buckets, is_line_start, is_blank_preceded)
+
+        # 3. Local boundary refinement with Depthwise Conv1D
+        if self.conv_refinement is not None:
+            fused = self.conv_refinement(fused, attention_mask=attention_mask)
+
+        # 4. Dense projection
         features = self.norm(self.act(self.dense(fused)))
 
-        # Multi-Sample Dropout averaging during training
-        if self.training and len(self.dropouts) > 1:
-            logits_list = [self.classifier(drop(features)) for drop in self.dropouts]
-            logits = torch.mean(torch.stack(logits_list, dim=0), dim=0)
+        # 5. Multi-Sample Dropout & Loss computation
+        if self.training and targets is not None and loss_fct is not None:
+            branch_logits = self.multi_sample_dropout(features, self.classifier)
+            # Compute focal loss per branch BEFORE averaging to prevent ensemble smoothing
+            branch_losses = [loss_fct(logits, targets) for logits in branch_logits]
+            loss = torch.mean(torch.stack(branch_losses))
+            logits = torch.mean(torch.stack(branch_logits, dim=0), dim=0)
+            return logits, loss
+        elif self.training and len(self.multi_sample_dropout.dropouts) > 1:
+            branch_logits = self.multi_sample_dropout(features, self.classifier)
+            logits = torch.mean(torch.stack(branch_logits, dim=0), dim=0)
+            if targets is not None and loss_fct is not None:
+                return logits, loss_fct(logits, targets)
+            return logits
         else:
             logits = self.classifier(features)
+            if targets is not None and loss_fct is not None:
+                return logits, loss_fct(logits, targets)
+            return logits
 
-        return logits
+
+SequenceLabellingHead = EnhancedTokenClassificationHead
 
 
 class EnhancedBertForTokenClassification(nn.Module):
     """
     Full Token Classification Model packaging a base Transformer backbone with
-    the EnhancedTokenClassificationHead and FocalLoss.
+    the EnhancedTokenClassificationHead, LocalConvRefinement, and FocalLoss.
     
     Fully compatible with Hugging Face Trainer, save_pretrained, and ONNX export.
     """
@@ -233,14 +394,20 @@ class EnhancedBertForTokenClassification(nn.Module):
         config: Any,
         base_model: nn.Module,
         num_layers_to_fuse: int = 4,
-        focal_gamma: float = 1.5,
-        label_smoothing: float = 0.0,
-        class_weights: Optional[torch.Tensor] = None
+        focal_gamma: float = 2.0,
+        label_smoothing: float = 0.05,
+        class_weights: Optional[torch.Tensor] = None,
+        dropout_rates: Tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25),
+        use_conv_refinement: bool = True,
+        conv_kernel_size: int = 7,
+        use_layout_embeddings: bool = True,
+        per_branch_focal_loss: bool = True
     ):
         super().__init__()
         self.config = config
         self.config.output_hidden_states = True
         self.num_labels = config.num_labels
+        self.per_branch_focal_loss = per_branch_focal_loss
         
         # Underlying transformer backbone (e.g. mmBERT-base)
         self.base_model = base_model
@@ -249,7 +416,11 @@ class EnhancedBertForTokenClassification(nn.Module):
         self.head = EnhancedTokenClassificationHead(
             hidden_size=hidden_size,
             num_labels=self.num_labels,
-            num_layers_to_fuse=num_layers_to_fuse
+            num_layers_to_fuse=num_layers_to_fuse,
+            dropout_rates=dropout_rates,
+            use_conv_refinement=use_conv_refinement,
+            conv_kernel_size=conv_kernel_size,
+            use_layout_embeddings=use_layout_embeddings
         )
 
         self.loss_fct = FocalLoss(
@@ -307,6 +478,9 @@ class EnhancedBertForTokenClassification(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        col_buckets: Optional[torch.Tensor] = None,
+        is_line_start: Optional[torch.Tensor] = None,
+        is_blank_preceded: Optional[torch.Tensor] = None,
         **kwargs
     ) -> TokenClassifierOutput:
         
@@ -326,11 +500,34 @@ class EnhancedBertForTokenClassification(nn.Module):
         if hidden_states is None:
             hidden_states = outputs[0]
 
-        logits = self.head(hidden_states)
+        layout_features = None
+        if col_buckets is not None and is_line_start is not None and is_blank_preceded is not None:
+            layout_features = {
+                "col_buckets": col_buckets,
+                "is_line_start": is_line_start,
+                "is_blank_preceded": is_blank_preceded
+            }
 
-        loss = None
-        if labels is not None:
-            loss = self.loss_fct(logits, labels)
+        if self.training and labels is not None and self.per_branch_focal_loss:
+            head_out = self.head(
+                hidden_states,
+                attention_mask=attention_mask,
+                targets=labels,
+                loss_fct=self.loss_fct,
+                layout_features=layout_features
+            )
+            logits, loss = head_out
+        else:
+            head_out = self.head(
+                hidden_states,
+                attention_mask=attention_mask,
+                layout_features=layout_features
+            )
+            if isinstance(head_out, tuple):
+                logits = head_out[0]
+            else:
+                logits = head_out
+            loss = self.loss_fct(logits, labels) if labels is not None else None
 
         return TokenClassifierOutput(
             loss=loss,
@@ -367,6 +564,9 @@ class EnhancedBertForTokenClassification(nn.Module):
             "hidden_size": getattr(self.config, "hidden_size", 768),
             "num_labels": self.num_labels,
             "num_layers_to_fuse": self.head.num_layers_to_fuse,
+            "use_conv_refinement": getattr(self.head, "use_conv_refinement", False),
+            "use_layout_embeddings": getattr(self.head, "use_layout_embeddings", False),
+            "pooling_type": getattr(self.head, "pooling_type", "sigmoid"),
         }
         with open(os.path.join(save_directory, "enhanced_head_config.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
@@ -380,6 +580,7 @@ class EnhancedBertForTokenClassification(nn.Module):
         label2id: Optional[Dict[str, int]] = None,
         token: Optional[str] = None,
         torch_dtype: Optional[torch.dtype] = None,
+        attn_implementation: Optional[str] = None,
         **kwargs
     ) -> "EnhancedBertForTokenClassification":
         revision = kwargs.get("revision", None)
@@ -392,9 +593,13 @@ class EnhancedBertForTokenClassification(nn.Module):
             config_kwargs["id2label"] = id2label
         if label2id is not None:
             config_kwargs["label2id"] = label2id
+        if attn_implementation is not None:
+            config_kwargs["_attn_implementation"] = attn_implementation
             
         config = AutoConfig.from_pretrained(model_name_or_path, token=token, **config_kwargs)
         config.output_hidden_states = True
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         
         meta_file = None
         safetensors_file = None
@@ -429,11 +634,15 @@ class EnhancedBertForTokenClassification(nn.Module):
                     model_bin_file = None
 
         num_layers_to_fuse = 4
+        use_conv_refinement = True
+        use_layout_embeddings = True
         if meta_file and os.path.exists(meta_file):
             try:
                 with open(meta_file, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                     num_layers_to_fuse = meta.get("num_layers_to_fuse", 4)
+                    use_conv_refinement = meta.get("use_conv_refinement", True)
+                    use_layout_embeddings = meta.get("use_layout_embeddings", True)
             except Exception:
                 pass
 
@@ -456,13 +665,25 @@ class EnhancedBertForTokenClassification(nn.Module):
         if has_full_weights:
             base_model = AutoModel.from_config(config)
         else:
-            base_model = AutoModel.from_pretrained(
-                model_name_or_path,
-                config=config,
-                token=token,
-                torch_dtype=torch_dtype,
-                **kwargs
-            )
+            load_kwargs = dict(kwargs)
+            if attn_implementation is not None:
+                load_kwargs["attn_implementation"] = attn_implementation
+            try:
+                base_model = AutoModel.from_pretrained(
+                    model_name_or_path,
+                    config=config,
+                    token=token,
+                    torch_dtype=torch_dtype,
+                    **load_kwargs
+                )
+            except TypeError:
+                base_model = AutoModel.from_pretrained(
+                    model_name_or_path,
+                    config=config,
+                    token=token,
+                    torch_dtype=torch_dtype,
+                    **kwargs
+                )
 
         # Check and align vocabulary size if token embeddings were expanded during training
         if loaded_state_dict is not None:
@@ -473,7 +694,9 @@ class EnhancedBertForTokenClassification(nn.Module):
         model = cls(
             config=config,
             base_model=base_model,
-            num_layers_to_fuse=num_layers_to_fuse
+            num_layers_to_fuse=num_layers_to_fuse,
+            use_conv_refinement=use_conv_refinement,
+            use_layout_embeddings=use_layout_embeddings
         )
 
         if loaded_state_dict is not None:

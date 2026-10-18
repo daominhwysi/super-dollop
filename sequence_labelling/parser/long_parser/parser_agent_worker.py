@@ -101,20 +101,40 @@ class ParserAgentWorker:
             "page_ids": page_ids or [],
         }
 
-        try:
-            anchored_res = self.anchored_parser.parse_exam_chunk(
-                raw_chunk_text,
-                chunk_metrics=chunk_metrics,
-            )
-            structured_questions = anchored_res.get("questions") or []
-            stimuli = anchored_res.get("stimuli") or {}
-            tagged_text = anchored_res.get("raw_xml") or ""
-            spans = anchored_res.get("spans") or []
-            method = anchored_res.get("method", "llm_xml_anchored")
-        except Exception as e:
-            validation_errors.append(f"Parsing failed: {e}")
-            print(f"[Parser Worker Warning] Parsing error: {e}")
-            structured_questions = []
+        max_chunk_attempts = max(3, self.max_attempts)
+        for attempt_i in range(1, max_chunk_attempts + 1):
+            try:
+                anchored_res = self.anchored_parser.parse_exam_chunk(
+                    raw_chunk_text,
+                    chunk_metrics=chunk_metrics,
+                )
+                structured_questions = anchored_res.get("questions") or []
+                stimuli = anchored_res.get("stimuli") or {}
+                tagged_text = anchored_res.get("raw_xml") or ""
+                spans = anchored_res.get("spans") or []
+                method = anchored_res.get("method", "llm_xml_anchored")
+
+                # If non-empty chunk produced empty xml, don't consider it a success if input has questions
+                if len(raw_chunk_text.strip()) > 300 and not tagged_text.strip() and attempt_i < max_chunk_attempts:
+                    print(f"⚠️ [Parser Worker Warning] Attempt {attempt_i}/{max_chunk_attempts} produced empty XML. Retrying in 5s...", flush=True)
+                    time.sleep(5)
+                    continue
+
+                # Clear previous validation errors if successful
+                validation_errors.clear()
+                break
+            except Exception as e:
+                validation_errors.append(f"Attempt {attempt_i} failed: {e}")
+                print(f"[Parser Worker Warning] Parsing attempt {attempt_i}/{max_chunk_attempts} failed: {e}", flush=True)
+                is_timeout = isinstance(e, TimeoutError) or "524" in str(e) or "timeout" in str(e).lower()
+                if is_timeout or attempt_i >= max_chunk_attempts:
+                    if is_timeout:
+                        print(f"⚠️ [Parser Worker] Chunk encountered timeout or retries exhausted. Skipping further attempts.", flush=True)
+                    structured_questions = []
+                    tagged_text = ""
+                    break
+                else:
+                    time.sleep(10)
 
         # Ensure chunk-local IDs are globally unique across chunks.
         scoped_stimuli: Dict[str, str] = {}
@@ -170,7 +190,7 @@ class ParserAgentWorker:
             "page_ids": page_ids or [],
             "overlap_page_ids": overlap_page_ids or [],
             "page_offset_ranges": page_offset_ranges or [],
-            "parse_status": "ok" if not validation_errors else "error",
+            "parse_status": "ok" if (not validation_errors and (tagged_text.strip() or len(raw_chunk_text.strip()) <= 100)) else "error",
             "parse_diagnostics": {
                 "attempts": attempts_used,
                 "validation_errors": validation_errors,

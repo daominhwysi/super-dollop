@@ -60,12 +60,13 @@ def log_token_usage(
     input_tokens: int = 0,
     output_tokens: int = 0,
     reasoning_tokens: int = 0,
+    cache_read_tokens: int = 0,
     total_tokens: Optional[int] = None,
     duration_sec: Optional[float] = None,
     caller: Optional[str] = None,
 ) -> Path:
     """
-    Directly logs a token usage entry with provider and model.
+    Directly logs a token usage entry with provider, model, and cache metrics.
     """
     total = total_tokens if total_tokens is not None else (input_tokens + output_tokens + reasoning_tokens)
     
@@ -74,6 +75,7 @@ def log_token_usage(
         "provider": provider or "unknown",
         "model": model or "unknown",
         "input_tokens": _to_int(input_tokens),
+        "cache_read_tokens": _to_int(cache_read_tokens),
         "reasoning_tokens": _to_int(reasoning_tokens),
         "output_tokens": _to_int(output_tokens),
         "total_tokens": _to_int(total),
@@ -121,6 +123,7 @@ def log_response(
     input_tokens = 0
     completion_tokens = 0
     reasoning_tokens = 0
+    cache_read_tokens = 0
     output_tokens = 0
     total_tokens = 0
 
@@ -129,6 +132,11 @@ def log_response(
             input_tokens = _to_int(usage.get("prompt_tokens") or usage.get("input_tokens"))
             completion_tokens = _to_int(usage.get("completion_tokens") or usage.get("output_tokens"))
             total_tokens = _to_int(usage.get("total_tokens"))
+            cache_read_tokens = _to_int(
+                usage.get("cache_read_tokens")
+                or usage.get("cached_tokens")
+                or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+            )
             
             details = usage.get("completion_tokens_details") or {}
             if isinstance(details, dict):
@@ -138,6 +146,8 @@ def log_response(
 
             if "reasoning_tokens" in usage:
                 reasoning_tokens = _to_int(usage.get("reasoning_tokens"))
+            elif "thinking_tokens" in usage:
+                reasoning_tokens = _to_int(usage.get("thinking_tokens"))
 
             if "output_tokens" in usage and "completion_tokens" not in usage:
                 output_tokens = _to_int(usage.get("output_tokens"))
@@ -149,8 +159,18 @@ def log_response(
             completion_tokens = _to_int(getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", 0))
             total_tokens = _to_int(getattr(usage, "total_tokens", 0))
             
+            cached_val = getattr(usage, "cache_read_tokens", None) or getattr(usage, "cached_tokens", None)
+            if cached_val is None:
+                p_details = getattr(usage, "prompt_tokens_details", None)
+                cached_val = getattr(p_details, "cached_tokens", 0) if p_details else 0
+            cache_read_tokens = _to_int(cached_val)
+
             details = getattr(usage, "completion_tokens_details", None)
-            reasoning_tokens = _to_int(getattr(details, "reasoning_tokens", 0) or getattr(usage, "reasoning_tokens", 0))
+            reasoning_tokens = _to_int(
+                getattr(details, "reasoning_tokens", 0)
+                or getattr(usage, "reasoning_tokens", 0)
+                or getattr(usage, "thinking_tokens", 0)
+            )
 
             if getattr(usage, "output_tokens", None) is not None and getattr(usage, "completion_tokens", None) is None:
                 output_tokens = _to_int(getattr(usage, "output_tokens", 0))
@@ -166,6 +186,7 @@ def log_response(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         reasoning_tokens=reasoning_tokens,
+        cache_read_tokens=cache_read_tokens,
         total_tokens=total_tokens,
         duration_sec=duration_sec,
         caller=caller,
@@ -196,71 +217,83 @@ def load_logs(date: Optional[str] = None) -> List[Dict[str, Any]]:
 
 def summarize(date: Optional[str] = None) -> Dict[str, Any]:
     """
-    Compute aggregate token statistics overall, by provider, and by model.
+    Compute aggregate token statistics overall, by provider, by model, and by caller.
     """
     records = load_logs(date)
     summary: Dict[str, Any] = {
         "date": date or datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
         "total_calls": len(records),
         "input_tokens": 0,
+        "cache_read_tokens": 0,
         "reasoning_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "total_duration_sec": 0.0,
         "by_provider": {},
         "by_model": {},
         "by_provider_model": {},
+        "by_caller": {},
     }
 
     for r in records:
         inp = r.get("input_tokens", 0)
+        cache = r.get("cache_read_tokens", 0)
         res = r.get("reasoning_tokens", 0)
         out = r.get("output_tokens", 0)
         tot = r.get("total_tokens", inp + out + res)
+        dur = r.get("duration_sec", 0.0) or 0.0
         prov = r.get("provider", "unknown")
         mod = r.get("model", "unknown")
+        caller = r.get("caller") or "unknown"
         prov_mod = f"{prov} / {mod}"
 
         # Global sums
         summary["input_tokens"] += inp
+        summary["cache_read_tokens"] += cache
         summary["reasoning_tokens"] += res
         summary["output_tokens"] += out
         summary["total_tokens"] += tot
+        summary["total_duration_sec"] += dur
 
-        # By Provider
-        if prov not in summary["by_provider"]:
-            summary["by_provider"][prov] = {
-                "calls": 0, "input_tokens": 0, "reasoning_tokens": 0, "output_tokens": 0, "total_tokens": 0
-            }
-        p_dict = summary["by_provider"][prov]
-        p_dict["calls"] += 1
-        p_dict["input_tokens"] += inp
-        p_dict["reasoning_tokens"] += res
-        p_dict["output_tokens"] += out
-        p_dict["total_tokens"] += tot
+        def _update_bucket(bucket: Dict[str, Any], key: str):
+            if key not in bucket:
+                bucket[key] = {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "total_duration_sec": 0.0,
+                }
+            b = bucket[key]
+            b["calls"] += 1
+            b["input_tokens"] += inp
+            b["cache_read_tokens"] += cache
+            b["reasoning_tokens"] += res
+            b["output_tokens"] += out
+            b["total_tokens"] += tot
+            b["total_duration_sec"] += dur
 
-        # By Model
-        if mod not in summary["by_model"]:
-            summary["by_model"][mod] = {
-                "calls": 0, "input_tokens": 0, "reasoning_tokens": 0, "output_tokens": 0, "total_tokens": 0
-            }
-        m_dict = summary["by_model"][mod]
-        m_dict["calls"] += 1
-        m_dict["input_tokens"] += inp
-        m_dict["reasoning_tokens"] += res
-        m_dict["output_tokens"] += out
-        m_dict["total_tokens"] += tot
+        _update_bucket(summary["by_provider"], prov)
+        _update_bucket(summary["by_model"], mod)
+        _update_bucket(summary["by_provider_model"], prov_mod)
+        _update_bucket(summary["by_caller"], caller)
 
-        # By Provider / Model
-        if prov_mod not in summary["by_provider_model"]:
-            summary["by_provider_model"][prov_mod] = {
-                "calls": 0, "input_tokens": 0, "reasoning_tokens": 0, "output_tokens": 0, "total_tokens": 0
-            }
-        pm_dict = summary["by_provider_model"][prov_mod]
-        pm_dict["calls"] += 1
-        pm_dict["input_tokens"] += inp
-        pm_dict["reasoning_tokens"] += res
-        pm_dict["output_tokens"] += out
-        pm_dict["total_tokens"] += tot
+    # Compute cache hit percentages
+    def _add_rates(b: Dict[str, Any]):
+        inp = b.get("input_tokens", 0)
+        cache = b.get("cache_read_tokens", 0)
+        calls = b.get("calls", 0)
+        dur = b.get("total_duration_sec", 0.0)
+        b["cache_hit_pct"] = round(100.0 * cache / inp, 1) if inp > 0 else 0.0
+        b["avg_duration_sec"] = round(dur / calls, 2) if calls > 0 else 0.0
+
+    _add_rates(summary)
+    for p in summary["by_provider"].values(): _add_rates(p)
+    for m in summary["by_model"].values(): _add_rates(m)
+    for pm in summary["by_provider_model"].values(): _add_rates(pm)
+    for c in summary["by_caller"].values(): _add_rates(c)
 
     return summary
 
@@ -271,51 +304,77 @@ def print_summary(date: Optional[str] = None) -> None:
     date_str = s["date"]
     total_calls = s["total_calls"]
 
-    print(f"\n========================================================================================")
-    print(f" TOKEN USAGE REPORT — Date: {date_str} (Total API Calls: {total_calls})")
-    print(f"========================================================================================")
+    print(f"\n==========================================================================================================")
+    print(f" TOKEN USAGE & OBSERVABILITY REPORT — Date: {date_str} (Total API Calls: {total_calls})")
+    print(f"==========================================================================================================")
 
     if total_calls == 0:
         print(" No token records found for this date.")
-        print("========================================================================================\n")
+        print("==========================================================================================================\n")
         return
 
     # 1. By Provider Summary
     print("\n--- 🏢 Breakdown by Provider ---")
-    header = f"{'Provider':<18} | {'Calls':>7} | {'Input Tokens':>14} | {'Reasoning':>12} | {'Output':>12} | {'Total':>14}"
+    header = f"{'Provider':<16} | {'Calls':>6} | {'Input Tokens':>13} | {'Cache Read (Hit %)':>20} | {'Thinking':>10} | {'Output':>10} | {'Total':>13} | {'Avg Sec':>7}"
     print(header)
     print("-" * len(header))
     for prov, stats in sorted(s["by_provider"].items(), key=lambda x: -x[1]["total_tokens"]):
-        print(f"{prov:<18} | {stats['calls']:>7,d} | {stats['input_tokens']:>14,d} | {stats['reasoning_tokens']:>12,d} | {stats['output_tokens']:>12,d} | {stats['total_tokens']:>14,d}")
+        cache_str = f"{stats['cache_read_tokens']:,d} ({stats['cache_hit_pct']}%)"
+        print(f"{prov:<16} | {stats['calls']:>6,d} | {stats['input_tokens']:>13,d} | {cache_str:>20} | {stats['reasoning_tokens']:>10,d} | {stats['output_tokens']:>10,d} | {stats['total_tokens']:>13,d} | {stats['avg_duration_sec']:>6.2f}s")
 
     # 2. By Model Summary
     print("\n--- 🤖 Breakdown by Model ---")
-    header_m = f"{'Model':<30} | {'Calls':>7} | {'Input Tokens':>14} | {'Reasoning':>12} | {'Output':>12} | {'Total':>14}"
+    header_m = f"{'Model':<26} | {'Calls':>6} | {'Input Tokens':>13} | {'Cache Read (Hit %)':>20} | {'Thinking':>10} | {'Output':>10} | {'Total':>13} | {'Avg Sec':>7}"
     print(header_m)
     print("-" * len(header_m))
     for mod, stats in sorted(s["by_model"].items(), key=lambda x: -x[1]["total_tokens"]):
-        display_mod = mod if len(mod) <= 30 else (mod[:27] + "...")
-        print(f"{display_mod:<30} | {stats['calls']:>7,d} | {stats['input_tokens']:>14,d} | {stats['reasoning_tokens']:>12,d} | {stats['output_tokens']:>12,d} | {stats['total_tokens']:>14,d}")
+        display_mod = mod if len(mod) <= 26 else (mod[:23] + "...")
+        cache_str = f"{stats['cache_read_tokens']:,d} ({stats['cache_hit_pct']}%)"
+        print(f"{display_mod:<26} | {stats['calls']:>6,d} | {stats['input_tokens']:>13,d} | {cache_str:>20} | {stats['reasoning_tokens']:>10,d} | {stats['output_tokens']:>10,d} | {stats['total_tokens']:>13,d} | {stats['avg_duration_sec']:>6.2f}s")
 
-    # 3. Combined Provider & Model
-    print("\n--- 🔗 Breakdown by Provider & Model ---")
-    header_pm = f"{'Provider / Model':<36} | {'Calls':>7} | {'Input':>12} | {'Reasoning':>11} | {'Output':>11} | {'Total Tokens':>14}"
-    print(header_pm)
-    print("-" * len(header_pm))
-    for pm, stats in sorted(s["by_provider_model"].items(), key=lambda x: -x[1]["total_tokens"]):
-        display_pm = pm if len(pm) <= 36 else (pm[:33] + "...")
-        print(f"{display_pm:<36} | {stats['calls']:>7,d} | {stats['input_tokens']:>12,d} | {stats['reasoning_tokens']:>11,d} | {stats['output_tokens']:>11,d} | {stats['total_tokens']:>14,d}")
+    # 3. By Caller (if present)
+    if s["by_caller"] and any(k != "unknown" for k in s["by_caller"]):
+        print("\n--- 🎯 Breakdown by Pipeline Caller ---")
+        header_c = f"{'Caller / Component':<26} | {'Calls':>6} | {'Input Tokens':>13} | {'Cache Read (Hit %)':>20} | {'Output':>10} | {'Total':>13} | {'Avg Sec':>7}"
+        print(header_c)
+        print("-" * len(header_c))
+        for caller, stats in sorted(s["by_caller"].items(), key=lambda x: -x[1]["total_tokens"]):
+            display_c = caller if len(caller) <= 26 else (caller[:23] + "...")
+            cache_str = f"{stats['cache_read_tokens']:,d} ({stats['cache_hit_pct']}%)"
+            print(f"{display_c:<26} | {stats['calls']:>6,d} | {stats['input_tokens']:>13,d} | {cache_str:>20} | {stats['output_tokens']:>10,d} | {stats['total_tokens']:>13,d} | {stats['avg_duration_sec']:>6.2f}s")
 
     # 4. Grand Total
     print("\n" + "=" * len(header))
-    print(f"{'GRAND TOTAL':<18} | {s['total_calls']:>7,d} | {s['input_tokens']:>14,d} | {s['reasoning_tokens']:>12,d} | {s['output_tokens']:>12,d} | {s['total_tokens']:>14,d}")
-    print("========================================================================================\n")
+    global_cache = f"{s['cache_read_tokens']:,d} ({s['cache_hit_pct']}%)"
+    global_avg_sec = round(s["total_duration_sec"] / s["total_calls"], 2) if s["total_calls"] > 0 else 0.0
+    print(f"{'GRAND TOTAL':<16} | {s['total_calls']:>6,d} | {s['input_tokens']:>13,d} | {global_cache:>20} | {s['reasoning_tokens']:>10,d} | {s['output_tokens']:>10,d} | {s['total_tokens']:>13,d} | {global_avg_sec:>6.2f}s")
+    print("==========================================================================================================\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Display LLM token usage breakdown by provider and model.")
     parser.add_argument("--date", type=str, default=None, help="Target date in YYYY-MM-DD format (default: today)")
+    parser.add_argument("--json", action="store_true", help="Output summary in JSON format")
+    parser.add_argument("--watch", action="store_true", help="Continuously refresh and watch token usage")
+    parser.add_argument("--interval", type=float, default=3.0, help="Watch refresh interval in seconds")
     args = parser.parse_args()
+
+    if args.json:
+        print(json.dumps(summarize(date=args.date), indent=2, ensure_ascii=False))
+        return
+
+    if args.watch:
+        import time
+        try:
+            while True:
+                os.system("clear" if os.name == "posix" else "cls")
+                print_summary(date=args.date)
+                print(f"[Live Monitor] Refreshing every {args.interval}s. Press Ctrl+C to exit.")
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\nExiting watch mode.")
+            return
+
     print_summary(date=args.date)
 
 

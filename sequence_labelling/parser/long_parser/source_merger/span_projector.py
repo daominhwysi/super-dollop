@@ -103,7 +103,7 @@ def project_local_spans_to_global(
                 g_end_clamped -= 1
 
         # Include trailing sentence punctuation inside span if parsed text ends with punctuation
-        if g_end_clamped < len(canonical_text) and canonical_text[g_end_clamped] in ".!?:":
+        if p_sub and p_sub[-1] in ".!?:" and g_end_clamped < len(canonical_text) and canonical_text[g_end_clamped] in ".!?:":
             if l_span.label in ("stimulus", "stem", "option_text"):
                 g_end_clamped += 1
 
