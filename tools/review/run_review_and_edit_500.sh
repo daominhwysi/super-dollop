@@ -22,7 +22,7 @@ EDITOR_MODEL="${EDITOR_MODEL:-gemini-3.8-flash}"
 EDITOR_PROVIDER="${EDITOR_PROVIDER:-agy}"
 EDITOR_THINKING="${EDITOR_THINKING:-low}"
 RUN_PHASE="${RUN_PHASE:-edit}" # options: all, review, edit (default: edit)
-GRANULARITY="${GRANULARITY:-chunk}" # options: chunk, document, auto (default: chunk)
+GRANULARITY="${GRANULARITY:-chunk}" # options: chunk, document (default: chunk)
 
 OVERWRITE_FLAG=""
 MODE_DESC="Resuming from previous progress (skipping already audited documents)"

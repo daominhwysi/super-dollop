@@ -106,7 +106,7 @@ UNRECOVERABLE_PATTERNS = [
     r"scrambl",
     r"jumbled",
     r"cross[- ]reading",
-    r"truncated[- ]output",
+    r"truncat",
     r"zero questions",
     r"no questions detected",
     r"garbled",
@@ -121,6 +121,15 @@ def is_unrecoverable_discard(report_dict: Dict[str, Any]) -> Tuple[bool, str]:
     Determines if a discarded document has unrecoverable OCR flaws (e.g. 2-column interleaving,
     scrambled questions, garbled lines, or truncated OCR) that cannot be salvaged by sequence editing.
     """
+    metrics = report_dict.get("metrics") or {}
+    retention = metrics.get("retention_ratio")
+    if retention is not None and retention < 0.75:
+        return True, f"Low text retention ratio ({retention:.1%}): output severely incomplete"
+
+    unannotated_q = metrics.get("unannotated_questions_count")
+    if unannotated_q is not None and unannotated_q >= 10:
+        return True, f"Excessive unannotated questions ({unannotated_q} omitted): exceeds surgical repair capability"
+
     discard_reasons = report_dict.get("discard_reasons", [])
     summary = report_dict.get("summary", "")
 
@@ -136,8 +145,11 @@ def is_unrecoverable_discard(report_dict: Dict[str, Any]) -> Tuple[bool, str]:
         if match:
             return True, f"Summary: {summary.strip()}"
 
-    # Check critical issues
+    # Check issues
     for issue in report_dict.get("issues", []):
+        cat = issue.get("category", "")
+        if cat in ("truncated_output", "unrecoverable_ocr"):
+            return True, f"Unrecoverable issue category: {cat}"
         if str(issue.get("severity", "")).upper() == "CRITICAL":
             msg = issue.get("message", "")
             match = UNRECOVERABLE_REGEX.search(msg)
@@ -158,9 +170,13 @@ def load_revision_targets(
     annotated_dir: Path,
     decisions: Set[str],
     skip_unrecoverable: bool = True,
-    granularity: str = "auto",
+    granularity: str = "chunk",
 ) -> List[Dict[str, Any]]:
-    """Load documents matching the requested review decisions with dual granularity support."""
+    """Load documents matching the requested review decisions with dual granularity support (chunk or document)."""
+    granularity = (granularity or "chunk").strip().lower()
+    if granularity not in {"chunk", "document"}:
+        raise ValueError(f"Invalid granularity: {granularity}. Must be 'chunk' or 'document'.")
+
     json_path = report_path.with_suffix(".json") if report_path.suffix == ".md" else report_path
     if not json_path.exists():
         print(f"❌ Error: Report file '{json_path}' not found.")
@@ -197,17 +213,7 @@ def load_revision_targets(
         should_decompose = (
             not is_chunk_target
             and chunks_dir.exists()
-            and (
-                granularity == "chunk"
-                or (
-                    granularity == "auto"
-                    and (
-                        len(list(chunks_dir.glob("chunk_*.xml"))) > 1
-                        or ((annotated_dir / exam_id / "merged.xml").exists()
-                            and (annotated_dir / exam_id / "merged.xml").stat().st_size / 3.5 > 15_000)
-                    )
-                )
-            )
+            and granularity == "chunk"
         )
 
         if should_decompose:
@@ -234,6 +240,11 @@ def load_revision_targets(
                             # Skip chunks that already pass
                             continue
                         c_decision = aud_data.get("decision", decision)
+                        if c_decision == "DISCARD" and skip_unrecoverable:
+                            is_unrec, _ = is_unrecoverable_discard(aud_data)
+                            if is_unrec:
+                                skipped_unrec_count += 1
+                                continue
                         c_score = aud_data.get("overall_score", c_score)
                         c_report = ReviewReport.model_validate(aud_data)
                         c_issues = [
@@ -575,9 +586,9 @@ def parse_args():
     )
     parser.add_argument(
         "--granularity",
-        choices=["chunk", "document", "auto"],
-        default="auto",
-        help="Editing granularity: chunk (individual chunks <=15k tokens), document (monolithic merged.xml), auto (switch to chunk if multi-chunk; default: auto)",
+        choices=["chunk", "document"],
+        default="chunk",
+        help="Editing granularity: chunk (individual chunks <=15k tokens; default: chunk), document (monolithic merged.xml)",
     )
     parser.add_argument(
         "--auto-reconcile",
@@ -920,9 +931,10 @@ def process_single_revision(
 
         if xml_path.name.startswith("chunk_"):
             chunk_audit_path = branch_xml_path.with_suffix(".audit.json")
-            if res.final_report:
+            final_rep = getattr(res, "final_report", None)
+            if final_rep:
                 chunk_audit_path.write_text(
-                    json.dumps(res.final_report.model_dump(), indent=2, ensure_ascii=False),
+                    json.dumps(final_rep.model_dump(), indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
 
@@ -947,9 +959,10 @@ def process_single_revision(
     elif auto_save and not dry_run and already_passed:
         if xml_path.name.startswith("chunk_"):
             chunk_audit_path = branch_xml_path.with_suffix(".audit.json")
-            if res.final_report:
+            final_rep = getattr(res, "final_report", None)
+            if final_rep:
                 chunk_audit_path.write_text(
-                    json.dumps(res.final_report.model_dump(), indent=2, ensure_ascii=False),
+                    json.dumps(final_rep.model_dump(), indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
 

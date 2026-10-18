@@ -22,6 +22,9 @@ providers:
   agy:
     base_url: "local://agy-cli"
     api_key_env: ""
+  aixingialaire:
+    base_url: "https://aixingialaire.com/v1"
+    api_key_env: "AIXINGIALAIRE_GPT_API_KEY"
 
 models:
   ocr:
@@ -38,9 +41,9 @@ models:
       included_class_ids: [1]
 
   parser:
-    model_name: "gemini-3.8-flash"
-    provider: "agy"
-    thinking: high
+    model_name: "gpt-6-luna"
+    provider: "aixingialaire"
+    thinking: low
     max_tokens: 128000
     description: "Sequence labeling LLM model for question stem and option annotation"
 
@@ -56,10 +59,10 @@ models:
     description: "LLM model for mapping unstructured answer keys to questions"
 
   chunker:
-    target_tokens: 12000
-    max_tokens: 16000
+    target_tokens: 6000
+    max_tokens: 8000
     overlap_pages: 0
-    description: "Passage-locked greedy chunker token budget (12k-16k tokens per chunk)"
+    description: "Passage-locked greedy chunker token budget (6k-8k tokens per chunk)"
 
   reviewer:
     model_name: "gemini-3.8-flash"

@@ -64,8 +64,32 @@ def main():
     table.add_row("Total Pages Converted", f"{total_pages:,} pages")
     table.add_row("Total Input Tokens", f"{in_tokens:,} tokens")
     table.add_row("Total Output Tokens", f"{out_tokens:,} tokens")
-    table.add_row("Cumulative agy Spend", f"${cost_usd:.4f} / $195.00 limit")
-    table.add_row("Remaining Weekly Quota", f"${max(0.0, 200.0 - cost_usd):.2f}")
+    table.add_row("Cumulative Nominal Spend", f"${cost_usd:.4f} (Est. API value)")
+
+    # Real Antigravity Quota Telemetry via /quota
+    try:
+        from sequence_labelling.llm.agy_rate_limiter import AgyQuotaService
+        quota = AgyQuotaService.fetch_quota(timeout=12.0)
+    except Exception:
+        quota = None
+
+    if quota and (quota.gemini_5h or quota.gemini_weekly):
+        if quota.gemini_5h:
+            table.add_row(
+                "Gemini 5-Hour Quota",
+                f"[bold green]{quota.gemini_5h_pct:.1f}% remaining[/bold green] (resets in {quota.gemini_5h.formatted_cooldown()})",
+            )
+        if quota.gemini_weekly:
+            table.add_row(
+                "Gemini Weekly Quota",
+                f"[bold green]{quota.gemini_weekly_pct:.1f}% remaining[/bold green] (resets {quota.gemini_weekly.formatted_reset()})",
+            )
+        if quota.claude_weekly:
+            table.add_row(
+                "Claude / GPT Quota",
+                f"5h: {quota.claude_5h_pct:.1f}% | Weekly: {quota.claude_weekly_pct:.1f}%",
+            )
+
     table.add_row("Last Checkpoint Updated", last_updated)
 
     console.print(table)

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Full Fine-Tuning Trainer for Vietnamese Sequence Labelling.
-Optimized for jhu-clsp/mmBERT-base (280M parameters, 8192 context window) with
-Multi-Scale Sliding Windows, Focal Loss, Distributed Training (DDP/torchrun),
+Optimized for aisingapore/SEA-LION-ModernBERT-300M (300M parameters, 8192 context window) with
+word-level sliding windows, Focal Loss, Distributed Training (DDP/torchrun),
 and Hugging Face Hub integration.
 """
 
 import os
 import sys
+import hashlib
 from pathlib import Path
 
 # Configure PyTorch memory allocator to avoid fragmentation on T4 / constrained GPUs
@@ -47,7 +48,12 @@ from transformers.utils import logging as transformers_logging
 transformers_logging.disable_progress_bar()
 
 from model.module.head import EnhancedBertForTokenClassification, FocalLoss
-from model.module.dataset import get_tag_mappings, MultiWindowBIODataset, OnlineAugmentedDataset
+from model.module.dataset import get_tag_mappings, MultiWindowBIODataset
+from model.inference.viterbi import ConstrainedViterbiDecoder
+
+
+# ModernBERT names its normalisation layers `norm`, `attn_norm`, `mlp_norm`, `final_norm`
+NO_DECAY_KEYWORDS = ("bias", "norm", "layer_pooling")
 
 
 def parse_args():
@@ -58,6 +64,7 @@ def parse_args():
     parser.add_argument("--model-name", "--model_name", type=str, default=None, help="Hugging Face model backbone")
     parser.add_argument("--output-dir", "--output_dir", type=str, default=None, help="Directory to save checkpoints")
     parser.add_argument("--enhanced-head", "--enhanced_head", action="store_true", default=True, help="Enable enhanced head with multi-sample dropout and layer pooling")
+    parser.add_argument("--attn-implementation", "--attn_implementation", type=str, default=None, help="Attention implementation ('sdpa', 'flash_attention_2', or 'eager')")
     parser.add_argument("--no-lora", "--no_lora", action="store_true", default=False, help="Full fine-tuning without LoRA")
     parser.add_argument("--focal-gamma", "--focal_gamma", type=float, default=None, help="Focal loss gamma parameter")
     parser.add_argument("--label-smoothing", "--label_smoothing", type=float, default=None, help="Label smoothing rate")
@@ -93,7 +100,7 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true", default=None, help="Enable FP16 mixed precision training (recommended for NVIDIA T4/V100 GPUs)")
     parser.add_argument("--bf16", action="store_true", default=None, help="Enable BF16 mixed precision training (for Ampere+ GPUs)")
     parser.add_argument("--no-amp", "--no_amp", action="store_true", default=False, help="Disable Automatic Mixed Precision (run in full FP32)")
-    parser.add_argument("--max-length", "--max_length", "--max-seq-length", type=int, default=None, help="Maximum token sequence length (defaults to 2048)")
+    parser.add_argument("--max-length", "--max_length", "--max-seq-length", type=int, default=None, help="Maximum token sequence length (defaults to model.max_sequence_length, 8192)")
     parser.add_argument("--empty-cache-freq", "--empty_cache_freq", type=int, default=0, help="Periodically empty CUDA cache every N steps (0 to disable)")
 
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -482,6 +489,65 @@ def push_checkpoint_to_hub(
         print(f"Notice: Failed to push checkpoint to Hugging Face Hub: {e}")
 
 
+def evaluate_split(
+    model: nn.Module,
+    loader: Any,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    id_to_tag: Dict[int, str],
+) -> Tuple[float, List[List[str]], List[List[str]]]:
+    """
+    Average loss plus decoded tag sequences for `loader`. Predictions are decoded with the same
+    constrained Viterbi decoder used at inference, so the metrics describe the deployed system.
+    """
+    decoder = ConstrainedViterbiDecoder(id_to_tag=id_to_tag)
+    model.eval()
+    total_loss = 0.0
+    all_preds: List[List[str]] = []
+    all_labels: List[List[str]] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            if use_amp and device.type == "cuda":
+                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+            total_loss += outputs.loss.item()
+
+            logits = outputs.logits.float().cpu().numpy()
+            label_ids = labels.cpu().numpy()
+            for logit_seq, label_seq in zip(logits, label_ids):
+                valid = label_seq != -100
+                if not valid.any():
+                    continue
+                pred_ids = decoder.decode(logit_seq[valid])
+                all_preds.append([id_to_tag.get(int(p), "O") for p in pred_ids])
+                all_labels.append([id_to_tag.get(int(l), "O") for l in label_seq[valid]])
+
+    return total_loss / max(1, len(loader)), all_preds, all_labels
+
+
+def load_checkpoint_weights(model: nn.Module, checkpoint_dir: Path):
+    """Load saved weights (safetensors preferred) from a checkpoint directory into `model`."""
+    raw_model = model.module if hasattr(model, "module") else model
+    safetensors_file = checkpoint_dir / "model.safetensors"
+    if safetensors_file.exists():
+        from safetensors.torch import load_file
+        state_dict = load_file(str(safetensors_file))
+    else:
+        state_dict = torch.load(checkpoint_dir / "pytorch_model.bin", map_location="cpu", weights_only=True)
+    missing, unexpected = raw_model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        print(f"Warning: loading '{checkpoint_dir}' left {len(missing)} missing and {len(unexpected)} unexpected keys.")
+
+
 def run_evaluation(
     model: torch.nn.Module,
     val_loader: Any,
@@ -515,46 +581,15 @@ def run_evaluation(
     Returns:
         (best_macro_f1, patience_counter, stop_training)
     """
-    model.eval()
-    val_loss = 0.0
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for batch in val_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-
-            if use_amp and device.type == "cuda":
-                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            else:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-            val_loss += outputs.loss.item()
-
-            preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
-            lbls = labels.cpu().numpy()
-
-            for p_seq, l_seq in zip(preds, lbls):
-                seq_pred = []
-                seq_lbl = []
-                for p, l in zip(p_seq, l_seq):
-                    if l != -100:
-                        seq_pred.append(id_to_tag.get(p, "O"))
-                        seq_lbl.append(id_to_tag.get(l, "O"))
-                all_preds.append(seq_pred)
-                all_labels.append(seq_lbl)
+    avg_val_loss, all_preds, all_labels = evaluate_split(model, val_loader, device, use_amp, amp_dtype, id_to_tag)
 
     stop_training = False
     if is_main_process:
-        avg_val_loss = val_loss / max(1, len(val_loader))
         metrics = compute_entity_metrics(all_preds, all_labels)
         current_macro_f1 = metrics["macro_f1"]
 
         print(
-            f"\n[{eval_title} (Gold Test Set)] Step {global_step} | Val Loss: {avg_val_loss:.4f} "
+            f"\n[{eval_title} (Dev Set)] Step {global_step} | Val Loss: {avg_val_loss:.4f} "
             f"| Macro F1: {current_macro_f1 * 100:.2f}% | Precision: {metrics['precision'] * 100:.2f}% | Recall: {metrics['recall'] * 100:.2f}%"
         )
         if mlflow_client is not None:
@@ -583,9 +618,9 @@ def run_evaluation(
         if is_best:
             best_macro_f1 = current_macro_f1
             patience_counter = 0
-            print(f"  --> New best model checkpoint! Macro F1: {best_macro_f1 * 100:.2f}%. Saving to '{output_dir}'...")
+            print(f"  --> New best model checkpoint! Macro F1: {best_macro_f1 * 100:.2f}%. Saving to '{output_dir}/best'...")
             save_training_checkpoint(
-                save_dir=output_dir,
+                save_dir=output_dir / "best",
                 model=model,
                 tokenizer=tokenizer,
                 optimizer=optimizer,
@@ -604,7 +639,7 @@ def run_evaluation(
             if args.push_to_hub and args.hub_model_id:
                 push_checkpoint_to_hub(
                     repo_id=args.hub_model_id,
-                    folder_path=output_dir,
+                    folder_path=output_dir / "best",
                     commit_message=f"Step {global_step} (Epoch {epoch}/{epochs}) - Best Macro F1: {best_macro_f1 * 100:.2f}%",
                     metrics=metrics,
                     args=args,
@@ -699,12 +734,12 @@ def main():
     model_name = args.model_name or model_cfg.get("name_or_path", "aisingapore/SEA-LION-ModernBERT-300M")
     output_dir = Path(args.output_dir or train_cfg.get("output_dir", "results/mmbert_seqlabel_v2"))
     epochs = args.epochs or train_cfg.get("num_train_epochs", 4)
-    lr = args.lr or float(train_cfg.get("learning_rate", 2.5e-5))
+    lr = args.lr or float(train_cfg.get("learning_rate", 1.5e-5))
     head_lr = args.head_lr or float(train_cfg.get("head_learning_rate", 5.0e-5))
     batch_size = args.batch_size or int(train_cfg.get("per_device_train_batch_size", 4))
     eval_batch_size = args.eval_batch_size or int(train_cfg.get("per_device_eval_batch_size", 4))
     grad_accum = args.gradient_accumulation_steps or int(train_cfg.get("gradient_accumulation_steps", 4))
-    weight_decay = args.weight_decay or float(train_cfg.get("weight_decay", 0.01))
+    weight_decay = args.weight_decay or float(train_cfg.get("weight_decay", 0.05))
     scheduler_type = args.lr_scheduler_type or train_cfg.get("lr_scheduler_type", "cosine")
     warmup_ratio = args.warmup_ratio or float(train_cfg.get("warmup_ratio", 0.10))
     focal_gamma = args.focal_gamma if args.focal_gamma is not None else float(loss_cfg.get("focal_gamma", head_cfg.get("focal_gamma", 2.0)))
@@ -749,7 +784,8 @@ def main():
             precision_str = "FP32 (config bf16/fp16 both false)"
 
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16 and torch.cuda.is_available()))
-    max_length = args.max_length or 2048
+    max_length = args.max_length or int(model_cfg.get("max_sequence_length", 8192))
+    window_overlap_tokens = int(data_cfg.get("window_overlap_tokens", 1024))
     save_steps = args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 0))
     eval_steps = args.eval_steps if args.eval_steps is not None else int(train_cfg.get("eval_steps", 0))
     save_total_limit = args.save_total_limit if args.save_total_limit is not None else int(train_cfg.get("save_total_limit", 2))
@@ -850,47 +886,48 @@ def main():
         sys.exit(1)
 
     # 4. Load Datasets
+    # The dev set is a document-level split of the training file, used for checkpoint
+    # selection and early stopping. The gold benchmark is evaluated once, after training,
+    # with the selected checkpoint, so it never influences model selection.
+    dev_ratio = float(data_cfg.get("dev_ratio", 0.05))
+
+    def is_dev_doc(doc_id: str) -> bool:
+        digest = hashlib.md5(f"{seed}:{doc_id}".encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) / 0xFFFFFFFF < dev_ratio
+
+    dataset_kwargs = dict(
+        tag_to_id=tag_to_id,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        window_overlap_tokens=window_overlap_tokens,
+        max_samples=20 if args.dry_run else None,
+    )
+    if is_main_process:
+        print(f"Loading training chunks from '{chunks_file.name}' (document-level dev split, dev_ratio={dev_ratio})...")
+    train_dataset = MultiWindowBIODataset(
+        chunks_file_path=chunks_file,
+        doc_filter=lambda doc_id: not is_dev_doc(doc_id),
+        **dataset_kwargs,
+    )
+    val_dataset = MultiWindowBIODataset(
+        chunks_file_path=chunks_file,
+        doc_filter=is_dev_doc,
+        **dataset_kwargs,
+    )
+    if len(val_dataset) == 0:
+        raise ValueError(f"Dev split is empty; increase dataset.dev_ratio (currently {dev_ratio})")
+
+    test_dataset = None
     if val_chunks_file and val_chunks_file.exists():
         if is_main_process:
-            print(f"Loading 100% of training chunks from '{chunks_file.name}' for training...")
-        train_dataset = MultiWindowBIODataset(
-            chunks_file_path=chunks_file,
-            tag_to_id=tag_to_id,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            max_samples=20 if args.dry_run else None
+            print(f"Loading gold benchmark chunks from '{val_chunks_file.name}' (final report only)...")
+        test_dataset = MultiWindowBIODataset(chunks_file_path=val_chunks_file, **dataset_kwargs)
+
+    if is_main_process:
+        print(
+            f"Dataset split: {len(train_dataset)} training windows, {len(val_dataset)} dev windows, "
+            f"{len(test_dataset) if test_dataset is not None else 0} gold test windows."
         )
-        if is_main_process:
-            print(f"Loading evaluation chunks from Gold Benchmark test set '{val_chunks_file.name}'...")
-        val_dataset = MultiWindowBIODataset(
-            chunks_file_path=val_chunks_file,
-            tag_to_id=tag_to_id,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            max_samples=20 if args.dry_run else None
-        )
-        if is_main_process:
-            print(f"Dataset split: {len(train_dataset)} training chunks (100%), {len(val_dataset)} validation chunks (Gold Benchmark).")
-    else:
-        full_dataset = MultiWindowBIODataset(
-            chunks_file_path=chunks_file,
-            tag_to_id=tag_to_id,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            max_samples=20 if args.dry_run else None
-        )
-        val_ratio = float(data_cfg.get("val_ratio", 0.0))
-        if val_ratio > 0.0:
-            n_val = max(1, int(len(full_dataset) * val_ratio))
-            n_train = len(full_dataset) - n_val
-            train_dataset, val_dataset = random_split(full_dataset, [n_train, n_val])
-            if is_main_process:
-                print(f"Dataset split: {n_train} training chunks, {n_val} validation chunks.")
-        else:
-            train_dataset = full_dataset
-            val_dataset = full_dataset
-            if is_main_process:
-                print(f"Notice: Validating on training set ({len(train_dataset)} chunks).")
 
     def collate_fn(batch):
         input_ids = [b["input_ids"] for b in batch]
@@ -907,6 +944,16 @@ def main():
             "attention_mask": padded_mask,
             "labels": padded_labels
         }
+
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=eval_batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=0,
+        )
 
     # Distributed or standard samplers
     if is_distributed:
@@ -940,16 +987,32 @@ def main():
     )
 
     # 5. Initialize Model
+    attn_impl = args.attn_implementation or model_cfg.get("attn_implementation", "sdpa")
     config = AutoConfig.from_pretrained(
         model_name,
         num_labels=num_labels,
         id2label=id_to_tag,
-        label2id=tag_to_id
+        label2id=tag_to_id,
+        _attn_implementation=attn_impl,
     )
+    max_positions = getattr(config, "max_position_embeddings", None)
+    if max_positions and max_length > max_positions:
+        raise ValueError(f"max_length={max_length} exceeds the backbone's max_position_embeddings={max_positions}")
     config.output_hidden_states = True
+    config._attn_implementation = attn_impl
 
-    base_model = AutoModel.from_pretrained(model_name, config=config)
+    try:
+        base_model = AutoModel.from_pretrained(
+            model_name,
+            config=config,
+            attn_implementation=attn_impl,
+        )
+    except TypeError:
+        base_model = AutoModel.from_pretrained(model_name, config=config)
+
     base_model.resize_token_embeddings(len(tokenizer))
+    if is_main_process:
+        print(f"Base model attention implementation configured: '{getattr(config, '_attn_implementation', attn_impl)}'")
 
     if args.gradient_checkpointing and hasattr(base_model, "gradient_checkpointing_enable"):
         base_model.gradient_checkpointing_enable()
@@ -1105,24 +1168,23 @@ def main():
 
     # 6. Optimizer & Scheduler
     raw_model = model.module if hasattr(model, "module") else model
-    no_decay = ["bias", "LayerNorm.weight", "layer_weights"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in raw_model.base_model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": weight_decay,
-            "lr": lr
-        },
-        {
-            "params": [p for n, p in raw_model.base_model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-            "lr": lr
-        },
-        {
-            "params": [p for n, p in raw_model.head.named_parameters()],
-            "weight_decay": weight_decay,
-            "lr": head_lr
-        }
-    ]
+    def build_param_groups(module: nn.Module, group_lr: float) -> List[Dict[str, Any]]:
+        decay, no_decay_params = [], []
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(key in name for key in NO_DECAY_KEYWORDS):
+                no_decay_params.append(param)
+            else:
+                decay.append(param)
+        return [
+            {"params": decay, "weight_decay": weight_decay, "lr": group_lr},
+            {"params": no_decay_params, "weight_decay": 0.0, "lr": group_lr},
+        ]
+
+    optimizer_grouped_parameters = (
+        build_param_groups(raw_model.base_model, lr) + build_param_groups(raw_model.head, head_lr)
+    )
 
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, eps=1e-6)
 
@@ -1483,8 +1545,22 @@ def main():
         if args.dry_run:
             break
 
+    if test_loader is not None:
+        best_dir = output_dir / "best"
+        if best_dir.exists():
+            load_checkpoint_weights(model, best_dir)
+        _, test_preds, test_labels = evaluate_split(model, test_loader, device, use_amp, amp_dtype, id_to_tag)
+        if is_main_process:
+            test_metrics = compute_entity_metrics(test_preds, test_labels)
+            print(
+                f"\n[Final Gold Benchmark] Macro F1: {test_metrics['macro_f1'] * 100:.2f}% | "
+                f"Precision: {test_metrics['precision'] * 100:.2f}% | Recall: {test_metrics['recall'] * 100:.2f}%"
+            )
+            with open(output_dir / "gold_test_metrics.json", "w", encoding="utf-8") as f:
+                json.dump(test_metrics, f, indent=2)
+
     if is_main_process:
-        print(f"\nTraining completed! Best Validation Macro F1: {best_macro_f1 * 100:.2f}%")
+        print(f"\nTraining completed! Best Dev Macro F1: {best_macro_f1 * 100:.2f}%")
         if mlflow_client is not None and mlflow_client.active_run() is not None:
             try:
                 mlflow_client.end_run()

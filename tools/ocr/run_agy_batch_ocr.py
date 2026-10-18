@@ -2,7 +2,7 @@
 run_agy_batch_ocr.py — Autonomous Multi-Worker Batch OCR Orchestrator.
 
 Features:
-- Processes PDFs using AgyPDFOCRConverter (Direct Figure Detection + Digital Chunk Injection).
+- Processes PDFs using AgyPDFOCRConverter (Direct Figure Detection & Dynamic Style Diversity).
 - Enforces weekly budget ceiling (--stop-on-weekly-budget USD) calculated via TokenTracker rates ($0.75 in / $3.75 out).
 - Auto-handles 5-hour rolling cap limits (--sleep-on-cap):
   Catches Agy5HourCapError, saves atomic checkpoint, enters countdown sleep, verifies health via probe, and auto-resumes.
@@ -29,6 +29,7 @@ from sequence_labelling.llm.agy_rate_limiter import (
     AGY_OUTPUT_RATE_PER_M,
     Agy5HourCapError,
     AgyQuotaProbe,
+    AgyQuotaService,
     RollingUsageMonitor,
 )
 
@@ -143,20 +144,26 @@ class BatchOCRRunner:
         output_dir: Path,
         concurrency: int = 2,
         stop_on_weekly_budget: float = 195.0,
+        stop_on_weekly_quota_pct: float = 2.0,
         sleep_on_cap: bool = True,
         max_docs: Optional[int] = None,
         model: str = "gemini-3.8-flash-low",
         state_file: Path = DEFAULT_STATE_FILE,
+        pattern: str = "*.pdf",
+        account: Optional[str] = None,
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.concurrency = max(1, concurrency)
         self.stop_on_weekly_budget = stop_on_weekly_budget
+        self.stop_on_weekly_quota_pct = stop_on_weekly_quota_pct
         self.sleep_on_cap = sleep_on_cap
         self.max_docs = max_docs
         self.model = model
+        self.pattern = pattern
+        self.account = account
         self.ledger = BatchStateLedger(state_file=state_file)
-        self.converter = AgyPDFOCRConverter(model=model, batch_size=2)
+        self.converter = AgyPDFOCRConverter(model=model, batch_size=2, account=account)
         self._shutdown_requested = False
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -198,7 +205,7 @@ class BatchOCRRunner:
         # Probe health before resuming
         logger.info("Verifying active quota with AgyQuotaProbe...")
         for attempt in range(5):
-            healthy, cooldown, msg = AgyQuotaProbe.probe_health(model=self.model)
+            healthy, cooldown, msg = AgyQuotaProbe.probe_health(model=self.model, account=self.account)
             if healthy:
                 logger.info("✅ Quota probe verified! Auto-resuming batch OCR execution.")
                 return True
@@ -223,20 +230,44 @@ class BatchOCRRunner:
             logger.error(f"Error processing {pdf_file.name}: {e}")
             return False, "", {"error": str(e)}
 
+    def _ensure_active_account(self, target_account: Optional[str] = None) -> None:
+        """Configures isolated profile environment for the target account."""
+        account = target_account or os.environ.get("AGY_ACCOUNT")
+        if not account:
+            return
+        prof_home = Path.home() / ".gemini" / "profiles" / account
+        if not prof_home.exists():
+            import subprocess
+            subprocess.run(["agy-account", "setup", account], check=False)
+        os.environ["HOME"] = str(prof_home)
+        os.environ["AGY_ACCOUNT"] = account
+        logger.info(f"Isolated runtime profile activated for account '{account}' (HOME={prof_home})")
+
     def run(self) -> None:
         """Main execution loop."""
-        logger.info(f"Initializing Batch OCR Runner across {self.input_dir}...")
-        all_pdfs = sorted(list(self.input_dir.glob("*.pdf")))
+        self._ensure_active_account(self.account)
+        logger.info(f"Initializing Batch OCR Runner across {self.input_dir} (pattern: {self.pattern})...")
+        all_pdfs = sorted(list(self.input_dir.glob(self.pattern)))
         self.ledger.data["total_target_pdfs"] = len(all_pdfs)
         self.ledger.save()
 
-        # Filter pending PDFs
-        pending_pdfs = [p for p in all_pdfs if not self.ledger.is_completed(p.name)]
+        # Filter pending PDFs: skip if in ledger OR if output .md already exists
+        pending_pdfs = []
+        already_on_disk = 0
+        for p in all_pdfs:
+            out_file = self.output_dir / f"{p.stem}.md"
+            if self.ledger.is_completed(p.name):
+                continue
+            if out_file.exists() and out_file.stat().st_size > 100:
+                already_on_disk += 1
+                continue
+            pending_pdfs.append(p)
+
         if self.max_docs and self.max_docs > 0:
             pending_pdfs = pending_pdfs[: self.max_docs]
 
         logger.info(
-            f"Total target PDFs: {len(all_pdfs)} | Already completed: {self.ledger.data['completed_count']} | Pending: {len(pending_pdfs)}"
+            f"Total target PDFs: {len(all_pdfs)} | Ledger completed: {self.ledger.data['completed_count']} | Disk exists (skipped): {already_on_disk} | Pending: {len(pending_pdfs)}"
         )
 
         if not pending_pdfs:
@@ -244,8 +275,8 @@ class BatchOCRRunner:
             return
 
         # Pre-flight health check
-        logger.info("Running pre-flight agy quota health check...")
-        healthy, cooldown, msg = AgyQuotaProbe.probe_health(model=self.model)
+        logger.info(f"Running pre-flight agy quota health check for account '{self.account or 'default'}'...")
+        healthy, cooldown, msg = AgyQuotaProbe.probe_health(model=self.model, account=self.account)
         if not healthy:
             if cooldown and self.sleep_on_cap:
                 cap_err = Agy5HourCapError(f"Pre-flight cap active: {msg}", reset_after_sec=cooldown)
@@ -263,21 +294,50 @@ class BatchOCRRunner:
                 logger.info("Shutdown requested. Gracefully exiting batch runner.")
                 break
 
-            # Check weekly budget ceiling
-            cur_spend = self.ledger.data["cumulative_cost_usd"]
-            if cur_spend >= self.stop_on_weekly_budget:
+            # 1. Real Antigravity Quota Check via /quota (ground-truth)
+            quota = AgyQuotaService.fetch_quota(account=self.account)
+            if quota and quota.gemini_weekly:
+                if quota.gemini_weekly_pct <= self.stop_on_weekly_quota_pct:
+                    logger.warning(
+                        f"🛑 [WEEKLY QUOTA LIMIT REACHED] Real Gemini Weekly Quota is at {quota.gemini_weekly_pct:.1f}% "
+                        f"<= Minimum threshold ({self.stop_on_weekly_quota_pct:.1f}%). Exiting cleanly."
+                    )
+                    logger.warning(f"State saved cleanly to {self.ledger.state_file}. Exiting.")
+                    break
+
+            if quota and quota.is_gemini_5h_exhausted(threshold_pct=1.0):
+                cooldown = quota.gemini_5h_cooldown_sec()
                 logger.warning(
-                    f"🛑 [WEEKLY BUDGET LIMIT REACHED] Current spend (${cur_spend:.2f}) >= Ceiling (${self.stop_on_weekly_budget:.2f})."
+                    f"⚠️ [5-HOUR QUOTA EXHAUSTED] Real Gemini 5h Quota is at {quota.gemini_5h_pct:.1f}%. "
+                    f"Cooldown required: {quota.gemini_5h.formatted_cooldown() if quota.gemini_5h else f'{cooldown}s'}"
+                )
+                if self.sleep_on_cap:
+                    cap_err = Agy5HourCapError("5-hour rolling quota exhausted", reset_after_sec=cooldown)
+                    resumed = self._wait_for_cap_reset(cap_err)
+                    if not resumed:
+                        break
+                else:
+                    break
+
+            # 2. Check nominal weekly budget ceiling (secondary safeguard)
+            cur_spend = self.ledger.data["cumulative_cost_usd"]
+            if self.stop_on_weekly_budget and cur_spend >= self.stop_on_weekly_budget:
+                logger.warning(
+                    f"🛑 [NOMINAL BUDGET CEILING REACHED] Current spend (${cur_spend:.2f}) >= Ceiling (${self.stop_on_weekly_budget:.2f})."
                 )
                 logger.warning(f"State saved cleanly to {self.ledger.state_file}. Exiting.")
                 break
 
+            quota_tag = quota.summary_line() if quota else f"Nominal: ${cur_spend:.2f}"
             logger.info(
-                f"[{idx}/{len(pending_pdfs)}] Processing '{pdf_path.name}' (Spent: ${cur_spend:.2f} / ${self.stop_on_weekly_budget:.2f})..."
+                f"[{idx}/{len(pending_pdfs)}] Processing '{pdf_path.name}' ({quota_tag})..."
             )
 
-            # Attempt processing with retry and cap-sleep handling
-            while not self._shutdown_requested:
+            # Attempt processing with transient retry and cap-sleep handling
+            doc_retries = 2
+            for doc_attempt in range(doc_retries):
+                if self._shutdown_requested:
+                    break
                 try:
                     success, out_path, summary = self.process_single_pdf(pdf_path)
                     if success:
@@ -296,9 +356,16 @@ class BatchOCRRunner:
                         logger.info(
                             f"✅ Done '{pdf_path.name}': {pages} pages in {dur}s | In: {in_tok:,}, Out: {out_tok:,} | Total Cost: ${self.ledger.data['cumulative_cost_usd']:.2f}"
                         )
+                        break
                     else:
-                        self.ledger.record_failure(pdf_path.name, summary.get("error", "Unknown error"))
-                    break
+                        err_str = summary.get("error", "Unknown error")
+                        is_transient_err = any(k in err_str.lower() for k in ["503", "unavailable", "timed out", "eligibility check failed"])
+                        if is_transient_err and doc_attempt < doc_retries - 1:
+                            logger.warning(f"Transient error on '{pdf_path.name}' ({err_str[:80]}). Retrying document in 15s...")
+                            time.sleep(15)
+                            continue
+                        self.ledger.record_failure(pdf_path.name, err_str)
+                        break
 
                 except Agy5HourCapError as cap_err:
                     if self.sleep_on_cap:
@@ -325,13 +392,16 @@ class BatchOCRRunner:
 
 def main():
     parser = argparse.ArgumentParser(description="Autonomous agy Batch OCR Orchestrator")
-    parser.add_argument("--input-dir", type=str, default="data/batch_500_diverse_input", help="Directory of input PDFs")
-    parser.add_argument("--output-dir", type=str, default="data/batch_500_diverse_output", help="Directory for output markdown")
+    parser.add_argument("--input-dir", type=str, default="data/sequence_labelling_input_data_raw", help="Directory of input PDFs")
+    parser.add_argument("--output-dir", type=str, default="data/sequence_labelling_input_data", help="Directory for output markdown")
     parser.add_argument("--concurrency", type=int, default=2, help="Worker concurrency")
     parser.add_argument("--stop-on-weekly-budget", type=float, default=195.0, help="Max USD budget ceiling before pausing")
+    parser.add_argument("--stop-on-weekly-quota-pct", type=float, default=2.0, help="Min Gemini Weekly Quota %% before pausing (default: 2.0)")
     parser.add_argument("--no-sleep-on-cap", action="store_true", help="Stop instead of sleeping when 5h cap is hit")
     parser.add_argument("--max-docs", type=int, default=None, help="Optional max documents to process")
     parser.add_argument("--model", type=str, default="gemini-3.8-flash-low", help="agy model name")
+    parser.add_argument("--pattern", type=str, default="*.pdf", help="File pattern matching PDFs in input-dir (e.g. 'doc_*.pdf' or '*.pdf')")
+    parser.add_argument("--account", type=str, default=None, help="Optional agy account to switch to (e.g. daominhwysi, kien.duet)")
     parser.add_argument("--state-file", type=str, default="data/ocr_batch_500_state.json", help="Path to state ledger")
     parser.add_argument("--reset-failed", action="store_true", help="Clear failed_docs ledger so all failed documents are retried")
 
@@ -342,10 +412,13 @@ def main():
         output_dir=Path(args.output_dir),
         concurrency=args.concurrency,
         stop_on_weekly_budget=args.stop_on_weekly_budget,
+        stop_on_weekly_quota_pct=args.stop_on_weekly_quota_pct,
         sleep_on_cap=not args.no_sleep_on_cap,
         max_docs=args.max_docs,
         model=args.model,
         state_file=Path(args.state_file),
+        pattern=args.pattern,
+        account=args.account,
     )
     if args.reset_failed:
         cleared = runner.ledger.reset_failed()

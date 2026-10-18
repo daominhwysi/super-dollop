@@ -42,6 +42,7 @@ from sequence_labelling.llm.agy_rate_limiter import (
     AGY_OUTPUT_RATE_PER_M,
     Agy5HourCapError,
     AgyQuotaProbe,
+    AgyQuotaService,
     RollingUsageMonitor,
 )
 from tools.annotation.annotate_sequence_labelling_dataset import process_single_document
@@ -158,6 +159,7 @@ class AgyBatchAnnotationRunner:
         state_file: Path = DEFAULT_STATE_FILE,
         target_tokens: int = CHUNKER_TARGET_TOKENS,
         max_tokens: int = CHUNKER_MAX_TOKENS,
+        stop_on_weekly_quota_pct: float = 2.0,
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -165,6 +167,7 @@ class AgyBatchAnnotationRunner:
         self.provider = provider
         self.concurrency = max(1, concurrency)
         self.sleep_on_cap = sleep_on_cap
+        self.stop_on_weekly_quota_pct = stop_on_weekly_quota_pct
         self.max_docs = max_docs
         self.pattern = pattern
         self.overwrite = overwrite
@@ -275,9 +278,35 @@ class AgyBatchAnnotationRunner:
                 logger.info("Shutdown requested. Breaking loop safely...")
                 break
 
+            # 1. Real Antigravity Quota Check via /quota
+            quota = AgyQuotaService.fetch_quota()
+            if quota and quota.gemini_weekly:
+                if quota.gemini_weekly_pct <= self.stop_on_weekly_quota_pct:
+                    logger.warning(
+                        f"🛑 [WEEKLY QUOTA LIMIT REACHED] Real Gemini Weekly Quota is at {quota.gemini_weekly_pct:.1f}% "
+                        f"<= Minimum threshold ({self.stop_on_weekly_quota_pct:.1f}%). Exiting cleanly."
+                    )
+                    logger.warning(f"State saved cleanly to {self.ledger.state_file}. Exiting.")
+                    break
+
+            if quota and quota.is_gemini_5h_exhausted(threshold_pct=1.0):
+                cooldown = quota.gemini_5h_cooldown_sec()
+                logger.warning(
+                    f"⚠️ [5-HOUR QUOTA EXHAUSTED] Real Gemini 5h Quota is at {quota.gemini_5h_pct:.1f}%. "
+                    f"Cooldown required: {quota.gemini_5h.formatted_cooldown() if quota.gemini_5h else f'{cooldown}s'}"
+                )
+                if self.sleep_on_cap:
+                    cap_err = Agy5HourCapError("5-hour rolling quota exhausted", reset_after_sec=cooldown)
+                    resumed = self._wait_for_cap_reset(cap_err)
+                    if not resumed:
+                        break
+                else:
+                    break
+
             doc_name = doc_path.name
             rel_path = doc_path.relative_to(self.input_dir)
-            logger.info(f"[{idx}/{total_pending}] Processing '{doc_name}'...")
+            quota_tag = f" ({quota.summary_line()})" if quota else ""
+            logger.info(f"[{idx}/{total_pending}] Processing '{doc_name}'{quota_tag}...")
 
             doc_processed = False
             while not doc_processed and not self._shutdown_requested:
@@ -388,6 +417,12 @@ def main():
         help="Maximum chunk size in tokens (default: 4000)",
     )
     parser.add_argument(
+        "--stop-on-weekly-quota-pct",
+        type=float,
+        default=2.0,
+        help="Min Gemini Weekly Quota %% before pausing (default: 2.0)",
+    )
+    parser.add_argument(
         "--no-sleep-on-cap",
         action="store_true",
         help="Disable auto-sleep on 5-hour rolling cap limit",
@@ -403,6 +438,7 @@ def main():
         provider=args.provider,
         concurrency=args.concurrency,
         sleep_on_cap=not args.no_sleep_on_cap,
+        stop_on_weekly_quota_pct=args.stop_on_weekly_quota_pct,
         max_docs=args.max_docs,
         pattern=args.pattern,
         overwrite=args.overwrite,

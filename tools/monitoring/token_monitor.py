@@ -63,6 +63,27 @@ def render_project_dashboard(date: Optional[str] = None) -> None:
     )
     console.print(Panel(title, border_style="cyan", padding=(0, 1)))
 
+    # Real-time Antigravity Quota (/quota)
+    try:
+        from sequence_labelling.llm.agy_rate_limiter import AgyQuotaService
+        quota = AgyQuotaService.fetch_quota(timeout=10.0)
+        if quota and (quota.gemini_5h or quota.gemini_weekly):
+            q_table = Table(box=box.SIMPLE, show_header=True, expand=True)
+            q_table.add_column("Gemini 5-Hour Limit", justify="center", style="bold green")
+            q_table.add_column("Gemini Weekly Limit", justify="center", style="bold cyan")
+            q_table.add_column("Claude/GPT 5-Hour", justify="center", style="bold yellow")
+            q_table.add_column("Claude/GPT Weekly", justify="center", style="bold magenta")
+
+            q_table.add_row(
+                f"{quota.gemini_5h_pct:.1f}% left ({quota.gemini_5h.formatted_cooldown()})" if quota.gemini_5h else "N/A",
+                f"{quota.gemini_weekly_pct:.1f}% left ({quota.gemini_weekly.formatted_reset()})" if quota.gemini_weekly else "N/A",
+                f"{quota.claude_5h_pct:.1f}% left" if quota.claude_5h else "N/A",
+                f"{quota.claude_weekly_pct:.1f}% left" if quota.claude_weekly else "N/A",
+            )
+            console.print(Panel(q_table, title="[bold]⚡ Official Antigravity Subscription Quotas (/quota)[/bold]", border_style="green", padding=(0, 1)))
+    except Exception:
+        pass
+
     if total_calls == 0:
         console.print("[dim italic]No pipeline token records recorded for this date.[/dim italic]\n")
         return

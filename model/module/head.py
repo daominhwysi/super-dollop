@@ -580,6 +580,7 @@ class EnhancedBertForTokenClassification(nn.Module):
         label2id: Optional[Dict[str, int]] = None,
         token: Optional[str] = None,
         torch_dtype: Optional[torch.dtype] = None,
+        attn_implementation: Optional[str] = None,
         **kwargs
     ) -> "EnhancedBertForTokenClassification":
         revision = kwargs.get("revision", None)
@@ -592,9 +593,13 @@ class EnhancedBertForTokenClassification(nn.Module):
             config_kwargs["id2label"] = id2label
         if label2id is not None:
             config_kwargs["label2id"] = label2id
+        if attn_implementation is not None:
+            config_kwargs["_attn_implementation"] = attn_implementation
             
         config = AutoConfig.from_pretrained(model_name_or_path, token=token, **config_kwargs)
         config.output_hidden_states = True
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         
         meta_file = None
         safetensors_file = None
@@ -660,13 +665,25 @@ class EnhancedBertForTokenClassification(nn.Module):
         if has_full_weights:
             base_model = AutoModel.from_config(config)
         else:
-            base_model = AutoModel.from_pretrained(
-                model_name_or_path,
-                config=config,
-                token=token,
-                torch_dtype=torch_dtype,
-                **kwargs
-            )
+            load_kwargs = dict(kwargs)
+            if attn_implementation is not None:
+                load_kwargs["attn_implementation"] = attn_implementation
+            try:
+                base_model = AutoModel.from_pretrained(
+                    model_name_or_path,
+                    config=config,
+                    token=token,
+                    torch_dtype=torch_dtype,
+                    **load_kwargs
+                )
+            except TypeError:
+                base_model = AutoModel.from_pretrained(
+                    model_name_or_path,
+                    config=config,
+                    token=token,
+                    torch_dtype=torch_dtype,
+                    **kwargs
+                )
 
         # Check and align vocabulary size if token embeddings were expanded during training
         if loaded_state_dict is not None:

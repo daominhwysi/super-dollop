@@ -63,6 +63,7 @@ class RevisionLoopResult(BaseModel):
     diff_summary: str = ""
     duration_seconds: float = 0.0
     rounds: List[RevisionRound] = Field(default_factory=list)
+    final_report: Optional[ReviewReport] = None
 
 
 class EditorReviewerLoop:
@@ -231,6 +232,7 @@ class EditorReviewerLoop:
                 confirmed_issues_count=len(initial_report.confirmed_issues),
                 repaired_xml=annotated_xml,
                 duration_seconds=time.time() - started_at,
+                final_report=initial_report,
             )
 
         # Never pass the review's complete issue list to the editor.  It may
@@ -253,6 +255,7 @@ class EditorReviewerLoop:
                 confirmed_issues_count=0,
                 repaired_xml=annotated_xml,
                 duration_seconds=time.time() - started_at,
+                final_report=initial_report,
             )
 
         best_xml = annotated_xml
@@ -391,4 +394,5 @@ class EditorReviewerLoop:
             diff_summary=self._diff_summary(annotated_xml, best_xml),
             duration_seconds=time.time() - started_at,
             rounds=rounds,
+            final_report=best_report,
         )

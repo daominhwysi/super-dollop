@@ -568,7 +568,7 @@ def test_figures_out_of_scope_no_penalties():
 
 
 def test_discover_review_targets_merged_vs_chunk_rule(tmp_path):
-    # Setup standard exam folder with merged.xml and chunks
+    # Setup exam folder with merged.xml and chunks
     exam1 = tmp_path / "exam_1"
     exam1.mkdir()
     (exam1 / "merged.xml").write_text("<stem>Standard exam</stem>", encoding="utf-8")
@@ -577,32 +577,27 @@ def test_discover_review_targets_merged_vs_chunk_rule(tmp_path):
     (chunks1 / "chunk_0.xml").write_text("<stem>Standard exam chunk 0</stem>", encoding="utf-8")
     (chunks1 / "chunk_1.xml").write_text("<stem>Standard exam chunk 1</stem>", encoding="utf-8")
 
-    # Setup giant exam folder exceeding 500k tokens
+    # Setup monolithic exam folder with only merged.xml (no chunks folder)
     exam2 = tmp_path / "exam_2"
     exam2.mkdir()
-    # Write ~2MB content to exceed 500k tokens
-    giant_content = "<stem>" + ("giant text word " * 120_000) + "</stem>"
-    (exam2 / "merged.xml").write_text(giant_content, encoding="utf-8")
-    chunks2 = exam2 / "chunks"
-    chunks2.mkdir()
-    (chunks2 / "chunk_0.xml").write_text("<stem>Giant chunk 0</stem>", encoding="utf-8")
-    (chunks2 / "chunk_1.xml").write_text("<stem>Giant chunk 1</stem>", encoding="utf-8")
+    (exam2 / "merged.xml").write_text("<stem>Single merged exam</stem>", encoding="utf-8")
 
-    targets = AnnotationReviewerAgent.discover_review_targets(tmp_path, max_merged_tokens=500_000)
-    target_names = [t.name for t in targets]
+    # Default granularity is chunk level
+    default_targets = AnnotationReviewerAgent.discover_review_targets(tmp_path)
+    # exam_1 has chunks -> chunk files selected, merged.xml excluded
+    assert exam1 / "chunks" / "chunk_0.xml" in default_targets
+    assert exam1 / "chunks" / "chunk_1.xml" in default_targets
+    assert exam1 / "merged.xml" not in default_targets
+    # exam_2 has no chunks -> merged.xml selected
+    assert exam2 / "merged.xml" in default_targets
+    assert len(default_targets) == 3
 
-    # exam_1 is under 500k -> merged.xml selected, chunks ignored
-    assert exam1 / "merged.xml" in targets
-    assert exam1 / "chunks" / "chunk_0.xml" not in targets
-    assert exam1 / "chunks" / "chunk_1.xml" not in targets
-
-    # exam_2 is over 500k -> fallback to chunks, merged.xml ignored
-    assert exam2 / "merged.xml" not in targets
-    assert exam2 / "chunks" / "chunk_0.xml" in targets
-    assert exam2 / "chunks" / "chunk_1.xml" in targets
-
-    # Total targets = 1 (from exam1) + 2 (from exam2) = 3
-    assert len(targets) == 3
+    # Document granularity -> always selects merged.xml
+    doc_targets = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="document")
+    assert exam1 / "merged.xml" in doc_targets
+    assert exam2 / "merged.xml" in doc_targets
+    assert exam1 / "chunks" / "chunk_0.xml" not in doc_targets
+    assert len(doc_targets) == 2
 
 
 def test_batch_review_scan_processed_and_resume(tmp_path):
@@ -1267,7 +1262,7 @@ def test_cloze_question_labels_without_stems_valid():
 
 
 def test_discover_review_targets_dual_granularity(tmp_path):
-    """Verifies discover_review_targets under chunk, document, and auto modes."""
+    """Verifies discover_review_targets under chunk and document modes, and rejection of auto mode."""
     exam_dir = tmp_path / "exam_test"
     exam_dir.mkdir()
     (exam_dir / "merged.xml").write_text("<stem>Merged doc</stem>", encoding="utf-8")
@@ -1278,21 +1273,21 @@ def test_discover_review_targets_dual_granularity(tmp_path):
     c0.write_text("<stem>Chunk 0</stem>", encoding="utf-8")
     c1.write_text("<stem>Chunk 1</stem>", encoding="utf-8")
 
-    # Mode 1: chunk granularity -> always selects chunks
+    # Mode 1: default is chunk granularity -> selects chunks
+    default_targets = AnnotationReviewerAgent.discover_review_targets(tmp_path)
+    assert default_targets == [c0, c1]
+
+    # Explicit chunk granularity
     chunk_targets = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="chunk")
     assert chunk_targets == [c0, c1]
 
-    # Mode 2: document granularity -> always selects merged.xml
+    # Mode 2: document granularity -> selects merged.xml
     doc_targets = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="document")
     assert doc_targets == [exam_dir / "merged.xml"]
 
-    # Mode 3: auto granularity with low threshold -> switches to chunks
-    auto_targets_low = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="auto", max_merged_tokens=2)
-    assert auto_targets_low == [c0, c1]
-
-    # Mode 4: auto granularity with high threshold -> keeps merged.xml
-    auto_targets_high = AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="auto", max_merged_tokens=1000)
-    assert auto_targets_high == [exam_dir / "merged.xml"]
+    # Mode 3: auto mode is removed -> raises ValueError
+    with pytest.raises(ValueError, match="Invalid granularity"):
+        AnnotationReviewerAgent.discover_review_targets(tmp_path, granularity="auto")
 
 
 def test_review_file_chunk_raw_json_resolution(tmp_path):

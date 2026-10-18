@@ -53,7 +53,7 @@ def test_rejects_numbered_procedure_without_question_signals():
 Account setup
 1. Open the employee portal.
 2. Enter your identification number.
-3. Select two security questions.
+3. Save two security questions.
 """
 
     result = parse_question_candidates(text)

@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 SCRAPE_DIR = Path("/home/daominhwysi/project/scrape-toanmath/downloads")
 PROJECT_DATA_DIR = Path("data")
-OUTPUT_DIR = Path("data/batch_500_diverse_input")
-TARGET_COUNT = 500
+DEFAULT_OUTPUT_DIR = Path("data/sequence_labelling_input_data_raw")
+DEFAULT_TARGET_COUNT = 500
 
 PROVINCES = [
     ('Hà Nội', 'Miền Bắc'), ('TP HCM', 'Miền Nam'), ('Đà Nẵng', 'Miền Trung'), 
@@ -59,13 +59,13 @@ def compute_sha256(filepath: Path) -> str:
     return h.hexdigest()
 
 
-def get_existing_project_hashes() -> Set[str]:
-    """Collects SHA-256 hashes of all existing PDFs in this project."""
+def get_existing_project_hashes(output_dir: Optional[Path] = None) -> Set[str]:
+    """Collects SHA-256 hashes of all existing PDFs in this project (excluding destination doc_*)."""
     hashes = set()
     logger.info("Scanning existing project PDFs for deduplication...")
     for p in PROJECT_DATA_DIR.rglob("*.pdf"):
-        # Exclude our target output dir if re-running
-        if OUTPUT_DIR.name in str(p):
+        # If output_dir is specified and this file is a doc_* in output_dir, ignore so we can re-curate
+        if output_dir and output_dir.resolve() in p.resolve().parents and p.name.startswith("doc_"):
             continue
         try:
             hashes.add(compute_sha256(p))
@@ -166,23 +166,28 @@ def analyze_pdf_metadata(filepath: Path) -> Dict[str, Any]:
     }
 
 
-def curate_500_diverse_pdfs() -> List[Dict[str, Any]]:
-    """Gathers and filters the candidate pool, then selects 500 diverse digital PDFs."""
-    known_hashes = get_existing_project_hashes()
+def curate_500_diverse_pdfs(
+    source_dir: Path = SCRAPE_DIR,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    target_count: int = DEFAULT_TARGET_COUNT,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """Gathers and filters the candidate pool, then selects diverse digital PDFs."""
+    known_hashes = get_existing_project_hashes(output_dir=output_dir)
 
-    logger.info(f"Scanning {SCRAPE_DIR} for candidate PDF documents...")
-    all_scrape_files = list(SCRAPE_DIR.glob("*.pdf"))
+    logger.info(f"Scanning {source_dir} for candidate PDF documents...")
+    all_scrape_files = list(source_dir.glob("*.pdf"))
     logger.info(f"Found {len(all_scrape_files)} total files in scrape repository.")
 
     # Shuffle to ensure random fair sampling before filtering
-    random.seed(42)
+    random.seed(seed)
     random.shuffle(all_scrape_files)
 
     valid_candidates: List[Dict[str, Any]] = []
     scanned_hashes: Set[str] = set()
 
     for idx, p in enumerate(all_scrape_files, start=1):
-        if len(valid_candidates) >= 1500:
+        if len(valid_candidates) >= target_count * 3:
             # We have more than enough candidates for stratified sampling
             break
 
@@ -229,20 +234,15 @@ def curate_500_diverse_pdfs() -> List[Dict[str, Any]]:
     logger.info(f"Candidate collection complete: {len(valid_candidates)} verified candidates.")
 
     # Multi-dimensional Stratified Diversity Selection
-    # Target counts per Grade:
-    # Toán 10: 90
-    # Toán 11: 100
-    # Toán 12: 120
-    # Thi thử THPTQG: 120
-    # HSG / Olympic: 40
-    # Chuyên đề: 30
+    # Scale targets proportionally to target_count
+    ratio = target_count / 500.0
     grade_targets = {
-        'Toán 10': 90,
-        'Toán 11': 100,
-        'Toán 12': 120,
-        'Thi thử THPTQG': 120,
-        'HSG / Olympic': 40,
-        'Chuyên đề / Lý thuyết': 30,
+        'Toán 10': int(round(90 * ratio)),
+        'Toán 11': int(round(100 * ratio)),
+        'Toán 12': int(round(120 * ratio)),
+        'Thi thử THPTQG': int(round(120 * ratio)),
+        'HSG / Olympic': int(round(40 * ratio)),
+        'Chuyên đề / Lý thuyết': int(round(30 * ratio)),
     }
 
     by_grade = defaultdict(list)
@@ -282,24 +282,24 @@ def curate_500_diverse_pdfs() -> List[Dict[str, Any]]:
         selected.extend(picked_for_grade)
         logger.info(f"Grade '{grade}': selected {len(picked_for_grade)} / {target_k} requested.")
 
-    # If any remaining slots to reach 500, top up from unused candidates
-    if len(selected) < TARGET_COUNT:
+    # If any remaining slots to reach target_count, top up from unused candidates
+    if len(selected) < target_count:
         remaining = [c for c in valid_candidates if c['sha256'] not in used_hashes]
         random.shuffle(remaining)
-        needed = TARGET_COUNT - len(selected)
+        needed = target_count - len(selected)
         selected.extend(remaining[:needed])
 
-    selected = selected[:TARGET_COUNT]
+    selected = selected[:target_count]
     logger.info(f"Successfully selected exactly {len(selected)} diverse PDF documents.")
 
-    # Copy files into OUTPUT_DIR
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Copy files into output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
     manifest_records = []
 
-    logger.info(f"Copying files to '{OUTPUT_DIR}'...")
+    logger.info(f"Copying files to '{output_dir}'...")
     for idx, item in enumerate(selected, start=1):
         clean_name = f"doc_{idx:03d}_{item['filename']}"
-        dest_path = OUTPUT_DIR / clean_name
+        dest_path = output_dir / clean_name
         shutil.copy2(item['path'], dest_path)
 
         rec = {
@@ -319,22 +319,35 @@ def curate_500_diverse_pdfs() -> List[Dict[str, Any]]:
         manifest_records.append(rec)
 
     # Save manifest.json
-    manifest_json_path = OUTPUT_DIR / "manifest.json"
+    manifest_json_path = output_dir / "curated_500_manifest.json"
     with open(manifest_json_path, "w", encoding="utf-8") as f:
         json.dump(manifest_records, f, ensure_ascii=False, indent=2)
 
     # Save manifest.csv
-    manifest_csv_path = OUTPUT_DIR / "manifest.csv"
+    manifest_csv_path = output_dir / "curated_500_manifest.csv"
     with open(manifest_csv_path, "w", newline="", encoding="utf-8-sig") as f:
         fieldnames = ["index", "filename", "original_filename", "grade", "doc_type", "topic", "curriculum", "location", "region", "page_count", "size_mb", "sha256"]
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(manifest_records)
 
-    logger.info(f"Curation complete! 500 documents staged in {OUTPUT_DIR}")
+    logger.info(f"Curation complete! {len(selected)} documents staged in {output_dir}")
     logger.info(f"Manifest written: {manifest_json_path}")
     return manifest_records
 
 
 if __name__ == "__main__":
-    curate_500_diverse_pdfs()
+    import argparse
+    parser = argparse.ArgumentParser(description="Stratified Diversity Sampler & Deduplicator for Exam PDFs")
+    parser.add_argument("--source-dir", type=str, default=str(SCRAPE_DIR), help="Source directory containing scraped PDFs")
+    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR), help="Destination directory for curated PDFs")
+    parser.add_argument("--target-count", type=int, default=DEFAULT_TARGET_COUNT, help="Number of diverse PDFs to curate")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling reproducibility")
+    args = parser.parse_args()
+
+    curate_500_diverse_pdfs(
+        source_dir=Path(args.source_dir),
+        output_dir=Path(args.output_dir),
+        target_count=args.target_count,
+        seed=args.seed,
+    )

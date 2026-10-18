@@ -278,7 +278,35 @@ def predict_text(
                 b_input_ids[i, :len(inp)] = torch.tensor(inp, dtype=torch.long, device=device)
                 b_attention_mask[i, :len(att)] = torch.tensor(att, dtype=torch.long, device=device)
 
-            outputs = model(input_ids=b_input_ids, attention_mask=b_attention_mask)
+            # Optional 2D Layout feature extraction if supported by model
+            has_layout = getattr(getattr(model, "head", None), "use_layout_embeddings", False)
+            b_layout_kwargs = {}
+            if has_layout:
+                try:
+                    from model.module.dataset import extract_layout_features
+                    b_cols = torch.zeros((len(chunk_slice_ids), b_max_len), dtype=torch.long, device=device)
+                    b_line = torch.zeros((len(chunk_slice_ids), b_max_len), dtype=torch.long, device=device)
+                    b_blank = torch.zeros((len(chunk_slice_ids), b_max_len), dtype=torch.long, device=device)
+                    for i, c_idx in enumerate(range(b_start, b_end)):
+                        feats = extract_layout_features(processed_text, chunks_offsets[c_idx])
+                        l_len = len(chunks_offsets[c_idx])
+                        b_cols[i, :l_len] = torch.tensor(feats["col_buckets"][:l_len], dtype=torch.long, device=device)
+                        b_line[i, :l_len] = torch.tensor(feats["is_line_start"][:l_len], dtype=torch.long, device=device)
+                        b_blank[i, :l_len] = torch.tensor(feats["is_blank_preceded"][:l_len], dtype=torch.long, device=device)
+                    b_layout_kwargs = {
+                        "col_buckets": b_cols,
+                        "is_line_start": b_line,
+                        "is_blank_preceded": b_blank
+                    }
+                except Exception:
+                    b_layout_kwargs = {}
+
+            if device.type == "cuda":
+                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+                    outputs = model(input_ids=b_input_ids, attention_mask=b_attention_mask, **b_layout_kwargs)
+            else:
+                outputs = model(input_ids=b_input_ids, attention_mask=b_attention_mask, **b_layout_kwargs)
+
             b_logits = outputs.logits.cpu()  # [B, seq_len, num_labels]
 
             for chunk_offset_in_batch, chunk_idx in enumerate(range(b_start, b_end)):
@@ -440,7 +468,8 @@ class SequenceLabelPredictor:
             self.model_dir,
             num_labels=len(self.tag_to_id),
             id2label=self.id_to_tag,
-            label2id=self.tag_to_id
+            label2id=self.tag_to_id,
+            attn_implementation="sdpa",
         ).to(self.device)
 
     def predict(self, text: str) -> Dict[str, Any]:
@@ -485,7 +514,8 @@ def main():
         args.model_dir,
         num_labels=len(tag_to_id),
         id2label=id_to_tag,
-        label2id=tag_to_id
+        label2id=tag_to_id,
+        attn_implementation="sdpa",
     ).to(args.device)
 
     result = predict_text(

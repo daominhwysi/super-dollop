@@ -78,6 +78,16 @@ def test_load_revision_targets_chunk_decomposition(tmp_path):
     assert targets[0]["xml_path"].name == "chunk_1.xml"
     assert targets[0]["raw_path"].name == "chunk_1.json"
 
+    # Default granularity should be chunk level
+    targets_default = load_revision_targets(
+        report_path=report_path,
+        raw_dir=raw_dir,
+        annotated_dir=annotated_dir,
+        decisions={"NEEDS_REVISION"},
+    )
+    assert len(targets_default) == 1
+    assert targets_default[0]["doc_id"] == "exam_multi::chunk_1"
+
     # 2. Document granularity -> should target merged.xml directly
     targets_doc = load_revision_targets(
         report_path=report_path,
@@ -89,6 +99,16 @@ def test_load_revision_targets_chunk_decomposition(tmp_path):
     assert len(targets_doc) == 1
     assert targets_doc[0]["doc_id"] == "exam_multi"
     assert targets_doc[0]["xml_path"].name == "merged.xml"
+
+    # 3. Auto granularity is removed -> raises ValueError
+    with pytest.raises(ValueError, match="Invalid granularity"):
+        load_revision_targets(
+            report_path=report_path,
+            raw_dir=raw_dir,
+            annotated_dir=annotated_dir,
+            decisions={"NEEDS_REVISION"},
+            granularity="auto",
+        )
 
 
 def test_reconcile_repaired_exam_flow(tmp_path):

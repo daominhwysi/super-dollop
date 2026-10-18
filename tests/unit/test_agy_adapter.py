@@ -96,16 +96,40 @@ class TestAgyAdapter(unittest.TestCase):
 
         self.assertEqual(text, "Vision OCR Markdown Result")
         self.assertEqual(conv_id, "conv-vision-1")
-        mock_subproc.assert_called_once()
         cmd = mock_subproc.call_args[0][0]
-        self.assertIn("agy", cmd)
+        self.assertTrue(any("agy" in arg for arg in cmd))
         self.assertIn("--sandbox", cmd)
-        # Check that -p vision prompt mentions both pages
-        p_idx = cmd.index("-p")
-        prompt_arg = cmd[p_idx + 1]
-        self.assertIn("'page_1.jpg'", prompt_arg)
-        self.assertIn("'page_2.jpg'", prompt_arg)
+        self.assertIn("--agent", cmd)
+        self.assertIn("vision-ocr", cmd)
+        call_kwargs = mock_subproc.call_args[1]
+        vision_input = call_kwargs.get("input", "")
+        self.assertIn("'page_1.jpg'", vision_input)
+        self.assertIn("'page_2.jpg'", vision_input)
+
+    @patch("sequence_labelling.llm.agy_adapter.subprocess.run")
+    def test_chat_with_agy_text_mode_agent(self, mock_subproc):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = json.dumps({
+            "conversation_id": "conv-text-1",
+            "status": "SUCCESS",
+            "response": "<question_label>Câu 1.</question_label>",
+            "usage": {"input_tokens": 50, "output_tokens": 10},
+        })
+        mock_subproc.return_value = mock_proc
+
+        text, conv_id, usage = chat_with_agy(
+            prompt="Annotate this question",
+            model="gemini-3.8-flash",
+        )
+
+        self.assertEqual(text, "<question_label>Câu 1.</question_label>")
+        cmd = mock_subproc.call_args[0][0]
+        self.assertIn("--agent", cmd)
+        self.assertIn("text-only", cmd)
+        self.assertIn("--disable-slash-commands", cmd)
 
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -76,6 +76,7 @@ def get_provider_api_key(provider_name: str) -> str:
         "vilao": ("LLM_API_KEY",),
         "deepseek": ("DEEPSEEK_API_KEY",),
         "codex": ("CODEX_API_KEY", "OPENAI_API_KEY"),
+        "aixingialaire": ("AIXINGIALAIRE_GPT_API_KEY", "AIXINGIALAIRE_API_KEY"),
     }
     configured = providers.get(provider_name.lower(), {}).get("api_key_env")
     names = (configured,) if configured else aliases.get(provider_name.lower(), ())

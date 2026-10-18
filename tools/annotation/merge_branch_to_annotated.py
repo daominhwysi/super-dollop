@@ -11,6 +11,7 @@ Updates data/review_report.json and data/review_progress.json accordingly.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import shutil
 import sys
@@ -49,6 +50,25 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=WORKSPACE_DIR / "data" / "review_progress.json",
         help="Path to review progress JSON.",
+    )
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default="doc_*",
+        help="Glob pattern to filter branch document directories (default: 'doc_*'). Pass '*' to match all.",
+    )
+    parser.add_argument(
+        "--only-pass",
+        dest="only_pass",
+        action="store_true",
+        default=True,
+        help="Only merge documents whose revision status is PASS (default: True).",
+    )
+    parser.add_argument(
+        "--include-all",
+        dest="only_pass",
+        action="store_false",
+        help="Merge all branch documents regardless of status.",
     )
     parser.add_argument(
         "--dry-run",
@@ -144,12 +164,17 @@ def main() -> None:
         sys.exit(1)
 
     branch_doc_dirs = sorted([d for d in branch_dir.iterdir() if d.is_dir()])
-    print(f"Discovered {len(branch_doc_dirs)} document directories in branch: {branch_dir}")
+    if args.pattern:
+        branch_doc_dirs = [d for d in branch_doc_dirs if fnmatch.fnmatch(d.name, args.pattern)]
+
+    print(f"Discovered {len(branch_doc_dirs)} document directories matching '{args.pattern}' in branch: {branch_dir}")
+    print(f"Only-Pass gating: {'ENABLED (only merging status == PASS)' if args.only_pass else 'DISABLED'}")
     if dry_run:
         print("🔍 [DRY-RUN MODE ENABLED] - No files will be modified on disk.\n")
 
     # Track actions
     merged_count = 0
+    skipped_non_pass = 0
     status_counts: dict[str, int] = {}
     updated_reviews: dict[str, dict[str, Any]] = {}
 
@@ -159,6 +184,10 @@ def main() -> None:
 
         latest_review, status = extract_latest_review(doc_dir)
         status_counts[status] = status_counts.get(status, 0) + 1
+
+        if args.only_pass and status != "PASS":
+            skipped_non_pass += 1
+            continue
 
         branch_xml = doc_dir / "merged.xml"
         branch_json = doc_dir / "merged.json"
@@ -201,9 +230,12 @@ def main() -> None:
 
         merged_count += 1
 
-    print(f"Processed {merged_count} documents from branch:")
+    print(f"\nStatus breakdown of candidates in branch matching '{args.pattern}':")
     for st, cnt in sorted(status_counts.items()):
         print(f"  - {st}: {cnt}")
+    print(f"Merged to canonical dataset: {merged_count} documents (status: PASS)")
+    if args.only_pass and skipped_non_pass > 0:
+        print(f"Skipped non-passing candidates: {skipped_non_pass} documents")
 
     # 6. Update global review report and progress
     print("\nUpdating global review reports...")

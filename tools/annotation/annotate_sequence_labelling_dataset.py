@@ -49,9 +49,11 @@ def extract_pages_from_markdown(full_markdown: str) -> List[str]:
     cleaned = re.sub(r"^\s*<\s*/?pages\s*>\s*", "", full_markdown.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*<\s*/?\s*pages\s*>\s*$", "", cleaned, flags=re.IGNORECASE).strip()
 
-    page_blocks = re.findall(r"<page>(.*?)</page>", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    if page_blocks:
-        return [block.strip() for block in page_blocks if block.strip()]
+    # Split on <page> or </page> tags to cleanly isolate page blocks even if unclosed
+    if re.search(r"</?page(?:\s+[^>]*)?>", cleaned, flags=re.IGNORECASE):
+        blocks = [b.strip() for b in re.split(r"</?page(?:\s+[^>]*)?>", cleaned, flags=re.IGNORECASE) if b.strip()]
+        if blocks:
+            return blocks
 
     # Fallback to double newline page separator if no <page> tags present
     if PAGE_SEPARATOR in cleaned:
@@ -73,6 +75,7 @@ def process_single_document(
     overlap_pages: int = CHUNKER_OVERLAP_PAGES,
     concurrency: int = 4,
     parser_thinking: Optional[str] = None,
+    overwrite: bool = False,
 ) -> Dict[str, Any]:
     """
     Annotates a single document using the chunker and parser worker,
@@ -98,6 +101,13 @@ def process_single_document(
             "",
             p_text,
             flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        # Prune any stray or unclosed <page> / </page> tags originating from raw OCR
+        text_body = re.sub(
+            r"</?pages?(?:\s+[^>]*)?>",
+            "",
+            text_body,
+            flags=re.IGNORECASE,
         ).strip()
         if page_list:
             global_offset += len(PAGE_SEPARATOR)
@@ -125,6 +135,9 @@ def process_single_document(
         for chunk_index, chunk_pages in enumerate(chunks)
     ]
 
+    doc_out_dir = out_dir / rel_path.parent / rel_path.stem
+    existing_chunks_dir = doc_out_dir / "chunks"
+
     # --- Step 2: Parallel Parser Swarm ---
     worker = ParserAgentWorker(
         model=parser_model,
@@ -138,6 +151,18 @@ def process_single_document(
         futures = {}
         for plan in chunk_plans:
             chunk_idx = plan["chunk_index"]
+            c_json = existing_chunks_dir / f"chunk_{chunk_idx}.json"
+            c_xml = existing_chunks_dir / f"chunk_{chunk_idx}.xml"
+            if not overwrite and existing_chunks_dir.exists() and c_xml.exists() and c_xml.stat().st_size > 100 and c_json.exists():
+                try:
+                    cached = json.loads(c_json.read_text(encoding="utf-8"))
+                    if cached.get("parse_status") not in ("failed", "error") and cached.get("raw_xml"):
+                        print(f"  ⚡ [Cached Chunk] Document '{rel_path}' Chunk {chunk_idx}: loaded from disk ({len(cached.get('questions', []))} questions)", flush=True)
+                        chunk_results[chunk_idx] = cached
+                        continue
+                except Exception:
+                    pass
+
             future = executor.submit(
                 worker.process_chunk,
                 plan["raw_chunk_text"],
@@ -153,12 +178,12 @@ def process_single_document(
             chunk_idx = plan["chunk_index"]
             try:
                 res = future.result()
+                print(f"  ✅ [Parsed Chunk] Document '{rel_path}' Chunk {chunk_idx}: finished ({len(res.get('questions', []))} questions)", flush=True)
             except Agy5HourCapError:
                 raise
             except Exception as e:
-                print(f"[Error] Chunk {chunk_idx} failed for {rel_path}: {e}")
+                print(f"[Error] Chunk {chunk_idx} failed for {rel_path}: {e}", flush=True)
                 res = {
-
                     **plan,
                     "raw_xml": "",
                     "spans": [],
@@ -170,16 +195,15 @@ def process_single_document(
             chunk_results[chunk_idx] = res
 
     # --- Step 3: Save Per-Chunk Outputs First ---
-    doc_out_dir = out_dir / rel_path.parent / rel_path.stem
     doc_out_dir.mkdir(parents=True, exist_ok=True)
-
     chunks_dir = doc_out_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
     chunk_file_info = []
-    valid_chunk_results = [r for r in chunk_results if r is not None]
+    valid_chunk_results = sorted([r for r in chunk_results if r is not None], key=lambda x: x.get("chunk_index", 0))
 
-    for idx, cres in enumerate(valid_chunk_results):
+    for cres in valid_chunk_results:
+        idx = cres.get("chunk_index", 0)
         chunk_json_path = chunks_dir / f"chunk_{idx}.json"
         chunk_xml_path = chunks_dir / f"chunk_{idx}.xml"
 
@@ -291,6 +315,17 @@ def process_single_document(
         "chunks_summary": chunk_file_info,
     }
 
+    if not merged_xml_content.strip() and len(full_text.strip()) > 300:
+        print(f"❌ [Error] Merged XML is completely empty for '{rel_path}' despite non-empty input. Refusing to write empty output.")
+        return {
+            "status": "failed",
+            "file": str(rel_path),
+            "chunks": len(chunks),
+            "questions": 0,
+            "duration": round(duration, 2),
+            "output_dir": str(doc_out_dir),
+        }
+
     merged_json_path = doc_out_dir / "merged.json"
     merged_xml_path = doc_out_dir / "merged.xml"
 
@@ -334,12 +369,14 @@ def main():
         "--provider",
         type=str,
         default=PARSER_PROVIDER,
-        choices=["codex", "xah", "deepseek", "nvidia", "vilao", "commandcode", "agy", "antigravity"],
+        choices=["codex", "xah", "deepseek", "nvidia", "vilao", "commandcode", "agy", "antigravity", "aixingialaire"],
         help=f"Parser provider (default: {PARSER_PROVIDER})",
     )
     parser.add_argument("--target_tokens", type=int, default=CHUNKER_TARGET_TOKENS, help="Target chunk size in tokens")
     parser.add_argument("--max_tokens", type=int, default=CHUNKER_MAX_TOKENS, help="Maximum chunk size in tokens")
-    parser.add_argument("--concurrency", type=int, default=4, help="Number of concurrent chunk worker threads")
+    parser.add_argument("--concurrency", type=int, default=1, help="Number of concurrent chunk worker threads")
+    parser.add_argument("--shard-id", type=int, default=0, help="Shard index (0-based) for parallel multi-worker runs")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards for parallel multi-worker runs")
     parser.add_argument("--pattern", type=str, default="*.md", help="Glob pattern for markdown files to process (e.g. 'exam-00*.md')")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of documents to process")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output files")
@@ -361,14 +398,54 @@ def main():
 
     total_files = len(all_md_files)
     if not args.overwrite:
-        md_files = [
-            f for f in all_md_files
-            if not (output_path / f.relative_to(input_path).parent / f.stem / "merged.json").exists()
-        ]
+        md_files = []
+        for f in all_md_files:
+            doc_dir = output_path / f.relative_to(input_path).parent / f.stem
+            merged_json = doc_dir / "merged.json"
+            merged_xml = doc_dir / "merged.xml"
+            chunks_dir = doc_dir / "chunks"
+
+            if not merged_json.exists() or not merged_xml.exists() or merged_xml.stat().st_size < 100:
+                md_files.append(f)
+                continue
+
+            has_broken_chunk = False
+            if chunks_dir.exists():
+                for c_xml in chunks_dir.glob("chunk_*.xml"):
+                    if c_xml.stat().st_size == 0:
+                        has_broken_chunk = True
+                        break
+                if not has_broken_chunk:
+                    for c_json in chunks_dir.glob("chunk_*.json"):
+                        if c_json.name.endswith(".audit.json"):
+                            continue
+                        try:
+                            c_data = json.loads(c_json.read_text(encoding="utf-8"))
+                            if c_data.get("parse_status") in ("failed", "error") or not c_data.get("raw_xml"):
+                                has_broken_chunk = True
+                                break
+                        except Exception:
+                            has_broken_chunk = True
+                            break
+
+            if has_broken_chunk:
+                md_files.append(f)
+                continue
+
+            try:
+                xml_content = merged_xml.read_text(encoding="utf-8", errors="ignore")
+                if "<" in xml_content and ">" in xml_content:
+                    continue
+            except Exception:
+                pass
+            md_files.append(f)
         skipped_count = total_files - len(md_files)
     else:
         md_files = all_md_files
         skipped_count = 0
+
+    if args.num_shards > 1:
+        md_files = [f for idx, f in enumerate(md_files) if idx % args.num_shards == args.shard_id]
 
     from sequence_labelling.config import get_provider_base_url
     parser_base_url = get_provider_base_url(target_provider)
@@ -379,6 +456,7 @@ def main():
     print(f"  Output Directory  : {output_path}")
     print(f"  Total Documents   : {total_files}")
     print(f"  Already Done      : {skipped_count} (skipped)")
+    print(f"  Shard             : {args.shard_id + 1}/{args.num_shards}" if args.num_shards > 1 else "  Shard             : Full Set (1/1)")
     print(f"  To Process        : {len(md_files)}")
     print(f"  Parser Provider   : {target_provider}")
     print(f"  Parser Model      : {target_model}")
@@ -407,6 +485,7 @@ def main():
                 target_tokens=args.target_tokens,
                 max_tokens=args.max_tokens,
                 concurrency=args.concurrency,
+                overwrite=args.overwrite,
             )
             success_count += 1
         except Exception as e:

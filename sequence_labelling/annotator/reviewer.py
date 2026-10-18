@@ -2374,16 +2374,13 @@ class AnnotationReviewerAgent:
     @staticmethod
     def discover_review_targets(
         annotated_dir: Union[str, Path],
-        granularity: str = "auto",
+        granularity: str = "chunk",
         max_merged_tokens: int = 15_000,
     ) -> List[Path]:
         """
         Discovers XML files for review according to granularity mode:
-        - 'chunk': Audits individual chunk XMLs (chunk_*.xml). Enforces token budget <= 15k tokens.
+        - 'chunk': Audits individual chunk XMLs (chunk_*.xml). Enforces token budget <= 15k tokens. (Default)
         - 'document': Audits monolithic merged.xml documents.
-        - 'auto': Checks estimated token size:
-            * > max_merged_tokens (~15k tokens) and has chunks -> Chunk level (chunk_*.xml)
-            * <= max_merged_tokens or single-chunk -> Document level (merged.xml)
         - Standalone XML files are reviewed as-is.
         - Never reviews both merged and chunk versions for the same document.
         """
@@ -2391,9 +2388,9 @@ class AnnotationReviewerAgent:
         if base_dir.is_file():
             return [base_dir]
 
-        granularity = (granularity or "auto").strip().lower()
-        if granularity not in {"chunk", "document", "auto"}:
-            raise ValueError(f"Invalid granularity: {granularity}. Must be 'chunk', 'document', or 'auto'.")
+        granularity = (granularity or "chunk").strip().lower()
+        if granularity not in {"chunk", "document"}:
+            raise ValueError(f"Invalid granularity: {granularity}. Must be 'chunk' or 'document'.")
 
         targets: List[Path] = []
 
@@ -2420,19 +2417,8 @@ class AnnotationReviewerAgent:
                     targets.extend(chunk_files)
                 else:
                     targets.append(m_file)
-            elif granularity == "document":
+            else:  # document
                 targets.append(m_file)
-            else:  # auto
-                try:
-                    content = m_file.read_text(encoding="utf-8", errors="replace")
-                    est_tokens = len(content) / 3.5
-                except Exception:
-                    est_tokens = 0
-
-                if est_tokens > max_merged_tokens and chunk_files:
-                    targets.extend(chunk_files)
-                else:
-                    targets.append(m_file)
 
         # 2. Find any chunk files in folders that DO NOT have merged.xml
         all_chunks = sorted(base_dir.rglob("chunk_*.xml"))
@@ -2697,7 +2683,7 @@ class AnnotationReviewerAgent:
         save_audit_json: bool = True,
         use_llm: bool = True,
         concurrency: int = 4,
-        granularity: str = "auto",
+        granularity: str = "chunk",
         max_merged_tokens: int = 15_000,
         rollup_documents: bool = True,
         branch_dir: Optional[Union[str, Path]] = None,
@@ -2707,13 +2693,13 @@ class AnnotationReviewerAgent:
         filter_decision: Optional[str] = None,
         limit: Optional[int] = None,
         pattern: Optional[str] = None,
+        manifest: Optional[Union[str, Path]] = None,
     ) -> BatchReviewSummary:
         """
         Performs batch review across all XML documents in a directory.
         Supports dual granularity:
-        - chunk: Audits individual chunk XMLs (chunk_*.xml) strictly within <= 15,000 token budget.
+        - chunk: Audits individual chunk XMLs (chunk_*.xml) strictly within <= 15,000 token budget. (Default)
         - document: Audits monolithic merged.xml documents.
-        - auto: Automatically switches multi-chunk docs > 15,000 tokens to chunk level.
         Scans and resumes from existing audit_report.json unless overwrite is True.
         Saves progress, Markdown report, and JSON summary on the fly as documents finish.
         """
@@ -2722,12 +2708,42 @@ class AnnotationReviewerAgent:
         if not base_dir.exists():
             raise FileNotFoundError(f"Annotated directory not found: {annotated_dir}")
 
-        # Gather target xml files according to granularity
-        all_targets = self.discover_review_targets(
-            base_dir,
-            granularity=granularity,
-            max_merged_tokens=max_merged_tokens,
-        )
+        # Gather target xml files according to granularity or manifest
+        if manifest:
+            m_path = Path(manifest)
+            if not m_path.exists():
+                raise FileNotFoundError(f"Manifest file not found: {manifest}")
+            lines = [
+                line.strip()
+                for line in m_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            all_targets = []
+            for item in lines:
+                p = Path(item)
+                if p.is_file():
+                    all_targets.append(p.resolve())
+                elif (base_dir / item).is_file():
+                    all_targets.append((base_dir / item).resolve())
+                elif (base_dir / item).is_dir():
+                    d = (base_dir / item).resolve()
+                    chunks_d = d / "chunks"
+                    if granularity == "chunk" and chunks_d.exists():
+                        all_targets.extend(
+                            sorted(c for c in chunks_d.glob("chunk_*.xml") if not c.name.endswith(".audit.xml"))
+                        )
+                    elif (d / "merged.xml").exists():
+                        all_targets.append(d / "merged.xml")
+                    elif chunks_d.exists():
+                        all_targets.extend(
+                            sorted(c for c in chunks_d.glob("chunk_*.xml") if not c.name.endswith(".audit.xml"))
+                        )
+        else:
+            all_targets = self.discover_review_targets(
+                base_dir,
+                granularity=granularity,
+                max_merged_tokens=max_merged_tokens,
+            )
         all_targets.sort()
 
         if pattern:
@@ -3222,15 +3238,15 @@ def main():
     )
     parser.add_argument(
         "--granularity",
-        choices=["chunk", "document", "auto"],
-        default="auto",
-        help="Audit granularity: chunk (individual chunk XMLs <=15k tokens), document (monolithic merged.xml), auto (>15k tokens -> chunk, <=15k -> document; default: auto)",
+        choices=["chunk", "document"],
+        default="chunk",
+        help="Audit granularity: chunk (individual chunk XMLs <=15k tokens; default: chunk), document (monolithic merged.xml)",
     )
     parser.add_argument(
         "--max-merged-tokens",
         type=int,
         default=15_000,
-        help="Token threshold for auto granularity switching to chunk level (default: 15000)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--no-rollup",
@@ -3244,6 +3260,13 @@ def main():
         type=str,
         default=None,
         help="Branch output directory when writing reconciled files (optional)",
+    )
+
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help="Path to manifest file with document folders or chunk XMLs to evaluate",
     )
 
     args = parser.parse_args()
@@ -3263,10 +3286,12 @@ def main():
     print(f"  Reviewer Model      : {agent.model}")
     print(f"  Thinking Effort     : {agent.llm_reviewer.thinking}")
     print(f"  Concurrency         : {args.concurrency} worker thread(s)")
-    print(f"  Granularity Mode    : {args.granularity.upper()} (threshold: {args.max_merged_tokens} tokens)")
+    print(f"  Granularity Mode    : {args.granularity.upper()}")
     print(f"  Chunk Auto-Rollup   : {'Enabled' if args.rollup_documents else 'Disabled'}")
     print(f"  LLM Semantic Audit  : {'Disabled (Deterministic Only)' if args.no_llm else 'Enabled'}")
     print(f"  Overwrite Mode      : {'Enabled' if args.overwrite else 'Disabled (Resume from cache)'}")
+    if args.manifest:
+        print(f"  Manifest File       : {args.manifest}")
     if args.pattern:
         print(f"  Filter Pattern      : {args.pattern}")
     if args.filter_decision:
@@ -3292,6 +3317,7 @@ def main():
         filter_decision=args.filter_decision,
         limit=args.limit,
         pattern=args.pattern,
+        manifest=args.manifest,
     )
 
     print("\n" + "=" * 65)

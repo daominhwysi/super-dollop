@@ -63,6 +63,31 @@ def main():
     table.add_row("Total Questions Extracted", f"{total_questions:,} questions")
     table.add_row("Total Chunks Processed", f"{total_chunks:,} chunks")
     table.add_row("Avg Questions / Document", f"{round(total_questions / max(1, completed_count), 1)}")
+
+    # Real Antigravity Quota Telemetry via /quota
+    try:
+        from sequence_labelling.llm.agy_rate_limiter import AgyQuotaService
+        quota = AgyQuotaService.fetch_quota(timeout=12.0)
+    except Exception:
+        quota = None
+
+    if quota and (quota.gemini_5h or quota.gemini_weekly):
+        if quota.gemini_5h:
+            table.add_row(
+                "Gemini 5-Hour Quota",
+                f"[bold green]{quota.gemini_5h_pct:.1f}% remaining[/bold green] (resets in {quota.gemini_5h.formatted_cooldown()})",
+            )
+        if quota.gemini_weekly:
+            table.add_row(
+                "Gemini Weekly Quota",
+                f"[bold green]{quota.gemini_weekly_pct:.1f}% remaining[/bold green] (resets {quota.gemini_weekly.formatted_reset()})",
+            )
+        if quota.claude_weekly:
+            table.add_row(
+                "Claude / GPT Quota",
+                f"5h: {quota.claude_5h_pct:.1f}% | Weekly: {quota.claude_weekly_pct:.1f}%",
+            )
+
     table.add_row("Last Checkpoint Updated", last_updated)
 
     console.print(table)
