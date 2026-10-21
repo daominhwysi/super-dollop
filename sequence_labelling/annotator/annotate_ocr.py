@@ -221,12 +221,17 @@ def _extract_usage_tokens(usage: Any) -> Dict[str, Optional[int]]:
     }
 
 
-def parse_xml_annotations(tagged_text: str) -> Tuple[str, List[Dict[str, Any]]]:
+def parse_xml_annotations(tagged_text: str, expand_anchors: bool = True) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Parses tagged XML string to produce clean raw text and character offset spans.
     Supports XML tags with parameters/attributes (e.g. <question stimulus_id="stim_1">).
     Preserves raw text exact alignment.
+    Automatically expands compact stimulus anchors to full stimulus spans.
     """
+    if expand_anchors and "<stimulus" in tagged_text and "/>" in tagged_text:
+        from sequence_labelling.annotator.anchor_helper import AnchorHelper
+        tagged_text = AnchorHelper.expand_stimulus_anchors(tagged_text)
+
     allowed_tags = set(BASE_TAGS)
     raw_chars = []
     spans = []
@@ -243,9 +248,13 @@ def parse_xml_annotations(tagged_text: str) -> Tuple[str, List[Dict[str, Any]]]:
         is_closing = bool(match.group(1))
         tag_name = match.group(2)
         attr_str = match.group(3) or ""
+        is_self_closing = match.group(0).endswith("/>") or attr_str.strip().endswith("/")
 
         if tag_name in allowed_tags:
-            if not is_closing:
+            if is_self_closing:
+                # Do not push unclosable self-closing tag onto container tag_stack
+                pass
+            elif not is_closing:
                 params = {}
                 if attr_str:
                     attr_matches = re.findall(

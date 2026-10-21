@@ -59,10 +59,11 @@ models:
     description: "LLM model for mapping unstructured answer keys to questions"
 
   chunker:
-    target_tokens: 6000
-    max_tokens: 8000
-    overlap_pages: 0
-    description: "Passage-locked greedy chunker token budget (6k-8k tokens per chunk)"
+    target_tokens: 7000
+    max_tokens: 10000
+    overlap_pages: 1
+    overlap_fallback_tokens: 750
+    description: "Cartography-locked greedy chunker token budget (7k target, 10k ceiling, 1-page/750-tok overlap)"
 
   reviewer:
     model_name: "gemini-3.8-flash"
@@ -76,6 +77,12 @@ models:
     provider: "agy"
     thinking: low
     description: "Precision surgical editor agent using Search/Replace diff blocks"
+
+  cartographer:
+    model_name: "gemini-3.8-flash"
+    provider: "agy"
+    thinking: off
+    description: "Topological cartographer agent emitting chronological page-span object manifest"
 
 logging:
   dir: "backend/logs/ocr_logs"

@@ -60,7 +60,20 @@ def extract_structural_vector_and_tokens(
     token_count = len(re.findall(r"\w+|[^\w\s]", raw_text))
 
     qs = merged_json.get("questions", [])
-    stims = merged_json.get("stimuli", [])
+    stims = merged_json.get("stimuli") or []
+    if isinstance(stims, (list, dict)):
+        stim_count = len(stims)
+    else:
+        stim_count = 0
+    
+    # Fallback to counting unique stimulus_ids or XML tags
+    if stim_count == 0:
+        stim_count = merged_json.get("stimuli_count") or 0
+    if stim_count == 0:
+        stim_count = len(set(q.get("stimulus_id") for q in qs if q.get("stimulus_id")))
+    if stim_count == 0:
+        stim_count = len(re.findall(r"<stimulus\b", xml_text))
+
     q_count = max(1, len(qs))
 
     # Option statistics
@@ -73,7 +86,6 @@ def extract_structural_vector_and_tokens(
     stemless_ratio = stemless_count / q_count
 
     # Stimuli & passage density
-    stim_count = len(stims)
     stim_ratio = stim_count / q_count
 
     # Figures, tables, sections, explanations

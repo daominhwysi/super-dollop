@@ -75,21 +75,15 @@ class DocumentStateStack:
         return self.completed_groups
 
 
+from sequence_labelling.annotator.ocr_document import extract_page_metadata_stream
+
+
 def extract_metadata_headers_from_markdown(full_markdown_text: str) -> List[Dict[str, Any]]:
     """
     Extracts <page_metadata> or <|page_metadata|> JSON blocks embedded in OCR markdown text.
+    Uses resilient extract_page_metadata_stream from ocr_document.
     """
-    pattern = re.compile(r"(?:<\|page_metadata\|>|<page_metadata>)\s*(\{.*?\})\s*(?:<\|end_metadata\|>|</page_metadata>)", re.DOTALL)
-    headers = []
-
-    for match in pattern.finditer(full_markdown_text):
-        json_str = match.group(1).strip()
-        try:
-            headers.append(json.loads(json_str))
-        except Exception:
-            pass
-
-    return headers
+    return extract_page_metadata_stream(full_markdown_text)
 
 
 def merge_chunk_xmls(

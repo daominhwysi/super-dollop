@@ -360,6 +360,7 @@ class PDFOCRConverter:
         concurrency: Optional[int] = None,
         use_fallback: bool = False,
         progress_callback: Optional[Any] = None,
+        extract_metadata: bool = True,
     ) -> str:
         pdf_path = Path(pdf_path)
         if not pdf_path.exists():
@@ -586,6 +587,19 @@ class PDFOCRConverter:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(final_text)
             print(f"OCR output saved to: {output_path}")
+
+        if extract_metadata:
+            try:
+                from sequence_labelling.metadata.extractor import extract_and_save_metadata
+                pdf_p = Path(pdf_path)
+                meta_path = extract_and_save_metadata(
+                    ocr_markdown=final_text,
+                    filename=pdf_p.name,
+                    doc_id=pdf_p.stem,
+                )
+                print(f"Metadata generated and saved to: {meta_path}")
+            except Exception as meta_e:
+                print(f"[Warning] Post-OCR metadata extraction skipped/failed: {meta_e}")
 
         return final_text
 

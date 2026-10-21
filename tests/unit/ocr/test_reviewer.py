@@ -1373,3 +1373,59 @@ def test_rollup_chunk_audits_pass_and_reconciliation(tmp_path):
     assert "<question_label>Câu 2.</question_label>" in merged_content
 
 
+def test_non_exam_chunk_zero_questions_false_positive_recalculation():
+    """Verify that when a non-exam chunk (TOC/intro) has 0 questions in XML and the LLM
+    reviewer rejects deterministic question findings as false positives, det_score is
+    recalculated to 100.0, resulting in PASS and is_malfunctioned=False."""
+    raw_toc = """# MỤC LỤC
+1. Phần I: Giới thiệu chung
+2. Phần II: Đề thi thử
+3. Hướng dẫn ôn tập
+"""
+    xml_toc = """<section># MỤC LỤC
+1. Phần I: Giới thiệu chung
+2. Phần II: Đề thi thử
+3. Hướng dẫn ôn tập</section>"""
+
+    agent = AnnotationReviewerAgent()
+
+    # Mock LLM review where the reviewer rejects deterministic warnings as false positives
+    mock_llm_result = {
+        "parser_error_confirmations": [
+            {
+                "issue_id": 1,
+                "is_true_positive": False,
+                "reason": "This is a Table of Contents with zero exam questions. 0 questions in XML is correct.",
+            },
+            {
+                "issue_id": 2,
+                "is_true_positive": False,
+                "reason": "Heading in TOC, not an exam question.",
+            },
+            {
+                "issue_id": 3,
+                "is_true_positive": False,
+                "reason": "Heading in TOC, not an exam question.",
+            },
+        ],
+        "issues": [],
+        "summary": "Non-exam front matter correctly tagged with section; zero parser defects.",
+    }
+
+    report = agent.review_document(
+        xml_content=xml_toc,
+        raw_ocr_text=raw_toc,
+        doc_id="exam_book::chunk_000",
+        use_llm=True,
+        cached_llm_result=mock_llm_result,
+    )
+
+    assert report.is_malfunctioned is False
+    assert report.decision == ReviewDecision.PASS
+    assert report.overall_score >= 90.0
+    assert report.deterministic_score >= 90.0
+    assert report.rubric_scores.det_question_coverage == 100.0
+    assert report.rubric_scores.question_option_completeness == 100.0
+
+
+
