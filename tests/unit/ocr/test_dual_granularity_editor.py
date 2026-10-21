@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from sequence_labelling.annotator.reviewer import AnnotationReviewerAgent, ReviewDecision
-from tools.review.edit_review_set import (
+from sequence_labelling.annotator.revision_loop import (
     load_revision_targets,
     reconcile_repaired_exam,
     _chunk_sort_key,
