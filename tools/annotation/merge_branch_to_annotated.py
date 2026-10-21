@@ -39,10 +39,15 @@ def parse_args() -> argparse.Namespace:
         default=WORKSPACE_DIR / "data" / "sequence_labelling_annotated",
         help="Path to canonical annotated directory.",
     )
+    default_report = (
+        WORKSPACE_DIR / "data" / "review_report_chunks.json"
+        if (WORKSPACE_DIR / "data" / "review_report_chunks.json").exists()
+        else WORKSPACE_DIR / "data" / "review_report.json"
+    )
     parser.add_argument(
         "--report-path",
         type=Path,
-        default=WORKSPACE_DIR / "data" / "review_report.json",
+        default=default_report,
         help="Path to global review report JSON.",
     )
     parser.add_argument(
@@ -54,8 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pattern",
         type=str,
-        default="doc_*",
-        help="Glob pattern to filter branch document directories (default: 'doc_*'). Pass '*' to match all.",
+        default="*",
+        help="Glob pattern to filter branch document directories (default: '*').",
     )
     parser.add_argument(
         "--only-pass",
@@ -185,50 +190,91 @@ def main() -> None:
         latest_review, status = extract_latest_review(doc_dir)
         status_counts[status] = status_counts.get(status, 0) + 1
 
-        if args.only_pass and status != "PASS":
-            skipped_non_pass += 1
-            continue
-
         branch_xml = doc_dir / "merged.xml"
         branch_json = doc_dir / "merged.json"
         branch_state = doc_dir / "revision_state.json"
         branch_revisions = doc_dir / "revisions"
+        branch_chunks = doc_dir / "chunks"
 
-        if not dry_run:
-            dest_doc_dir.mkdir(parents=True, exist_ok=True)
+        if status == "PASS" or not args.only_pass:
+            if not dry_run:
+                dest_doc_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Copy merged.xml
-            if branch_xml.exists():
-                shutil.copy2(branch_xml, dest_doc_dir / "merged.xml")
+                # 1. Copy merged.xml
+                if branch_xml.exists():
+                    shutil.copy2(branch_xml, dest_doc_dir / "merged.xml")
 
-            # 2. Copy merged.json
-            if branch_json.exists():
-                shutil.copy2(branch_json, dest_doc_dir / "merged.json")
+                # 2. Copy merged.json
+                if branch_json.exists():
+                    shutil.copy2(branch_json, dest_doc_dir / "merged.json")
 
-            # 3. Copy revision_state.json
-            if branch_state.exists():
-                shutil.copy2(branch_state, dest_doc_dir / "revision_state.json")
+                # 3. Copy revision_state.json
+                if branch_state.exists():
+                    shutil.copy2(branch_state, dest_doc_dir / "revision_state.json")
 
-            # 4. Copy revisions/ directory
-            if branch_revisions.exists() and branch_revisions.is_dir():
-                dest_revs = dest_doc_dir / "revisions"
-                shutil.copytree(branch_revisions, dest_revs, dirs_exist_ok=True)
+                # 4. Copy revisions/ directory
+                if branch_revisions.exists() and branch_revisions.is_dir():
+                    dest_revs = dest_doc_dir / "revisions"
+                    shutil.copytree(branch_revisions, dest_revs, dirs_exist_ok=True)
 
-            # 5. Synchronize audit_report.json
-            dest_audit = dest_doc_dir / "audit_report.json"
-            if latest_review:
-                review_to_save = dict(latest_review)
-                review_to_save["file_path"] = str(dest_doc_dir / "merged.xml")
-                dest_audit.write_text(
-                    json.dumps(review_to_save, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                updated_reviews[doc_id] = review_to_save
+                # 5. Copy chunks/ directory
+                if branch_chunks.exists() and branch_chunks.is_dir():
+                    dest_chunks = dest_doc_dir / "chunks"
+                    shutil.copytree(branch_chunks, dest_chunks, dirs_exist_ok=True)
+
+                # 6. Synchronize audit_report.json
+                dest_audit = dest_doc_dir / "audit_report.json"
+                if latest_review:
+                    review_to_save = dict(latest_review)
+                    review_to_save["file_path"] = str(dest_doc_dir / "merged.xml")
+                    dest_audit.write_text(
+                        json.dumps(review_to_save, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    updated_reviews[doc_id] = review_to_save
+            else:
+                if latest_review:
+                    updated_reviews[doc_id] = latest_review
+
+            merged_count += 1
+        elif branch_chunks.exists() and branch_chunks.is_dir():
+            # For partial exams, copy individual verified PASS chunks
+            passing_chunks_copied = 0
+            for ca in branch_chunks.glob("chunk_*.audit.json"):
+                c_stem = ca.name.replace(".audit.json", "")
+                try:
+                    c_data = json.loads(ca.read_text(encoding="utf-8"))
+                    if c_data.get("decision") == "PASS":
+                        if not dry_run:
+                            dest_chunks = dest_doc_dir / "chunks"
+                            dest_chunks.mkdir(parents=True, exist_ok=True)
+                            for ext in [".xml", ".json", ".audit.json", "_revision_state.json"]:
+                                src_f = branch_chunks / f"{c_stem}{ext}"
+                                if src_f.exists():
+                                    shutil.copy2(src_f, dest_chunks / src_f.name)
+                        passing_chunks_copied += 1
+                except Exception:
+                    pass
+            if passing_chunks_copied > 0:
+                merged_count += 1
+            else:
+                skipped_non_pass += 1
         else:
-            if latest_review:
-                updated_reviews[doc_id] = latest_review
+            skipped_non_pass += 1
 
-        merged_count += 1
+        # Collect chunk audits if present (for updating chunk-level reports)
+        if branch_chunks.exists() and branch_chunks.is_dir():
+            for ca in branch_chunks.glob("chunk_*.audit.json"):
+                c_stem = ca.name.replace(".audit.json", "")
+                c_doc_id = f"{doc_id}::{c_stem}"
+                try:
+                    c_data = json.loads(ca.read_text(encoding="utf-8"))
+                    if not args.only_pass or c_data.get("decision") == "PASS":
+                        c_data["doc_id"] = c_doc_id
+                        c_data["file_path"] = str(dest_doc_dir / "chunks" / f"{c_stem}.xml")
+                        updated_reviews[c_doc_id] = c_data
+                except Exception:
+                    pass
 
     print(f"\nStatus breakdown of candidates in branch matching '{args.pattern}':")
     for st, cnt in sorted(status_counts.items()):
@@ -255,25 +301,26 @@ def main() -> None:
         r.get("doc_id"): dict(r) for r in all_reports if r.get("doc_id")
     }
 
-    # If canonical dataset has documents not yet in report, add them
-    for d in target_dir.iterdir():
-        if not d.is_dir():
-            continue
-        doc_id = d.name
-        if doc_id not in report_by_doc_id:
-            audit_file = d / "audit_report.json"
-            if audit_file.exists():
-                try:
-                    audit_entry = json.loads(audit_file.read_text(encoding="utf-8"))
-                    report_by_doc_id[doc_id] = audit_entry
-                except Exception:
-                    pass
+    # If canonical dataset has documents not yet in report, add them only if all_reports is empty
+    if not all_reports:
+        for d in target_dir.iterdir():
+            if not d.is_dir():
+                continue
+            doc_id = d.name
+            if doc_id not in report_by_doc_id:
+                audit_file = d / "audit_report.json"
+                if audit_file.exists():
+                    try:
+                        audit_entry = json.loads(audit_file.read_text(encoding="utf-8"))
+                        report_by_doc_id[doc_id] = audit_entry
+                    except Exception:
+                        pass
 
     # Update with new branch reviews
     for doc_id, rev in updated_reviews.items():
         if doc_id in report_by_doc_id:
             report_by_doc_id[doc_id].update(rev)
-        else:
+        elif not all_reports:
             report_by_doc_id[doc_id] = rev
 
     # Recompute global counts and stats across all documents

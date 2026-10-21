@@ -39,7 +39,7 @@ def test_greedy_oversize_chunker():
         {"p": 2, "estimated_tokens": 12000, "head": "CONT_GROUP", "tail": "CLEAN"},
         {"p": 3, "estimated_tokens": 8000, "head": "CLEAN", "tail": "CLEAN"},
     ]
-    chunks = greedy_oversize_chunker(pages, target_tokens=15000, max_tokens=25000)
+    chunks = greedy_oversize_chunker(pages, target_tokens=15000, max_tokens=25000, overlap_pages=0)
     assert len(chunks) == 2
     assert [p["p"] for p in chunks[0]] == [1, 2]
     assert [p["p"] for p in chunks[1]] == [3]

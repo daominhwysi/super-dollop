@@ -10,11 +10,12 @@ import sys
 import json
 import re
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 # Ensure project root is in python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from sequence_labelling.annotator.ocr_document import OCRDocument
 from sequence_labelling.parser.long_parser.sequence_reconciler import (
     DocumentStateStack,
     extract_metadata_headers_from_markdown,
@@ -27,42 +28,23 @@ from sequence_labelling.parser.long_parser.greedy_chunker import (
 from sequence_labelling.parser.long_parser.parser_agent_worker import ParserAgentWorker
 
 
-def parse_ocr_markdown(file_path: str) -> List[Dict[str, Any]]:
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    page_matches = list(re.finditer(r"<page>(.*?)</page>", text, re.DOTALL))
-    pages_data = []
-
-    for idx, match in enumerate(page_matches):
-        p_content = match.group(1)
-        meta_match = re.search(
-            r"<page_metadata>\s*(\{.*?\})\s*</page_metadata>", p_content, re.DOTALL
-        )
-        meta = json.loads(meta_match.group(1)) if meta_match else {}
-
-        clean_text = re.sub(
-            r"<page_metadata>.*?</page_metadata>", "", p_content, flags=re.DOTALL
-        ).strip()
-        words = len(clean_text.split())
-        chars = len(clean_text)
-        estimated_tokens = max(50, int(chars / 3.8))
-
-        pages_data.append(
-            {
-                "p": meta.get("p", idx + 1),
-                "head": meta.get("head", "CLEAN"),
-                "tail": meta.get("tail", "CLEAN"),
-                "seq": meta.get("seq", []),
-                "estimated_tokens": estimated_tokens,
-                "words": words,
-                "chars": chars,
-                "text": clean_text,
-                "active_stimulus_id": meta.get("active_stimulus_id") or meta.get("stimulus_id"),
-            }
-        )
-
-    return pages_data, text
+def parse_ocr_markdown(file_path: str) -> Tuple[List[Dict[str, Any]], str]:
+    ocr_doc = OCRDocument.from_file(file_path)
+    pages_data = [
+        {
+            "p": p.page_number,
+            "head": p.metadata.get("head", "CLEAN"),
+            "tail": p.metadata.get("tail", "CLEAN"),
+            "seq": p.metadata.get("seq", []),
+            "estimated_tokens": max(50, int(len(p.cleaned_text) / 3.8)),
+            "words": len(p.cleaned_text.split()),
+            "chars": len(p.cleaned_text),
+            "text": p.cleaned_text,
+            "active_stimulus_id": p.metadata.get("active_stimulus_id") or p.metadata.get("stimulus_id"),
+        }
+        for p in ocr_doc.pages
+    ]
+    return pages_data, ocr_doc.raw_text
 
 
 def render_chunk_parsed_markdown(

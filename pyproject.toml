@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
+vsl = "sequence_labelling.cli:main"
 sequence-label = "sequence_labelling.cli:main"
 synthetic-exam-gen = "synthetic_exam_generator.cli:main"
 seqlabel-train = "model.train:main"

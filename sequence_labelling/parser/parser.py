@@ -22,7 +22,12 @@ def parse_spans_into_structured_questions(raw_text: str, spans: List[Dict[str, A
 
         if label == "section":
             current_section = text
-            active_stimulus_id = None
+            # Do not clear active_stimulus_id if this section is an instructional prompt for reading comprehension questions
+            is_reading_subprompt = bool(
+                re.search(r"(?:câu|question|đọc|read|passage|đoạn văn|thông tin|bài đọc)", text, re.IGNORECASE)
+            )
+            if not is_reading_subprompt:
+                active_stimulus_id = None
 
         elif label == "stimulus":
             stim_id = params.get("id", f"stim_{len(stimuli) + 1}")

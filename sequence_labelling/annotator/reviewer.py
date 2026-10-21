@@ -22,6 +22,7 @@ from sequence_labelling.config import (
 from sequence_labelling.llm.deepseek_client import chat
 from sequence_labelling.llm.agy_rate_limiter import is_quota_or_cap_error
 from sequence_labelling.parser.deterministic_parser import parse_chunk_deterministic
+from sequence_labelling.annotator.ocr_document import strip_page_markup
 
 # Allowed tag schema for sequence labelling & embedded markdown/HTML structure
 HTML_VOID_TAGS = {"br", "hr", "img", "col", "wbr", "input", "meta", "link"}
@@ -479,7 +480,7 @@ class DeterministicAuditor:
                 AuditIssue(
                     category="question_structure",
                     severity=IssueSeverity.CRITICAL,
-                    message="Zero questions (<question_label>) detected in document.",
+                    message="Zero questions (<question_label>) annotated in XML despite candidate question patterns in raw text. Verify if the parser erroneously omitted exam questions, or if this chunk is legitimately non-exam material (table of contents, foreword, study guide).",
                 )
             )
             return issues, 0.0, metrics
@@ -837,16 +838,7 @@ class DeterministicAuditor:
         """
         if not raw_ocr_text:
             return ""
-        # Strip <page_metadata> blocks whether closed with </page_metadata> or terminated at </page>
-        cleaned = re.sub(
-            r"<page_metadata>.*?(?:</page_metadata>|</page>)",
-            "</page>",
-            raw_ocr_text,
-            flags=re.DOTALL,
-        )
-        # Strip <pages>, </pages>, <page>, </page>
-        cleaned = re.sub(r"</?pages?>", "", cleaned)
-        return cleaned.strip()
+        return strip_page_markup(raw_ocr_text)
 
     @staticmethod
     def check_verbatim_alignment(
@@ -1416,11 +1408,12 @@ The audit algorithm will automatically compute document scores and assign penalt
 
 CRITICAL INSTRUCTION ON DUPLICATES:
 The user prompt may contain numbered findings from a deterministic parser pre-check.
-You MUST review every numbered finding and return one confirmation for each finding when possible,
-stating whether it is a true positive. Confirmed deterministic findings are already present in the
-final audit and MUST NOT be repeated in your `issues` array. The `issues` array must contain only
-new parser errors that are not represented by the deterministic findings. If a deterministic finding
-is a false positive, report that in `parser_error_confirmations`; do not copy it into `issues`.
+You MUST review every numbered finding and return one confirmation for each finding in `parser_error_confirmations`:
+- `is_true_positive: true`: Mark this ONLY IF the finding represents an ACTUAL PARSER ERROR OR DEFECT in the XML annotation.
+- `is_true_positive: false`: Mark this if the finding is a FALSE ALARM / FALSE POSITIVE. For example:
+  - If a finding claims questions are missing or zero questions were detected, but the excerpt is front matter, table of contents, preface, foreword, study guide, syllabus matrix, formula reference, or non-exam material where no actual exam questions exist: report `is_true_positive: false`. The parser was correct not to fabricate questions!
+  - If a finding flags a section header (e.g. `PHẦN 1:`, `PHẦN I`, `MỤC LỤC`) as an unannotated question: report `is_true_positive: false`.
+Confirmed deterministic findings (`is_true_positive: true`) are already present in the final audit and MUST NOT be repeated in your `issues` array. The `issues` array must contain only new parser errors that are not represented by the deterministic findings. If a deterministic finding is a false positive, report that in `parser_error_confirmations`; do not copy it into `issues`.
 
 ---
 
@@ -1607,6 +1600,7 @@ When reporting issues, you MUST categorize each error using one of the following
 7. **Grading Guides & Solution Keys (HƯỚNG DẪN CHẤM)**: All scoring guides, rubric tables, and answer keys belong in `<explanation>...</explanation>`. Tagging scoring guide rows as new exam questions (`<question_label>`, `<stem>`) is a `mislabelled_element` defect.
 8. **LaTeX Math Comparisons & Angle Brackets**: Mathematical comparisons such as `$x < 0$`, `$a > b$`, `$\\alpha < \\beta$`, or fractions inside LaTeX math spans are literal source text, NEVER XML tags. NEVER report unclosed angle brackets inside LaTeX formulas as `broken_system_tag`!
 9. **Severity Calibration on Isolated Errors**: If a formatting discrepancy is an isolated one-off occurrence (e.g. 1 question label or 1 option tag in a 40+ question document), rate it as MINOR, NOT MAJOR, to prevent compound penalty distortion on otherwise high-quality documents.
+10. **Zero Questions / Non-Exam Front Matter**: If a document or chunk consists of front matter (book cover, table of contents, foreword, user guide, exam matrix analysis, syllabus summary) and contains no actual exam questions, having 0 questions in XML is 100% CORRECT and VALID. If a deterministic finding claims zero questions or unannotated questions for such non-exam text, confirm it as a FALSE POSITIVE (`is_true_positive: false`).
 
 ---
 
@@ -1737,7 +1731,7 @@ Respond ONLY with a valid JSON object with NO markdown codeblocks or extra text:
             f"10. Documents may legitimately mix solved examples (<stem> + <explanation>) and unsolved exercises (<stem> only).\n"
             f"11. If an [AUDITOR_SAMPLING_WINDOW] comment is present, it was injected by the test auditor tool for large files; do not treat the sampling marker or jump across it as an omission or error.\n"
             f"12. Terminal Sentinel (<|END|>): Do NOT require or expect '<|END|>'. In annotated XML documents, '<|END|>' is stripped upon saving; its absence is completely normal and valid. NEVER report missing '<|END|>' as an error or truncation.\n"
-            f"13. Duplicate prevention: validate every deterministic finding in `parser_error_confirmations`; return only additional errors in `issues`.\n"
+            f"13. Deterministic Confirmations & False Positives: In `parser_error_confirmations`, mark `is_true_positive: true` ONLY IF a finding represents an ACTUAL PARSER ERROR. If a finding claims zero questions or unannotated questions, but the text is front matter, table of contents, foreword, study guide, formula summary, or non-exam material where no actual exam questions exist, report `is_true_positive: false`. The parser was correct not to fabricate questions! Return only additional errors in `issues`.\n"
             f"14. Question Labels without Stems: In cloze tests, fill-in-the-blank items, or reading passage questions with embedded blanks, questions legitimately consist of only <question_label> followed immediately by <option_label>. NEVER flag these as 'missing_stem' or as an error.\n\n"
             f"Inspect the document, confirm the supplied deterministic findings, identify only additional parser errors, and return your JSON report."
         )
@@ -2066,6 +2060,37 @@ class AnnotationReviewerAgent:
                         summary_text = "Review completed: false-positive end sentinel truncation ignored; document well-formed."
                     else:
                         summary_text = raw_summary
+
+                # Recalculate deterministic component if false positives were rejected by semantic review
+                det_unannot_issues = [iss for iss in issues if iss.category == "unannotated_question"]
+                confirmed_unannot = [iss for iss in confirmed_issues if iss.category == "unannotated_question"]
+                if det_unannot_issues:
+                    if not confirmed_unannot:
+                        det_cov_score = 100.0
+                        rubric.det_question_coverage = 100.0
+                    else:
+                        real_unannot_count = len(confirmed_unannot)
+                        total_expected = metrics.get("xml_total_questions", 0) + real_unannot_count
+                        if total_expected > 0:
+                            det_cov_score = round((metrics.get("xml_total_questions", 0) / total_expected) * 100.0, 1)
+                            rubric.det_question_coverage = det_cov_score
+
+                det_qstruct_issues = [iss for iss in issues if iss.category == "question_structure"]
+                confirmed_qstruct = [iss for iss in confirmed_issues if iss.category == "question_structure"]
+                if det_qstruct_issues and not confirmed_qstruct:
+                    s_structure = 100.0
+                    rubric.question_option_completeness = 100.0
+
+                if raw_ocr_text and raw_ocr_text.strip():
+                    det_score = (
+                        s_syntax * 0.25
+                        + det_cov_score * 0.35
+                        + verbatim_score * 0.25
+                        + s_structure * 0.15
+                    )
+                else:
+                    det_score = s_syntax * 0.60 + s_structure * 0.40
+                det_score = max(0.0, min(100.0, round(det_score, 1)))
 
                 # Weighted score: 40% deterministic rule adherence, 60% LLM semantic judgment
                 overall_score = round(det_score * 0.40 + llm_score_val * 0.60, 1)

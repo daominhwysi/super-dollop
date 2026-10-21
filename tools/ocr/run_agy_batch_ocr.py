@@ -222,6 +222,15 @@ class BatchOCRRunner:
         try:
             markdown_content, summary = self.converter.convert_document(pdf_file)
             out_file.write_text(markdown_content, encoding="utf-8")
+            try:
+                from sequence_labelling.metadata.extractor import extract_and_save_metadata
+                extract_and_save_metadata(
+                    ocr_markdown=markdown_content,
+                    filename=pdf_file.name,
+                    doc_id=doc_stem,
+                )
+            except Exception as meta_err:
+                logger.warning(f"Post-OCR metadata extraction skipped/failed for '{doc_stem}': {meta_err}")
             return True, str(out_file), summary
         except Agy5HourCapError as e:
             # Re-raise cap errors directly to trigger batch-level sleep

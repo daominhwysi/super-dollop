@@ -29,10 +29,16 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_DIR))
 
 from sequence_labelling.annotator.annotate_ocr import parse_xml_annotations
+from sequence_labelling.annotator.anchor_helper import AnchorHelper
 from synthetic_exam_generator.reconstructor import (
     reconstruct_exam,
     spans_to_xml,
     ReconstructorConfig,
+)
+from synthetic_exam_generator.hard_negative_injector import (
+    HardNegativeBank,
+    SyntheticHardNegativeInjector,
+    InjectionConfig,
 )
 
 # Standard tags to include in sequence labeling
@@ -65,121 +71,10 @@ def load_gold_set_exclusion(gold_path: Path) -> set:
 
 def expand_stimulus_anchors(xml_content: str) -> str:
     """
-    Expands compact self-closing stimulus anchors:
-        <stimulus id="..." start_anchor="..." end_anchor="..." />
-    into full paired XML tags:
-        <stimulus>passage_text</stimulus>
-    so that parse_xml_annotations() extracts them as genuine stimulus spans
-    rather than discarding them and marking reading comprehension tokens as 'O'.
+    Expands compact self-closing stimulus anchors into full paired XML tags
+    using the canonical AnchorHelper implementation.
     """
-    import html
-
-    def _clean_anchor_text(text: str) -> str:
-        text = html.unescape(text)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"[\*_#`]", " ", text)
-        return text.strip()
-
-    def _find_probe_match(probe_words: List[str], search_text: str):
-        if not probe_words:
-            return None
-        for n in range(min(4, len(probe_words)), 0, -1):
-            pat = r"\s*".join(re.escape(w) for w in probe_words[:n])
-            m = re.search(pat, search_text, re.IGNORECASE)
-            if m:
-                return m
-            stripped = [re.sub(r"^[^\w]+|[^\w]+$", "", w) for w in probe_words[:n]]
-            stripped = [w for w in stripped if w]
-            if stripped:
-                pat2 = r"\s*".join(re.escape(w) for w in stripped)
-                m = re.search(pat2, search_text, re.IGNORECASE)
-                if m:
-                    return m
-        return None
-
-    def _find_end_probe_match(probe_words: List[str], search_text: str):
-        if not probe_words:
-            return None
-        for n in range(min(4, len(probe_words)), 0, -1):
-            sub = probe_words[-n:]
-            pat = r"\s*".join(re.escape(w) for w in sub)
-            m = re.search(pat, search_text, re.IGNORECASE)
-            if m:
-                return m
-            stripped = [re.sub(r"^[^\w]+|[^\w]+$", "", w) for w in sub]
-            stripped = [w for w in stripped if w]
-            if stripped:
-                pat2 = r"\s*".join(re.escape(w) for w in stripped)
-                m = re.search(pat2, search_text, re.IGNORECASE)
-                if m:
-                    return m
-        return None
-
-    matches = list(re.finditer(r"<stimulus\b([^>]*?)/>", xml_content))
-    if not matches:
-        return xml_content
-
-    modified_xml = xml_content
-    # Process backwards so character modifications do not invalidate earlier offsets
-    for m in reversed(matches):
-        attr_str = m.group(1)
-        s_m = re.search(r'start_anchor="([^"]*)"', attr_str)
-        e_m = re.search(r'end_anchor="([^"]*)"', attr_str)
-        tag_start, tag_end = m.span()
-
-        if not (s_m and e_m):
-            modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-            continue
-
-        sa = _clean_anchor_text(s_m.group(1))
-        ea = _clean_anchor_text(e_m.group(1))
-
-        s_words = [w for w in sa.split() if w]
-        e_words = [w for w in ea.split() if w]
-        if not s_words or not e_words:
-            modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-            continue
-
-        # Search after tag_end first to avoid matching inside attribute string; fall back to tag_start
-        search_region = modified_xml[tag_end:]
-        s_match = _find_probe_match(s_words, search_region)
-        offset_base = tag_end
-        if not s_match:
-            search_region = modified_xml[tag_start:]
-            s_match = _find_probe_match(s_words, search_region)
-            offset_base = tag_start
-
-        if not s_match:
-            modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-            continue
-
-        abs_passage_start = offset_base + s_match.start()
-        if tag_start <= abs_passage_start < tag_end:
-            modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-            continue
-
-        after_start_region = modified_xml[abs_passage_start:]
-        e_match = _find_end_probe_match(e_words, after_start_region)
-        if not e_match:
-            modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-            continue
-
-        abs_passage_end = abs_passage_start + e_match.end()
-        passage_text = modified_xml[abs_passage_start:abs_passage_end]
-        wrapped = f"<stimulus>{passage_text}</stimulus>"
-
-        if abs_passage_start >= tag_end:
-            before_tag = modified_xml[:tag_start]
-            between_tag_and_passage = modified_xml[tag_end:abs_passage_start]
-            after_passage = modified_xml[abs_passage_end:]
-            modified_xml = before_tag + between_tag_and_passage + wrapped + after_passage
-        else:
-            before_passage = modified_xml[:abs_passage_start]
-            between_passage_and_tag = modified_xml[abs_passage_end:tag_start]
-            after_tag = modified_xml[tag_end:]
-            modified_xml = before_passage + wrapped + between_passage_and_tag + after_tag
-
-    return modified_xml
+    return AnchorHelper.expand_stimulus_anchors(xml_content)
 
 
 def tokenize_with_offsets(text: str) -> Tuple[List[str], List[Tuple[int, int]]]:
@@ -549,12 +444,13 @@ def process_synthetic_exams(
     synthetic_dir: Path,
     target_count: Optional[int] = None,
     seed: int = 42,
-    config: Optional[ReconstructorConfig] = None
-) -> List[Dict[str, Any]]:
+    config: Optional[ReconstructorConfig] = None,
+    injector: Optional[SyntheticHardNegativeInjector] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
     """Loads and compiles synthetic curriculum exams into sequence-labelled documents."""
     exam_files = sorted(synthetic_dir.glob("*.json"))
     if not exam_files:
-        return []
+        return [], 0
 
     rng = random.Random(seed)
     rng.shuffle(exam_files)
@@ -581,14 +477,29 @@ def process_synthetic_exams(
     )
 
     records = []
+    injected_count = 0
     for f in exam_files:
         try:
+            # Read-only access: files in synthetic_dir are never modified on disk
             exam_data = json.loads(f.read_text(encoding="utf-8"))
             reconstructed = reconstruct_exam(exam_data, cfg)
             raw_text = reconstructed.get("raw_text", "")
             spans = reconstructed.get("spans", [])
             if not raw_text.strip() or not spans:
                 continue
+
+            was_injected = False
+            if injector is not None:
+                subject = exam_data.get("subject", "general")
+                raw_text, spans, was_injected = injector.inject_into_reconstructed_exam(
+                    raw_text,
+                    spans,
+                    subject=subject,
+                    rng=rng,
+                    include_span_text=cfg.include_span_text,
+                )
+                if was_injected:
+                    injected_count += 1
 
             xml_content = spans_to_xml(raw_text, spans)
             records.append({
@@ -598,12 +509,13 @@ def process_synthetic_exams(
                 "raw_text": raw_text,
                 "xml_content": xml_content,
                 "spans": spans,
-                "score": 100.0
+                "score": 100.0,
+                "hard_negative_injected": was_injected,
             })
         except Exception as e:
             print(f"Error compiling synthetic exam {f.name}: {e}")
 
-    return records
+    return records, injected_count
 
 
 def process_gold_benchmark_documents(
@@ -772,6 +684,29 @@ def main():
         help="Probability of prepending untagged administrative school headers in synthetic exams"
     )
     parser.add_argument(
+        "--synthetic-hard-negative-dir",
+        type=str,
+        default="data/synthetic_hard_negative",
+        help="Path to modular synthetic hard-negative directory (default: data/synthetic_hard_negative)"
+    )
+    parser.add_argument(
+        "--synthetic-hard-negative-prob",
+        type=float,
+        default=None,
+        help="Probability of injecting a hard-negative module into a synthetic exam (default: from config/profile or 0.35)"
+    )
+    parser.add_argument(
+        "--synthetic-hard-negative-max-chars",
+        type=int,
+        default=None,
+        help="Maximum character length of an injected hard-negative module (default: from config or 1500)"
+    )
+    parser.add_argument(
+        "--disable-hard-negative-injection",
+        action="store_true",
+        help="Disable synthetic hard-negative module injection completely"
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default="configs/augmentation_config.yaml",
@@ -882,6 +817,40 @@ def main():
         admin_sec = yaml_cfg["synthetic_data"]["administrative_headers"]
         synth_admin_prob = float(admin_sec.get("probability", 0.40)) if admin_sec.get("enabled", True) else 0.0
 
+    # Resolve synthetic hard-negative injection parameters
+    hard_neg_dir = WORKSPACE_DIR / args.synthetic_hard_negative_dir
+    synth_hn_enabled = not args.disable_hard_negative_injection
+
+    synth_hn_prob = 0.35
+    if args.synthetic_hard_negative_prob is not None:
+        synth_hn_prob = args.synthetic_hard_negative_prob
+    elif "synthetic_hard_negative_prob" in profile_data:
+        synth_hn_prob = float(profile_data["synthetic_hard_negative_prob"])
+    elif "synthetic_data" in yaml_cfg and "hard_negative_injection" in yaml_cfg["synthetic_data"]:
+        hn_sec = yaml_cfg["synthetic_data"]["hard_negative_injection"]
+        synth_hn_prob = float(hn_sec.get("probability", 0.35))
+        synth_hn_enabled = synth_hn_enabled and bool(hn_sec.get("enabled", True))
+
+    synth_hn_max_chars = 1500
+    if args.synthetic_hard_negative_max_chars is not None:
+        synth_hn_max_chars = args.synthetic_hard_negative_max_chars
+    elif "synthetic_data" in yaml_cfg and "hard_negative_injection" in yaml_cfg["synthetic_data"]:
+        hn_sec = yaml_cfg["synthetic_data"]["hard_negative_injection"]
+        synth_hn_max_chars = int(hn_sec.get("max_chars", 1500))
+
+    injector = None
+    if synth_hn_enabled and hard_neg_dir.exists() and synth_hn_prob > 0.0:
+        bank = HardNegativeBank(hard_neg_dir)
+        inj_cfg = InjectionConfig(
+            enabled=True,
+            injection_prob=synth_hn_prob,
+            max_module_chars=synth_hn_max_chars,
+        )
+        injector = SyntheticHardNegativeInjector(bank, inj_cfg)
+        print(f"Synthetic Hard-Negative Injection: ENABLED (prob={synth_hn_prob:.2f}, bank={hard_neg_dir.name})")
+    else:
+        print(f"Synthetic Hard-Negative Injection: DISABLED (dir_exists={hard_neg_dir.exists()}, prob={synth_hn_prob:.2f})")
+
     # Resolve multi-scale sliding window configurations (512 to 2048)
     window_configs = []
     if args.window_configs:
@@ -950,13 +919,14 @@ def main():
         admin_header_prob=synth_admin_prob
     )
     
-    synthetic_records = process_synthetic_exams(
+    synthetic_records, num_injected = process_synthetic_exams(
         synthetic_dir,
         target_count=target_synthetic,
         seed=args.seed,
-        config=synth_cfg
+        config=synth_cfg,
+        injector=injector,
     )
-    print(f"Compiled {len(synthetic_records)} synthetic training documents.")
+    print(f"Compiled {len(synthetic_records)} synthetic training documents ({num_injected} with injected hard negatives).")
 
     # 4. Merge and Shuffle Documents
     all_documents = real_records + synthetic_records
@@ -1025,6 +995,9 @@ def main():
                 for c in chunks:
                     c["window_size"] = chunk_size
                     c["stride"] = stride
+                    c["source"] = doc["source"]
+                    if doc.get("hard_negative_injected"):
+                        c["hard_negative_injected"] = True
                     f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     # 6. Build Gold Benchmark Test/Validation Outputs (100% pristine, 0 noise)
@@ -1099,6 +1072,8 @@ def main():
             "real_augmented_documents": num_augmented,
             "real_whitespace_aug_prob": args.real_whitespace_aug_prob,
             "synthetic_documents": len(synthetic_records),
+            "synthetic_hard_negative_injected_documents": num_injected if injector else 0,
+            "synthetic_hard_negative_prob": synth_hn_prob if injector else 0.0,
             "synthetic_ratio": round(len(synthetic_records) / len(all_documents), 4) if all_documents else 0.0,
             "synthetic_admin_header_prob": synth_admin_prob,
             "total_tokens": total_tokens,

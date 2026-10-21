@@ -123,6 +123,15 @@ synthetic_data:
     latex_mask_prob: 0.05             # 5% LaTeX formula placeholder / delimiter variation
     latex_placeholder: "[LATEX]"
 
+  # D. Adversarial Hard-Negative Expository Injection
+  # Splices modular definitions, formula cards, and outlines directly into synthetic exams
+  # to train the model on background 'O' expository prose without false-positive question detection.
+  hard_negative_injection:
+    enabled: true
+    probability: 0.35                 # 35% of synthetic exams receive an injected module
+    max_chars: 1500                   # Bounded token length (~300-350 tokens)
+    data_dir: "data/synthetic_hard_negative"
+
 # ------------------------------------------------------------------------------
 # 4. NAMED CONFIGURATION PROFILES
 # ------------------------------------------------------------------------------
@@ -135,6 +144,7 @@ profiles:
     real_flatten_newlines_prob: 0.20
     synthetic_flatten_newlines_prob: 0.20
     synthetic_collapse_whitespace_prob: 0.15
+    synthetic_hard_negative_prob: 0.35
     inline_option_prob: 0.35
     grid_2x2_prob: 0.20
     typo_rate: 0.015
@@ -148,6 +158,7 @@ profiles:
     real_flatten_newlines_prob: 0.00
     synthetic_flatten_newlines_prob: 0.00
     synthetic_collapse_whitespace_prob: 0.00
+    synthetic_hard_negative_prob: 0.15
     inline_option_prob: 0.15
     grid_2x2_prob: 0.10
     typo_rate: 0.005
@@ -161,6 +172,7 @@ profiles:
     real_flatten_newlines_prob: 0.30
     synthetic_flatten_newlines_prob: 0.25
     synthetic_collapse_whitespace_prob: 0.35
+    synthetic_hard_negative_prob: 0.50
     inline_option_prob: 0.60
     grid_2x2_prob: 0.35
     typo_rate: 0.035

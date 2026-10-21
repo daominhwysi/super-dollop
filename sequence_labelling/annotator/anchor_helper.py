@@ -173,3 +173,131 @@ class AnchorHelper:
         updated_xml = stim_id_pattern.sub(renumber_stim, updated_xml)
 
         return updated_xml, fixes
+
+    @classmethod
+    def expand_stimulus_anchors(cls, xml_content: str) -> str:
+        """
+        Expands compact self-closing stimulus anchors:
+            <stimulus id="..." start_anchor="..." end_anchor="..." />
+        into full paired XML tags:
+            <stimulus id="...">passage_text</stimulus>
+        so that parse_xml_annotations() extracts them as genuine stimulus spans
+        rather than discarding them and marking reading comprehension tokens as 'O'.
+        """
+        import html
+
+        def _clean_anchor_text(text: str) -> str:
+            text = html.unescape(text)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"[\*_#`]", " ", text)
+            return text.strip()
+
+        def _find_probe_match(probe_words: List[str], search_text: str):
+            if not probe_words:
+                return None
+            for n in range(min(4, len(probe_words)), 0, -1):
+                pat = r"\s*".join(re.escape(w) for w in probe_words[:n])
+                m = re.search(pat, search_text, re.IGNORECASE)
+                if m:
+                    return m
+                stripped = [re.sub(r"^[^\w]+|[^\w]+$", "", w) for w in probe_words[:n]]
+                stripped = [w for w in stripped if w]
+                if stripped:
+                    pat2 = r"\s*".join(re.escape(w) for w in stripped)
+                    m = re.search(pat2, search_text, re.IGNORECASE)
+                    if m:
+                        return m
+            return None
+
+        def _find_end_probe_match(probe_words: List[str], search_text: str):
+            if not probe_words:
+                return None
+            for n in range(min(4, len(probe_words)), 0, -1):
+                sub = probe_words[-n:]
+                pat = r"\s*".join(re.escape(w) for w in sub)
+                m = re.search(pat, search_text, re.IGNORECASE)
+                if m:
+                    return m
+                stripped = [re.sub(r"^[^\w]+|[^\w]+$", "", w) for w in sub]
+                stripped = [w for w in stripped if w]
+                if stripped:
+                    pat2 = r"\s*".join(re.escape(w) for w in stripped)
+                    m = re.search(pat2, search_text, re.IGNORECASE)
+                    if m:
+                        return m
+            return None
+
+        matches = list(re.finditer(r"<stimulus\b([^>]*?)/>", xml_content))
+        if not matches:
+            return xml_content
+
+        modified_xml = xml_content
+        # Process backwards so character modifications do not invalidate earlier offsets
+        for m in reversed(matches):
+            attr_str = m.group(1)
+            id_m = re.search(r'id="([^"]*)"', attr_str)
+            stim_id = id_m.group(1) if id_m else "stim_1"
+            s_m = re.search(r'start_anchor="([^"]*)"', attr_str)
+            e_m = re.search(r'end_anchor="([^"]*)"', attr_str)
+            tag_start, tag_end = m.span()
+
+            if not (s_m and e_m):
+                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                continue
+
+            sa = _clean_anchor_text(s_m.group(1))
+            ea = _clean_anchor_text(e_m.group(1))
+
+            s_words = [w for w in sa.split() if w]
+            e_words = [w for w in ea.split() if w]
+            if not s_words or not e_words:
+                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                continue
+
+            # Search after tag_end first to avoid matching inside attribute string; fall back to tag_start
+            search_region = modified_xml[tag_end:]
+            s_match = _find_probe_match(s_words, search_region)
+            offset_base = tag_end
+            if not s_match:
+                search_region = modified_xml[tag_start:]
+                s_match = _find_probe_match(s_words, search_region)
+                offset_base = tag_start
+
+            if not s_match:
+                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                continue
+
+            abs_passage_start = offset_base + s_match.start()
+            if tag_start <= abs_passage_start < tag_end:
+                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                continue
+
+            after_start_region = modified_xml[abs_passage_start:]
+            e_match = _find_end_probe_match(e_words, after_start_region)
+            if not e_match:
+                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                continue
+
+            abs_passage_end = abs_passage_start + e_match.end()
+
+            # Ensure abs_passage_end does not cut an existing XML tag (e.g. <figure ... />) in half
+            open_b = modified_xml.rfind("<", 0, abs_passage_end)
+            close_b = modified_xml.rfind(">", 0, abs_passage_end)
+            if open_b > close_b:
+                next_close = modified_xml.find(">", abs_passage_end)
+                if next_close != -1:
+                    abs_passage_end = next_close + 1
+
+            passage_text = modified_xml[abs_passage_start:abs_passage_end]
+            wrapped = f'<stimulus id="{stim_id}">{passage_text}</stimulus>'
+
+            if abs_passage_start >= tag_end:
+                before_tag = modified_xml[:tag_start]
+                between_tag_and_passage = modified_xml[tag_end:abs_passage_start]
+                after_passage = modified_xml[abs_passage_end:]
+                modified_xml = before_tag + between_tag_and_passage + wrapped + after_passage
+            else:
+                # If passage overlapped before or around the tag
+                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+
+        return modified_xml

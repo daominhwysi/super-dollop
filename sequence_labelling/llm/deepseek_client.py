@@ -287,6 +287,14 @@ def chat(
         if aixingialaire_client is None:
             raise ValueError("Error: Provider requires AIXINGIALAIRE_API_KEY but it is not set.")
         active_client = aixingialaire_client
+        effort = None
+        if thinking is True:
+            effort = "high"
+        elif isinstance(thinking, str) and thinking in ["low", "medium", "high", "max"]:
+            effort = thinking
+
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
 
     else:
         if deepseek_client is None:

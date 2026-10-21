@@ -23,6 +23,7 @@ from sequence_labelling.config import (
     CHUNKER_MAX_TOKENS,
     CHUNKER_OVERLAP_PAGES,
 )
+from sequence_labelling.annotator.ocr_document import OCRDocument
 from sequence_labelling.parser.long_parser.sequence_reconciler import (
     DocumentStateStack,
     extract_metadata_headers_from_markdown,
@@ -41,27 +42,12 @@ from sequence_labelling.llm.agy_rate_limiter import Agy5HourCapError
 
 def extract_pages_from_markdown(full_markdown: str) -> List[str]:
     """
-    Extracts page blocks from OCR/markdown text using <page>...</page> tags, or falls back to page dividers.
+    Extracts page blocks from OCR/markdown text using OCRDocument.
     """
     if not full_markdown:
         return []
-
-    cleaned = re.sub(r"^\s*<\s*/?pages\s*>\s*", "", full_markdown.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*<\s*/?\s*pages\s*>\s*$", "", cleaned, flags=re.IGNORECASE).strip()
-
-    # Split on <page> or </page> tags to cleanly isolate page blocks even if unclosed
-    if re.search(r"</?page(?:\s+[^>]*)?>", cleaned, flags=re.IGNORECASE):
-        blocks = [b.strip() for b in re.split(r"</?page(?:\s+[^>]*)?>", cleaned, flags=re.IGNORECASE) if b.strip()]
-        if blocks:
-            return blocks
-
-    # Fallback to double newline page separator if no <page> tags present
-    if PAGE_SEPARATOR in cleaned:
-        blocks = [b.strip() for b in cleaned.split(PAGE_SEPARATOR) if b.strip()]
-        if blocks:
-            return blocks
-
-    return [cleaned] if cleaned else []
+    doc = OCRDocument.from_markdown(full_markdown)
+    return [p.raw_text for p in doc.pages]
 
 
 def process_single_document(
@@ -83,45 +69,12 @@ def process_single_document(
     """
     start_time = time.time()
     doc_id = f"doc_{uuid.uuid4().hex[:8]}"
-    full_text = file_path.read_text(encoding="utf-8")
 
-    metadata_headers = extract_metadata_headers_from_markdown(full_text)
+    ocr_doc = OCRDocument.from_file(file_path)
+    metadata_headers = ocr_doc.page_metadata_list
     state_stack = DocumentStateStack(doc_id=doc_id)
     completed_groups = state_stack.process_metadata_stream(metadata_headers)
-
-    raw_pages = extract_pages_from_markdown(full_text)
-    page_list = []
-    global_offset = 0
-    for idx, p_text in enumerate(raw_pages):
-        if not p_text.strip():
-            continue
-        meta = metadata_headers[idx] if idx < len(metadata_headers) else {}
-        text_body = re.sub(
-            r"<page_metadata>.*?(?:</page_metadata>|(?=</page>)|$)",
-            "",
-            p_text,
-            flags=re.DOTALL | re.IGNORECASE,
-        ).strip()
-        # Prune any stray or unclosed <page> / </page> tags originating from raw OCR
-        text_body = re.sub(
-            r"</?pages?(?:\s+[^>]*)?>",
-            "",
-            text_body,
-            flags=re.IGNORECASE,
-        ).strip()
-        if page_list:
-            global_offset += len(PAGE_SEPARATOR)
-        page_start = global_offset
-        global_offset += len(text_body)
-        page_list.append({
-            "p": meta.get("p", idx + 1),
-            "text": text_body,
-            "estimated_tokens": max(50, len(p_text.split())),
-            "head": meta.get("head", "CLEAN"),
-            "tail": meta.get("tail", "CLEAN"),
-            "global_start": page_start,
-            "global_end": global_offset,
-        })
+    page_list = ocr_doc.to_chunk_pages()
 
     # --- Step 1: Chunker ---
     chunks = greedy_oversize_chunker(
