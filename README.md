@@ -105,16 +105,22 @@ An annotated document commonly contains:
 
 `merged.xml` is the source-preserving sequence-labelled representation. `merged.json` contains structured questions and stimuli derived from the XML. The merger validates that removing annotation tags reproduces the canonical source text.
 
-## End-to-end batch workflow
+## End-to-end batch workflow (Unified `vsl` CLI)
+
+The project provides a unified CLI tool `vsl` (also accessible as `sequence-label` or `python -m sequence_labelling.cli`) that wraps the end-to-end dataset pipeline:
+
+```bash
+# Check status across OCR, annotation, quality review, and branch staging
+uv run vsl status
+```
 
 ### 1. OCR PDFs or images
 
 ```bash
-uv run python tools/ocr/batch_ocr_raw_dataset.py \
+uv run vsl ocr \
   --raw-dir data/sequence_labelling_input_data_raw \
   --out-dir data/sequence_labelling_input_data \
-  --provider codex \
-  --concurrency 1
+  --concurrency 2
 ```
 
 Use `--overwrite` only when intentionally regenerating existing Markdown. The OCR stage supports PDF and common image formats and emits page-aware Markdown with figure metadata where configured.
@@ -122,26 +128,26 @@ Use `--overwrite` only when intentionally regenerating existing Markdown. The OC
 ### 2. Annotate OCR Markdown
 
 ```bash
-uv run python tools/annotation/annotate_sequence_labelling_dataset.py \
-  --input_dir data/sequence_labelling_input_data \
-  --output_dir data/sequence_labelling_annotated \
+uv run vsl parse \
+  --raw-dir data/sequence_labelling_input_data \
+  --annotated-dir data/sequence_labelling_annotated \
   --provider agy \
   --model gemini-3.8-flash \
   --concurrency 4
 ```
 
-The tool skips documents with existing `merged.json` unless `--overwrite` is supplied. Use `--pattern`, `--limit`, and smaller token budgets for controlled experiments.
+The tool skips documents with existing `merged.json` unless `--overwrite` is supplied. Use `--limit` and concurrency settings for controlled batches.
 
 ### 3. Audit the annotated dataset
 
 ```bash
-uv run python tools/review/batch_review_annotated.py \
+uv run vsl audit \
   --annotated-dir data/sequence_labelling_annotated \
   --raw-dir data/sequence_labelling_input_data \
   --provider codex \
   --model gpt-5.6-luna \
   --thinking high \
-  --output-report artifacts/review_report.md
+  --out-report artifacts/review_report.md
 ```
 
 The reviewer writes a Markdown report and a JSON report beside the requested output. Existing per-document `audit_report.json` files are reused unless `--overwrite` is supplied.
@@ -149,7 +155,7 @@ The reviewer writes a Markdown report and a JSON report beside the requested out
 For a fast deterministic-only audit:
 
 ```bash
-uv run python tools/review/batch_review_annotated.py \
+uv run vsl audit \
   --annotated-dir data/sequence_labelling_annotated \
   --raw-dir data/sequence_labelling_input_data \
   --no-llm
@@ -160,14 +166,14 @@ uv run python tools/review/batch_review_annotated.py \
 The editor/reviewer loop never overwrites the canonical annotated directory. It writes candidates and checkpoint artifacts to the branch directory.
 
 ```bash
-uv run python tools/review/edit_review_set.py \
+uv run vsl repair \
   --report data/review_report.json \
   --filter needs_revision \
   --concurrency 4 \
   --reuse-prerun-logs \
   --auto-save \
   --branch-dir data/sequence_labelling_annotated_branch \
-  --out-report artifacts/revision_resolution_report.json
+  --out-report artifacts/reports/revision_resolution_report.json
 ```
 
 Safe continuation is the default:
@@ -192,40 +198,36 @@ Each resumed document can contain:
     └── round_001.json
 ```
 
-The aggregate report is checkpointed as documents finish. To keep a long run alive after disconnecting from a shell:
+The aggregate report is checkpointed as documents finish. Any `vsl` command can run inside a detached background TMUX session by appending `--tmux [SESSION_NAME]`:
 
 ```bash
-tmux new-session -d -s sequence-review \
-  'uv run python tools/review/edit_review_set.py --report data/review_report.json --filter needs_revision --concurrency 4 --reuse-prerun-logs --auto-save --branch-dir data/sequence_labelling_annotated_branch --out-report artifacts/revision_resolution_report.json 2>&1 | tee artifacts/full_revision_loop.log'
+# Launch in detached background tmux session
+uv run vsl repair --tmux vsl-repair --filter needs_revision --concurrency 4
 
-tmux attach -t sequence-review
+# Inspect, attach, tail logs, or kill TMUX sessions directly
+uv run vsl tmux list
+uv run vsl tmux attach vsl-repair
+uv run vsl tmux logs vsl-repair
+uv run vsl tmux kill vsl-repair
 ```
 
-### 5. Reparse failed documents
+### 5. Merge approved branch repairs to canonical dataset
 
 ```bash
-uv run python tools/review/reparse_review_set.py \
-  --report data/review_report.json \
-  --filter all_failures \
-  --raw-dir data/sequence_labelling_input_data \
-  --output-dir data/sequence_labelling_annotated \
-  --provider agy \
-  --model gemini-3.8-flash
+uv run vsl branch merge \
+  --branch-dir data/sequence_labelling_annotated_branch \
+  --target-dir data/sequence_labelling_annotated
 ```
 
-For a combined reparse-and-review workflow:
+### 6. Build Token Classification & Span Training Splits
 
 ```bash
-uv run python tools/review/reparse_and_review.py \
-  --report data/review_report.json \
-  --filter all_failures \
-  --stage all \
-  --out-report artifacts/ocr_logs/reparse_and_review_report.json
+uv run vsl dataset build \
+  --output-dir data/dataset_training_splits \
+  --synthetic-ratio 0.2
 ```
 
-Use `--stage reparse-only`, `--stage review-only`, `--doc-id`, `--limit`, or `--dry-run` to narrow the operation.
-
-### 6. Re-merge annotation chunks
+### 7. Re-merge annotation chunks (Source Merger)
 
 ```bash
 uv run python tools/annotation/remerge_annotated_dataset.py \

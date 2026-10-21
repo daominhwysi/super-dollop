@@ -109,25 +109,33 @@ The system operates as an end-to-end pipeline designed to ingest unstructured Vi
 ```
 [Raw Exam PDFs/Images]
          │
-         ▼  (tools/ocr/batch_ocr_raw_dataset.py / sequence_labelling/annotator/pdf_converter.py)
-[Standardized Page-Aware Markdown with OCR Metadata]
+         ▼  (tools/ocr/run_agy_batch_ocr.py / sequence_labelling/annotator/agy_pdf_ocr.py)
+[Standardized Page-Aware Markdown with OCR & Exam Metadata (Subject, Grade, Year)]
+         │
+         ▼  (sequence_labelling/parser/long_parser/document_cartographer.py)
+[Stage 1: Document Cartographer] (Gemini 3.8 Flash High / GPT-5.6 Luna)
+   │ Emits Top-Down Spatial Manifest: Sections, Stimuli [p_start, p_end], Questions Q(1)[1,1], Q(3)[1,2]
+   │ Computes clean_cut_seams where zero entities or stimuli are severed across page boundaries
          │
          ▼  (sequence_labelling/parser/long_parser/greedy_chunker.py)
-[Passage-Locked Chunks (Target ~4K, Max ~6.5K Tokens)]
+[Stage 2: Cartography-Locked Chunks] (Target ~4K, Max ~6.5K Tokens, Snapped to Clean Seams)
          │
          ├──► [Deterministic Parser] (sequence_labelling/parser/deterministic_parser.py) ──► Fast Path (<0.5ms)
          │
          ▼  (sequence_labelling/parser/long_parser/parser_agent_worker.py)
-[LLM Parser Worker / Anchored XML Parser] (Gemini 3.8 Flash High / GPT-5.6 Luna)
+[Stage 3: Parallel LLM Parser Workers] (Gemini 3.8 Flash High / GPT-6 Luna)
+   │ Surgically annotates chunks with character-exact XML tags; emits verbatim paired <stimulus> tags
          │
          ▼  (sequence_labelling/parser/long_parser/sequence_reconciler.py & source_merger/)
-[Full Reconciled & Merged Exam Annotations (merged.xml, merged.json)]
+[Stage 4: Reconciled & Merged Exam Annotations (merged.xml, merged.json)]
+   │ Enforces stimulus multi-question rule globally (≥2 questions = <stimulus>, 1 question = fold to stem)
          │
-         ▼  (tools/review/batch_review_annotated.py / sequence_labelling/annotator/reviewer.py)
-[Deterministic Auditor + LLM Semantic Reviewer] ──► Score [0-100] & Routing (PASS / NEEDS_REVISION / DISCARD)
+         ▼  (sequence_labelling/annotator/reviewer.py)
+[Stage 5: Cartography-Audited Reviewer] ──► Score [0-100] & Routing (PASS / NEEDS_REVISION / DISCARD)
+   │ Audits 100% recall against Cartographer Manifest: flags any missing Q or severed stimulus
          │
          ▼  (tools/review/edit_review_set.py / sequence_labelling/annotator/editor.py)
-[Surgical Editor Loop] (Isolated branch repair in data/sequence_labelling_annotated_branch/)
+[Stage 6: Surgical Editor Loop] (Isolated branch repair in data/sequence_labelling_annotated_branch/)
          │
          ▼  (tools/annotation/merge_branch_to_annotated.py)
 [Canonical Verified Dataset (data/sequence_labelling_annotated/)]
@@ -167,7 +175,8 @@ vietnamese-sequence-labelling-v2/
 │   ├── parser/                              # Parsing engines and reconciliation algorithms
 │   │   ├── deterministic_parser.py          # Pure regex/interval parser for zero text corruption (<0.5ms)
 │   │   └── long_parser/                     # Long-context multi-chunk parser framework
-│   │       ├── greedy_chunker.py            # Passage-locked page chunking avoiding cross-question splits
+│   │       ├── document_cartographer.py     # Top-down topological cartographer emitting page-span manifests
+│   │       ├── greedy_chunker.py            # Cartography-locked page chunking avoiding cross-question splits
 │   │       ├── parser_agent_worker.py       # Worker wrapping LLM calls for XML annotation extraction
 │   │       ├── anchored_xml_llm_parser.py   # Self-closing stimulus anchor tag parsing and reconciliation
 │   │       ├── sequence_reconciler.py       # Inter-chunk state stack and boundary seam reconciler
@@ -206,10 +215,8 @@ vietnamese-sequence-labelling-v2/
 │
 ├── tools/                                   # Categorized operational CLI tools and batch workflows
 │   ├── ocr/                                 # Document ingestion and Vision OCR batch tooling
-│   │   ├── batch_ocr_raw_dataset.py         # Batch PDF OCR runner producing page-level Markdown
 │   │   ├── run_agy_batch_ocr.py             # Multi-worker AGY OCR orchestrator with auto-cap recovery
 │   │   ├── check_batch_status.py            # Real-time terminal status inspector for batch OCR runs
-│   │   ├── convert_pdfs_to_markdown.py      # Digital PDF-to-Markdown converter with math preservation
 │   │   ├── classify_raw_pdfs.py             # PDF classifier (scanned vs digital vs hybrid)
 │   │   └── curate_500_diverse_pdfs.py       # Stratified diversity sampler and deduplicator for exams
 │   │
@@ -222,7 +229,6 @@ vietnamese-sequence-labelling-v2/
 │   │   └── merge_branch_to_annotated.py     # Safely merges approved branch candidates to canonical data
 │   │
 │   ├── review/                              # Quality auditing, surgical editing, and remediation
-│   │   ├── batch_review_annotated.py        # Batch reviewer executing deterministic + LLM audit
 │   │   ├── edit_review_set.py               # Surgical Editor/Reviewer revision loop on branch files
 │   │   ├── reparse_review_set.py            # Reparses failing documents directly from raw Markdown
 │   │   ├── reparse_and_review.py            # Unified end-to-end reparse, audit, and comparison pipeline
@@ -277,5 +283,71 @@ vietnamese-sequence-labelling-v2/
     ├── sequence_labelling_annotated/        # Canonical annotated ground truth XML and structured JSON
     └── sequence_labelling_annotated_branch/ # Disposable staging branch for surgical editor candidate repairs
 ```
+
+---
+
+## 8. Document Cartography & Topological Boundary Invariants
+
+> [!IMPORTANT]
+> **Stage 1 Document Cartography Invariant**:
+> 
+> 1. **Clean-Cut Seams Enforced**: Chunker cuts must never split an active question (`Q(3) [1, 2]`) or a stimulus group (`[Stimulus ... Last Question]`) across chunk boundaries. All chunk divisions must snap strictly to `clean_cut_seams` determined by `DocumentCartographer`.
+> 2. **Top-Down Sequential Stream**: The Cartographer scans the document top-to-bottom in physical reading order, outputting objects with exact page spans `[start_page, end_page]`.
+> 3. **Global Multi-Question Stimulus Resolution**:
+>    - Chunk workers in Stage 3 emit candidate `<stimulus id="...">` tags without guessing about future unseen pages.
+>    - The global Source Merger (Stage 4) verifies question counts across the entire document:
+>      - Count $\ge 2$: Preserved as `<stimulus id="...">`.
+>      - Count $== 1$: Safely collapsed into that single question's `<stem>`.
+> 4. **Deterministic Recall Auditing**: The Reviewer (Stage 5) uses the Cartographer's manifest as an authoritative pre-scan ground truth to verify 100% question recall. Any question present in the manifest but missing from the parsed XML is flagged immediately.
+
+---
+
+## 9. Isolated Staging Invariant: All Edits and Candidate Reparses Route to Branch
+
+> [!IMPORTANT]
+> **All surgical edits, defect remediation loops, and candidate re-annotations MUST ALWAYS be routed to `data/sequence_labelling_annotated_branch/`.**
+>
+> Under NO circumstances should any autonomous agent, tool, or reparse script overwrite canonical `data/sequence_labelling_annotated/` in-place without an isolated branch staging and verification step.
+>
+> ### Core Invariants:
+> 1. **Isolated Branch Staging**:
+>    - All `EditorAgent` surgical repairs, multi-round reviewer loops, and chunk/document re-annotations MUST output directly to `data/sequence_labelling_annotated_branch/<doc_id>/`.
+>    - Canonical `data/sequence_labelling_annotated/` remains an immutable production baseline during repair and reparse operations.
+> 2. **Audited Merge Protocol**:
+>    - Repaired or re-annotated files can only be merged into canonical `data/sequence_labelling_annotated/` using the verified merge gate:
+>      ```bash
+>      uv run python tools/annotation/merge_branch_to_annotated.py --branch-dir data/sequence_labelling_annotated_branch --target-dir data/sequence_labelling_annotated
+>      ```
+>    - The merge gate enforces:
+>      - Strict character fidelity verification (`strip_tags(candidate) == strip_tags(original)`).
+>      - Complete XML syntax validation (`is_valid_xml`).
+>      - Update of audit ledgers and progress trackers (`review_report.json`).
+
+---
+
+## 10. Anti-Sprawl & Tooling Reuse Invariant: Zero One-Off Script Sprawl
+
+> [!CAUTION]
+> **NEVER create a new script without verifying existing tools first.**
+> 
+> A major recurring failure mode is that agents create new standalone scripts (`run_*_tmux.sh`, `reparse_*_shard*.py`, `test_*_batch.py`) instead of reusing or extending existing tools, placing temporary scripts at the same directory level as canonical production tools.
+>
+> ### Strict Rules for All Agents:
+> 1. **Check Existing Tools First**:
+>    - Before writing ANY script to run OCR, parsing, review, repair, or evaluation, search `tools/` and `sequence_labelling/`.
+>    - If a tool exists that performs 80%+ of the required workflow (e.g. `run_agy_batch_ocr.py`, `edit_review_set.py`, `reviewer.py`), **USE IT** or **EXTEND IT**.
+> 2. **Parameterize Instead of Duplicating**:
+>    - NEVER create a new script simply to change a model name, filter by doc ID, alter concurrency, or change shard count.
+>    - Add/use standard CLI flags (`--concurrency`, `--model`, `--provider`, `--filter`, `--doc-id`, `--shards`, `--shard-id`).
+> 3. **No Batch-Specific or TMUX Script Sprawl**:
+>    - NEVER commit or leave scripts named after batch counts, document numbers, or times (e.g. `run_review_166.sh`, `reparse_218.sh`, `schedule_2am.sh`).
+>    - Batch runs must be parameterized via generic CLI flags, not hardcoded bash files.
+> 4. **Mandatory Scratch Sandbox for Ad-Hoc Scripts**:
+>    - If a temporary probe, one-off diagnostic, or ad-hoc calculation script is strictly necessary, it MUST be saved in:
+>      `<appDataDir>/brain/<conversation-id>/scratch/` or `.scratch/` (gitignored).
+>    - It is **STRICTLY PROHIBITED** to place temporary scripts directly into `tools/`, `scripts/`, or the repository root.
+
+
+
 
 
