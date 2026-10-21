@@ -16,3 +16,5 @@ result.md
 results/
 .ag-kit-backups/
 .agents/
+.scratch/
+scratch/
