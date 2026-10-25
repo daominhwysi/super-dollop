@@ -210,6 +210,7 @@ def parse_args():
     parser.add_argument("--eval-steps", "--eval_steps", type=int, default=None, help="Evaluate validation set every N optimization steps (0 to disable mid-epoch evaluation)")
     parser.add_argument("--save-steps", "--save_steps", type=int, default=None, help="Save a rolling checkpoint every N steps (0 to disable)")
     parser.add_argument("--save-total-limit", "--save_total_limit", type=int, default=None, help="Maximum number of rolling step checkpoints to keep (default: 2)")
+    parser.add_argument("--early-stopping-patience", "--early_stopping_patience", "--patience", type=int, default=None, help="Patience evaluations before early stopping (0 to disable)")
     parser.add_argument("--push-to-hub", "--push_to_hub", action="store_true", default=False, help="Push checkpoint to Hugging Face Hub during and after training")
     parser.add_argument("--hub-model-id", "--hub_model_id", type=str, default=None, help="Hugging Face model repository ID")
 
@@ -797,7 +798,7 @@ def run_evaluation(
                 )
         else:
             patience_counter += 1
-            if patience_counter >= max_patience and not args.dry_run:
+            if max_patience > 0 and patience_counter >= max_patience and not args.dry_run:
                 print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
                 stop_training = True
 
@@ -1467,7 +1468,11 @@ def main():
     global_step = 0
     best_macro_f1 = -1.0
     patience_counter = 0
-    max_patience = int(train_cfg.get("early_stopping_patience", 3))
+    max_patience = (
+        args.early_stopping_patience
+        if args.early_stopping_patience is not None
+        else int(train_cfg.get("early_stopping_patience", 8))
+    )
 
     if resume_dir is not None:
         trainer_state_file = resume_dir / "trainer_state.pt"
