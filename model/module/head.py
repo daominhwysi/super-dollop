@@ -119,6 +119,7 @@ class SigmoidWeightedLayerPooling(nn.Module):
             gates = torch.sigmoid(self.weights[:k])
             norm_gates = gates / (torch.sum(gates) + 1e-8)
             stacked = torch.stack(selected_layers, dim=0)  # Shape: [k, B, T, H]
+            norm_gates = norm_gates.to(dtype=stacked.dtype)
             fused = torch.einsum('l,lbth->bth', norm_gates, stacked)
             return fused
         return hidden_states
@@ -211,50 +212,16 @@ class TightenedMultiSampleDropout(nn.Module):
 MultiSampleDropout = TightenedMultiSampleDropout
 
 
-class LayoutFeatureEmbedding(nn.Module):
-    """
-    2D Spatial & Indentation-Aware Layout Feature Embedding.
-    Injects column bucket, line-start, and blank-preceded indicators directly
-    into token representations.
-    Initialized with zeros to guarantee exact identity pass-through at step 0.
-    """
-    def __init__(self, hidden_size: int = 768, num_col_buckets: int = 5):
-        super().__init__()
-        self.col_embed = nn.Embedding(num_col_buckets, hidden_size)
-        self.line_start_embed = nn.Embedding(2, hidden_size)
-        self.blank_preceded_embed = nn.Embedding(2, hidden_size)
-        self.norm = nn.LayerNorm(hidden_size)
-
-        # Zero init ensures zero disruption to pretrained representations at step 0
-        nn.init.zeros_(self.col_embed.weight)
-        nn.init.zeros_(self.line_start_embed.weight)
-        nn.init.zeros_(self.blank_preceded_embed.weight)
-
-    def forward(
-        self,
-        col_buckets: torch.Tensor,
-        is_line_start: torch.Tensor,
-        is_blank_preceded: torch.Tensor
-    ) -> torch.Tensor:
-        emb = (
-            self.col_embed(col_buckets.long())
-            + self.line_start_embed(is_line_start.long())
-            + self.blank_preceded_embed(is_blank_preceded.long())
-        )
-        return self.norm(emb)
-
-
 class EnhancedTokenClassificationHead(nn.Module):
     """
     Enhanced dense token classification head.
     
     Architecture:
     1. Sigmoid-Gated Layer Pooling across top-K transformer layers.
-    2. Optional 2D Layout Feature Embedding injection.
-    3. 1D Depthwise Separable Convolutional boundary refinement.
-    4. Dense GELU + LayerNorm projection.
-    5. Tightened Multi-Sample Dropout (MSD) with Per-Branch Focal Loss.
-    6. Classification Projection: Linear(H, num_labels).
+    2. 1D Depthwise Separable Convolutional boundary refinement.
+    3. Dense GELU + LayerNorm projection.
+    4. Tightened Multi-Sample Dropout (MSD) with Per-Branch Focal Loss.
+    5. Classification Projection: Linear(H, num_labels).
     """
     def __init__(
         self,
@@ -265,7 +232,7 @@ class EnhancedTokenClassificationHead(nn.Module):
         intermediate_dim: Optional[int] = None,
         use_conv_refinement: bool = True,
         conv_kernel_size: int = 7,
-        use_layout_embeddings: bool = True,
+        use_layout_embeddings: bool = False,
         pooling_type: str = "sigmoid"
     ):
         super().__init__()
@@ -281,14 +248,7 @@ class EnhancedTokenClassificationHead(nn.Module):
         else:
             self.layer_pooling = WeightedLayerPooling(num_layers=self.num_layers_to_fuse)
 
-        # 2. Optional Layout Feature Embedding
-        self.use_layout_embeddings = use_layout_embeddings
-        if use_layout_embeddings:
-            self.layout_embed = LayoutFeatureEmbedding(hidden_size=hidden_size)
-        else:
-            self.layout_embed = None
-
-        # 3. Local 1D Depthwise Separable Convolution Refinement
+        # 2. Local 1D Depthwise Separable Convolution Refinement
         self.use_conv_refinement = use_conv_refinement
         if use_conv_refinement:
             self.conv_refinement = LocalConvRefinement(
@@ -299,16 +259,16 @@ class EnhancedTokenClassificationHead(nn.Module):
         else:
             self.conv_refinement = None
 
-        # 4. Dense feature projection with LayerNorm & GELU
+        # 3. Dense feature projection with LayerNorm & GELU
         self.dense = nn.Linear(hidden_size, inter_dim)
         self.act = nn.GELU()
         self.norm = nn.LayerNorm(inter_dim)
 
-        # 5. Tightened Multi-Sample Dropout (MSD)
+        # 4. Tightened Multi-Sample Dropout (MSD)
         self.multi_sample_dropout = TightenedMultiSampleDropout(dropout_rates=dropout_rates)
         self.dropouts = self.multi_sample_dropout.dropouts  # Backward compatibility
 
-        # 6. Final classification projection
+        # 5. Final classification projection
         self.classifier = nn.Linear(inter_dim, num_labels)
 
         self._init_weights()
@@ -340,22 +300,14 @@ class EnhancedTokenClassificationHead(nn.Module):
         # 1. Pool top-K layers
         fused = self.layer_pooling(hidden_states)
 
-        # 2. Inject 2D Layout Features if provided
-        if self.layout_embed is not None and layout_features is not None:
-            col_buckets = layout_features.get("col_buckets")
-            is_line_start = layout_features.get("is_line_start")
-            is_blank_preceded = layout_features.get("is_blank_preceded")
-            if col_buckets is not None and is_line_start is not None and is_blank_preceded is not None:
-                fused = fused + self.layout_embed(col_buckets, is_line_start, is_blank_preceded)
-
-        # 3. Local boundary refinement with Depthwise Conv1D
+        # 2. Local boundary refinement with Depthwise Conv1D
         if self.conv_refinement is not None:
             fused = self.conv_refinement(fused, attention_mask=attention_mask)
 
-        # 4. Dense projection
+        # 3. Dense projection
         features = self.norm(self.act(self.dense(fused)))
 
-        # 5. Multi-Sample Dropout & Loss computation
+        # 4. Multi-Sample Dropout & Loss computation
         if self.training and targets is not None and loss_fct is not None:
             branch_logits = self.multi_sample_dropout(features, self.classifier)
             # Compute focal loss per branch BEFORE averaging to prevent ensemble smoothing
@@ -400,7 +352,7 @@ class EnhancedBertForTokenClassification(nn.Module):
         dropout_rates: Tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25),
         use_conv_refinement: bool = True,
         conv_kernel_size: int = 7,
-        use_layout_embeddings: bool = True,
+        use_layout_embeddings: bool = False,
         per_branch_focal_loss: bool = True
     ):
         super().__init__()
@@ -500,28 +452,18 @@ class EnhancedBertForTokenClassification(nn.Module):
         if hidden_states is None:
             hidden_states = outputs[0]
 
-        layout_features = None
-        if col_buckets is not None and is_line_start is not None and is_blank_preceded is not None:
-            layout_features = {
-                "col_buckets": col_buckets,
-                "is_line_start": is_line_start,
-                "is_blank_preceded": is_blank_preceded
-            }
-
         if self.training and labels is not None and self.per_branch_focal_loss:
             head_out = self.head(
                 hidden_states,
                 attention_mask=attention_mask,
                 targets=labels,
-                loss_fct=self.loss_fct,
-                layout_features=layout_features
+                loss_fct=self.loss_fct
             )
             logits, loss = head_out
         else:
             head_out = self.head(
                 hidden_states,
-                attention_mask=attention_mask,
-                layout_features=layout_features
+                attention_mask=attention_mask
             )
             if isinstance(head_out, tuple):
                 logits = head_out[0]
@@ -565,7 +507,7 @@ class EnhancedBertForTokenClassification(nn.Module):
             "num_labels": self.num_labels,
             "num_layers_to_fuse": self.head.num_layers_to_fuse,
             "use_conv_refinement": getattr(self.head, "use_conv_refinement", False),
-            "use_layout_embeddings": getattr(self.head, "use_layout_embeddings", False),
+            "use_layout_embeddings": False,
             "pooling_type": getattr(self.head, "pooling_type", "sigmoid"),
         }
         with open(os.path.join(save_directory, "enhanced_head_config.json"), "w", encoding="utf-8") as f:
@@ -635,16 +577,74 @@ class EnhancedBertForTokenClassification(nn.Module):
 
         num_layers_to_fuse = 4
         use_conv_refinement = True
-        use_layout_embeddings = True
+        use_layout_embeddings = False
         if meta_file and os.path.exists(meta_file):
             try:
                 with open(meta_file, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                     num_layers_to_fuse = meta.get("num_layers_to_fuse", 4)
                     use_conv_refinement = meta.get("use_conv_refinement", True)
-                    use_layout_embeddings = meta.get("use_layout_embeddings", True)
+                    use_layout_embeddings = meta.get("use_layout_embeddings", False)
             except Exception:
                 pass
+
+        loaded_state_dict = None
+        if safetensors_file and os.path.exists(safetensors_file):
+            try:
+                from safetensors.torch import load_file
+                loaded_state_dict = load_file(safetensors_file, device="cpu")
+            except Exception:
+                pass
+        elif model_bin_file and os.path.exists(model_bin_file):
+            try:
+                loaded_state_dict = torch.load(model_bin_file, map_location="cpu")
+            except Exception:
+                pass
+
+        # If this checkpoint already contains full model weights (base_model.* + head.*),
+        # initialize base_model from config directly to avoid misleading missing/unexpected warnings from AutoModel
+        has_full_weights = loaded_state_dict is not None and any(k.startswith("base_model.") for k in loaded_state_dict.keys())
+        if has_full_weights:
+            base_model = AutoModel.from_config(config)
+        else:
+            load_kwargs = dict(kwargs)
+            if attn_implementation is not None:
+                load_kwargs["attn_implementation"] = attn_implementation
+            try:
+                base_model = AutoModel.from_pretrained(
+                    model_name_or_path,
+                    config=config,
+                    token=token,
+                    torch_dtype=torch_dtype,
+                    **load_kwargs
+                )
+            except TypeError:
+                base_model = AutoModel.from_pretrained(
+                    model_name_or_path,
+                    config=config,
+                    token=token,
+                    torch_dtype=torch_dtype,
+                    **kwargs
+                )
+
+        # Check and align vocabulary size if token embeddings were expanded during training
+        if loaded_state_dict is not None:
+            emb_weight = loaded_state_dict.get("base_model.embeddings.tok_embeddings.weight", None)
+            if emb_weight is not None and base_model.get_input_embeddings().weight.shape[0] != emb_weight.shape[0]:
+                base_model.resize_token_embeddings(emb_weight.shape[0])
+
+        model = cls(
+            config=config,
+            base_model=base_model,
+            num_layers_to_fuse=num_layers_to_fuse,
+            use_conv_refinement=use_conv_refinement,
+            use_layout_embeddings=use_layout_embeddings
+        )
+
+        if loaded_state_dict is not None:
+            model.load_state_dict(loaded_state_dict, strict=False)
+
+        return model
 
         loaded_state_dict = None
         if safetensors_file and os.path.exists(safetensors_file):

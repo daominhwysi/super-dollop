@@ -56,6 +56,25 @@ tags:
 size_categories:
 - 10K<n<100K
 pretty_name: Vietnamese Exam Sequence Labelling Dataset v2
+configs:
+  - config_name: default
+    data_files:
+      - split: train
+        path: "train_spans.jsonl"
+      - split: test
+        path: "test_spans.jsonl"
+  - config_name: bio_chunks
+    data_files:
+      - split: train
+        path: "train_bio_chunks.jsonl"
+      - split: test
+        path: "test_bio_chunks.jsonl"
+  - config_name: generative
+    data_files:
+      - split: train
+        path: "train_generative.jsonl"
+      - split: test
+        path: "test_generative.jsonl"
 ---
 
 # Vietnamese Exam Sequence Labelling Dataset (v2)
@@ -157,25 +176,19 @@ Generated and curated by the [Vietnamese Sequence Labelling v2](https://github.c
 ```python
 from datasets import load_dataset
 
-# 1. Load token classification sliding-window chunks:
-dataset = load_dataset(
-    "daominhwysi/synthetic-seq-labelling-vi-exam-v2",
-    data_files={{
-        "train": "train_bio_chunks.jsonl",
-        "test": "test_bio_chunks.jsonl"
-    }}
-)
+# 1. Load document-level character spans (Default, Clean Full Exams):
+dataset = load_dataset("daominhwysi/synthetic-seq-labelling-vi-exam-v2")
+# or explicitly:
+dataset = load_dataset("daominhwysi/synthetic-seq-labelling-vi-exam-v2", "default")
 print(dataset["train"][0])
 
-# 2. Load document-level character spans:
-spans_dataset = load_dataset(
-    "daominhwysi/synthetic-seq-labelling-vi-exam-v2",
-    data_files={{
-        "train": "train_spans.jsonl",
-        "test": "test_spans.jsonl"
-    }}
-)
-print(spans_dataset["train"][0])
+# 2. Load token classification sliding-window chunks:
+bio_dataset = load_dataset("daominhwysi/synthetic-seq-labelling-vi-exam-v2", "bio_chunks")
+print(bio_dataset["train"][0])
+
+# 3. Load generative instruction pairs (for LLM fine-tuning):
+gen_dataset = load_dataset("daominhwysi/synthetic-seq-labelling-vi-exam-v2", "generative")
+print(gen_dataset["train"][0])
 ```
 
 ---

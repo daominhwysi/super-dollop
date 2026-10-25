@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional, Any, Sequence, Tuple, List, Dict
 from pathlib import Path
 from dotenv import load_dotenv
@@ -356,6 +357,12 @@ def chat(
                 or "rate limit" in err_msg.lower()
                 or "timeout" in err_msg.lower()
                 or "timed out" in err_msg.lower()
+                or "overloaded" in err_msg.lower()
+                or "retry your request" in err_msg.lower()
+                or "server error" in err_msg.lower()
+                or "bad gateway" in err_msg.lower()
+                or "service unavailable" in err_msg.lower()
+                or "500" in err_msg
                 or "502" in err_msg
                 or "503" in err_msg
                 or "504" in err_msg

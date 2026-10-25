@@ -25,6 +25,7 @@ import yaml
 import math
 import random
 import argparse
+import contextlib
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -34,7 +35,7 @@ load_dotenv(dotenv_path=WORKSPACE_DIR / ".env")
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Sampler, random_split
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     AutoTokenizer,
@@ -54,6 +55,122 @@ from model.inference.viterbi import ConstrainedViterbiDecoder
 
 # ModernBERT names its normalisation layers `norm`, `attn_norm`, `mlp_norm`, `final_norm`
 NO_DECAY_KEYWORDS = ("bias", "norm", "layer_pooling")
+
+
+class LengthGroupedBatchSampler(Sampler[List[int]]):
+    """
+    BatchSampler that groups samples by sequence length into buckets before batching,
+    preventing wasted GPU computation on pad tokens when training across multi-scale
+    windows (512, 768, 1024, 2048).
+    
+    Batches are shuffled randomly at the batch level each epoch to preserve SGD randomness.
+    """
+    def __init__(
+        self,
+        lengths: List[int],
+        batch_size: int,
+        drop_last: bool = False,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        # Sort indices by length with small random jitter to avoid deterministic tie-breaks
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.lengths)))
+        
+        # Bucket indices by length (exact or coarse bucket)
+        # Using coarse buckets of 64 tokens groups sequences of similar length together
+        indices.sort(key=lambda idx: (self.lengths[idx] // 64, rng.random()))
+
+        batches = []
+        for i in range(0, len(indices), self.batch_size):
+            batch = indices[i:i + self.batch_size]
+            if len(batch) == self.batch_size or not self.drop_last:
+                batches.append(batch)
+
+        if self.shuffle:
+            rng.shuffle(batches)
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+
+class DistributedLengthGroupedBatchSampler(Sampler[List[int]]):
+    """Distributed version of LengthGroupedBatchSampler for DDP."""
+    def __init__(
+        self,
+        lengths: List[int],
+        batch_size: int,
+        num_replicas: int,
+        rank: int,
+        drop_last: bool = False,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.lengths)))
+        indices.sort(key=lambda idx: (self.lengths[idx] // 64, rng.random()))
+
+        batches = []
+        for i in range(0, len(indices), self.batch_size):
+            batch = indices[i:i + self.batch_size]
+            if len(batch) == self.batch_size or not self.drop_last:
+                batches.append(batch)
+
+        if self.shuffle:
+            rng.shuffle(batches)
+
+        # Distribute batches evenly across replicas
+        if not self.drop_last:
+            padding_size = (self.num_replicas - (len(batches) % self.num_replicas)) % self.num_replicas
+            if padding_size > 0:
+                batches.extend(batches[:padding_size])
+            num_samples = len(batches) // self.num_replicas
+        else:
+            num_samples = len(batches) // self.num_replicas
+            batches = batches[: num_samples * self.num_replicas]
+
+        batches = batches[self.rank * num_samples : (self.rank + 1) * num_samples]
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            total_batches = len(self.lengths) // self.batch_size
+            return total_batches // self.num_replicas
+        total_batches = (len(self.lengths) + self.batch_size - 1) // self.batch_size
+        return (total_batches + self.num_replicas - 1) // self.num_replicas
 
 
 def parse_args():
@@ -155,6 +272,7 @@ def save_training_checkpoint(
     patience_counter: int,
     tag_to_id: Dict[str, int],
     id_to_tag: Dict[int, str],
+    step_in_epoch: int = 0,
     is_main_process: bool = True
 ):
     """Saves model weights, config, tokenizer, label map, and full trainer state for continuity."""
@@ -182,6 +300,7 @@ def save_training_checkpoint(
     trainer_state = {
         "epoch": epoch,
         "global_step": global_step,
+        "step_in_epoch": step_in_epoch,
         "best_macro_f1": best_macro_f1,
         "patience_counter": patience_counter,
         "optimizer_state_dict": optimizer.state_dict(),
@@ -482,7 +601,7 @@ def push_checkpoint_to_hub(
             repo_id=repo_id,
             repo_type="model",
             commit_message=commit_message,
-            ignore_patterns=["checkpoint-*", "checkpoint-*/*", "*.tmp"]
+            ignore_patterns=["checkpoint-*", "checkpoint-*/*", "step_*", "latest_checkpoint*", "*.tmp"]
         )
         print(f"Checkpoint successfully synchronized to: https://huggingface.co/{repo_id}")
     except Exception as e:
@@ -531,7 +650,25 @@ def evaluate_split(
                 all_preds.append([id_to_tag.get(int(p), "O") for p in pred_ids])
                 all_labels.append([id_to_tag.get(int(l), "O") for l in label_seq[valid]])
 
-    return total_loss / max(1, len(loader)), all_preds, all_labels
+    num_batches = len(loader)
+    if torch.distributed.is_initialized():
+        # Synchronize loss and sample counts across all DDP ranks
+        metrics_tensor = torch.tensor([total_loss, float(num_batches)], device=device)
+        torch.distributed.all_reduce(metrics_tensor, op=torch.distributed.ReduceOp.SUM)
+        avg_loss = metrics_tensor[0].item() / max(1.0, metrics_tensor[1].item())
+
+        # Gather predictions and labels across all ranks so Macro F1 evaluates on full split
+        world_size = torch.distributed.get_world_size()
+        gathered_preds = [None] * world_size
+        gathered_labels = [None] * world_size
+        torch.distributed.all_gather_object(gathered_preds, all_preds)
+        torch.distributed.all_gather_object(gathered_labels, all_labels)
+        all_preds = [p for rank_list in gathered_preds if rank_list for p in rank_list]
+        all_labels = [l for rank_list in gathered_labels if rank_list for l in rank_list]
+    else:
+        avg_loss = total_loss / max(1, num_batches)
+
+    return avg_loss, all_preds, all_labels
 
 
 def load_checkpoint_weights(model: nn.Module, checkpoint_dir: Path):
@@ -634,7 +771,7 @@ def run_evaluation(
                 id_to_tag=id_to_tag,
                 is_main_process=is_main_process
             )
-            update_latest_checkpoint_link(output_dir, output_dir, is_main_process=is_main_process)
+            update_latest_checkpoint_link(output_dir, output_dir / "best", is_main_process=is_main_process)
 
             if args.push_to_hub and args.hub_model_id:
                 push_checkpoint_to_hub(
@@ -652,8 +789,9 @@ def run_evaluation(
                 print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
                 stop_training = True
 
+            eval_step_dir = output_dir / f"checkpoint-{global_step}"
             save_training_checkpoint(
-                save_dir=output_dir / "latest_checkpoint",
+                save_dir=eval_step_dir,
                 model=model,
                 tokenizer=tokenizer,
                 optimizer=optimizer,
@@ -667,6 +805,8 @@ def run_evaluation(
                 id_to_tag=id_to_tag,
                 is_main_process=is_main_process
             )
+            update_latest_checkpoint_link(output_dir, eval_step_dir, is_main_process=is_main_process)
+            prune_checkpoints(output_dir, save_total_limit, is_main_process=is_main_process)
             if force_push_hub and args.push_to_hub and args.hub_model_id:
                 push_checkpoint_to_hub(
                     repo_id=args.hub_model_id,
@@ -843,8 +983,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     latex_placeholder = model_cfg.get("latex_placeholder", "[LATEX]")
     special_tokens = ["<blank />", "<blank/>", "[BLANK]"]
-    if latex_placeholder:
+    if latex_placeholder and latex_placeholder not in special_tokens:
         special_tokens.append(latex_placeholder)
+
+    # Capture constituent subwords before adding atomic special tokens
+    constituent_subwords: Dict[str, List[int]] = {}
+    for st in special_tokens:
+        sub_ids = tokenizer.encode(st, add_special_tokens=False)
+        if sub_ids:
+            constituent_subwords[st] = sub_ids
+
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
 
     if is_main_process:
@@ -865,6 +1013,15 @@ def main():
             filename="test_bio_chunks.jsonl",
             repo_type="dataset"
         ))
+        try:
+            hf_hub_download(
+                repo_id=args.dataset_repo_id,
+                filename="dataset_manifest.json",
+                repo_type="dataset",
+                local_dir=str(chunks_file.parent)
+            )
+        except Exception:
+            pass
     else:
         chunks_path = args.data_dir or data_cfg.get("bio_chunks_file", "data/training_dataset/train_bio_chunks.jsonl")
         chunks_file = Path(chunks_path)
@@ -892,7 +1049,13 @@ def main():
     dev_ratio = float(data_cfg.get("dev_ratio", 0.05))
 
     def is_dev_doc(doc_id: str) -> bool:
-        digest = hashlib.md5(f"{seed}:{doc_id}".encode("utf-8")).hexdigest()
+        # Strip chunk suffixes and augmentation flags to ensure the base document
+        # and all its augmented/chunked variants strictly reside in the SAME split.
+        # e.g. "doc_123::chunk_001_aug" -> "doc_123"
+        base_id = doc_id.split("::")[0]
+        if base_id.endswith("_aug"):
+            base_id = base_id[:-4]
+        digest = hashlib.md5(f"{seed}:{base_id}".encode("utf-8")).hexdigest()
         return int(digest[:8], 16) / 0xFFFFFFFF < dev_ratio
 
     dataset_kwargs = dict(
@@ -909,11 +1072,29 @@ def main():
         doc_filter=lambda doc_id: not is_dev_doc(doc_id),
         **dataset_kwargs,
     )
+    # Deduplicate validation chunks: for the dev set used during training,
+    # evaluate on a single canonical window size (e.g. 1024 or the largest available)
+    # to avoid 16x redundant forward passes and skewed F1 metrics.
+    def dev_record_filter(item: Dict[str, Any]) -> bool:
+        w_size = item.get("window_size")
+        # If dataset has multiple window sizes, keep only 1024 (or keep all if not multi-scale)
+        if w_size is not None and w_size != 1024:
+            return False
+        return True
+
     val_dataset = MultiWindowBIODataset(
         chunks_file_path=chunks_file,
         doc_filter=is_dev_doc,
+        record_filter=dev_record_filter if not args.dry_run else None,
         **dataset_kwargs,
     )
+    if len(val_dataset) == 0:
+        # Fallback to unfiltered dev if no 1024-scale chunk was matched
+        val_dataset = MultiWindowBIODataset(
+            chunks_file_path=chunks_file,
+            doc_filter=is_dev_doc,
+            **dataset_kwargs,
+        )
     if len(val_dataset) == 0:
         raise ValueError(f"Dev split is empty; increase dataset.dev_ratio (currently {dev_ratio})")
 
@@ -921,7 +1102,11 @@ def main():
     if val_chunks_file and val_chunks_file.exists():
         if is_main_process:
             print(f"Loading gold benchmark chunks from '{val_chunks_file.name}' (final report only)...")
-        test_dataset = MultiWindowBIODataset(chunks_file_path=val_chunks_file, **dataset_kwargs)
+        test_dataset = MultiWindowBIODataset(
+            chunks_file_path=val_chunks_file,
+            record_filter=dev_record_filter if not args.dry_run else None,
+            **dataset_kwargs,
+        )
 
     if is_main_process:
         print(
@@ -955,23 +1140,42 @@ def main():
             num_workers=0,
         )
 
-    # Distributed or standard samplers
-    if is_distributed:
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True, seed=seed)
-        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
-    else:
-        train_sampler = None
-        val_sampler = None
-
     workers = int(args.dataloader_num_workers if args.dataloader_num_workers is not None else train_cfg.get("dataloader_num_workers", 2))
     if os.name == "nt":
         workers = 0
 
+    # Build sequence lengths for length-grouped bucketing
+    if is_main_process:
+        print("Pre-calculating sequence lengths for length-grouped batch sampling...")
+    train_lengths = [train_dataset.get_sequence_length(i) for i in range(len(train_dataset))]
+
+    # Distributed or standard samplers
+    if is_distributed:
+        train_batch_sampler = DistributedLengthGroupedBatchSampler(
+            lengths=train_lengths,
+            batch_size=batch_size,
+            num_replicas=world_size,
+            rank=local_rank,
+            drop_last=False,
+            shuffle=True,
+            seed=seed,
+        )
+        train_sampler = None
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+    else:
+        train_batch_sampler = LengthGroupedBatchSampler(
+            lengths=train_lengths,
+            batch_size=batch_size,
+            drop_last=False,
+            shuffle=True,
+            seed=seed,
+        )
+        train_sampler = None
+        val_sampler = None
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        batch_sampler=train_batch_sampler,
         collate_fn=collate_fn,
         num_workers=workers,
         pin_memory=torch.cuda.is_available()
@@ -1010,7 +1214,38 @@ def main():
     except TypeError:
         base_model = AutoModel.from_pretrained(model_name, config=config)
 
+    orig_vocab_size = getattr(config, "vocab_size", len(tokenizer))
     base_model.resize_token_embeddings(len(tokenizer))
+    if len(tokenizer) > orig_vocab_size or any(tokenizer.convert_tokens_to_ids(st) >= orig_vocab_size for st in special_tokens):
+        embeddings = base_model.get_input_embeddings()
+        with torch.no_grad():
+            unused_id = None
+            for candidate in ["<unused0>", "[unused0]", "<unused_0>"]:
+                c_id = tokenizer.convert_tokens_to_ids(candidate)
+                if c_id is not None and c_id != tokenizer.unk_token_id and c_id < orig_vocab_size:
+                    unused_id = c_id
+                    break
+
+            for st in special_tokens:
+                tid = tokenizer.convert_tokens_to_ids(st)
+                if tid is None or tid < orig_vocab_size:
+                    continue
+
+                sub_ids = constituent_subwords.get(st, [])
+                sub_ids = [idx for idx in sub_ids if idx < orig_vocab_size and idx != tokenizer.unk_token_id]
+                if sub_ids:
+                    semantic_vec = embeddings.weight.data[sub_ids].mean(dim=0)
+                    embeddings.weight.data[tid].copy_(semantic_vec)
+                    if is_main_process:
+                        print(f"Semantically initialized special token '{st}' (id={tid}) from {len(sub_ids)} constituent subwords.")
+                elif unused_id is not None:
+                    embeddings.weight.data[tid].copy_(embeddings.weight.data[unused_id])
+                    if is_main_process:
+                        print(f"Initialized special token '{st}' (id={tid}) from fallback <unused*> token (id={unused_id}).")
+                else:
+                    embeddings.weight.data[tid].copy_(embeddings.weight.data[:orig_vocab_size].mean(dim=0))
+                    if is_main_process:
+                        print(f"Initialized special token '{st}' (id={tid}) from global pretrained vocab mean fallback.")
     if is_main_process:
         print(f"Base model attention implementation configured: '{getattr(config, '_attn_implementation', attn_impl)}'")
 
@@ -1197,6 +1432,7 @@ def main():
 
     # 7. Training State & Continuity Restoration
     start_epoch = 1
+    resume_step_in_epoch = 0
     global_step = 0
     best_macro_f1 = -1.0
     patience_counter = 0
@@ -1230,11 +1466,23 @@ def main():
                     scaler.load_state_dict(trainer_state["scaler_state_dict"])
 
                 # 4. Restore loop counters
-                saved_epoch = trainer_state.get("epoch", 0)
-                start_epoch = saved_epoch + 1
+                saved_epoch = trainer_state.get("epoch", 1)
                 global_step = trainer_state.get("global_step", 0)
                 best_macro_f1 = trainer_state.get("best_macro_f1", -1.0)
                 patience_counter = trainer_state.get("patience_counter", 0)
+                resume_step_in_epoch = trainer_state.get("step_in_epoch", 0)
+
+                # Check if checkpoint was saved mid-epoch or at epoch boundary
+                steps_per_epoch = len(train_loader) if len(train_loader) > 0 else 1
+                if resume_step_in_epoch > 0 and resume_step_in_epoch < steps_per_epoch:
+                    start_epoch = saved_epoch
+                    if is_main_process:
+                        print(f"Resuming mid-epoch at Epoch {start_epoch}, Step {resume_step_in_epoch}/{steps_per_epoch} (global step {global_step}).")
+                else:
+                    start_epoch = saved_epoch + 1
+                    resume_step_in_epoch = 0
+                    if is_main_process:
+                        print(f"Resuming at Epoch boundary: starting Epoch {start_epoch} (global step {global_step}).")
 
                 # 5. Restore RNG states if present
                 if "rng_state" in trainer_state:
@@ -1364,7 +1612,9 @@ def main():
     stop_training = False
 
     for epoch in range(start_epoch, epochs + 1):
-        if train_sampler is not None:
+        if hasattr(train_batch_sampler, "set_epoch"):
+            train_batch_sampler.set_epoch(epoch)
+        elif train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         model.train()
@@ -1378,19 +1628,26 @@ def main():
 
         optimizer.zero_grad()
         for step, batch in enumerate(train_loader):
+            if epoch == start_epoch and step < resume_step_in_epoch:
+                continue
+
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            if use_amp and device.type == "cuda":
-                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+            is_accumulating = is_distributed and ((step + 1) % grad_accum != 0) and ((step + 1) != len(train_loader))
+            sync_context = model.no_sync() if is_accumulating else contextlib.nullcontext()
+
+            with sync_context:
+                if use_amp and device.type == "cuda":
+                    with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = outputs.loss / grad_accum
+                    scaler.scale(loss).backward()
+                else:
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = outputs.loss / grad_accum
-                scaler.scale(loss).backward()
-            else:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss / grad_accum
-                loss.backward()
+                    loss.backward()
 
             train_loss += loss.item() * grad_accum
             interval_loss_sum += loss.item() * grad_accum
@@ -1440,6 +1697,7 @@ def main():
                         patience_counter=patience_counter,
                         tag_to_id=tag_to_id,
                         id_to_tag=id_to_tag,
+                        step_in_epoch=step + 1,
                         is_main_process=is_main_process
                     )
                     # Update symlink/pointer to latest checkpoint without duplicating gigabytes
@@ -1539,6 +1797,7 @@ def main():
             )
             last_eval_step = global_step
 
+        resume_step_in_epoch = 0
         if stop_training:
             break
 

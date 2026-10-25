@@ -30,6 +30,7 @@ if str(WORKSPACE_DIR) not in sys.path:
 
 from sequence_labelling.annotator.annotate_ocr import parse_xml_annotations
 from sequence_labelling.annotator.anchor_helper import AnchorHelper
+from model.module.dataset import get_tag_mappings, normalize_bio_tag
 from synthetic_exam_generator.reconstructor import (
     reconstruct_exam,
     spans_to_xml,
@@ -77,12 +78,18 @@ def expand_stimulus_anchors(xml_content: str) -> str:
     return AnchorHelper.expand_stimulus_anchors(xml_content)
 
 
+# Atomic token pattern protecting special tokens, math types, words, and symbols
+TOKEN_PATTERN = re.compile(
+    r"<blank\s*/>|<blank/>|\[(?:LATEX|BLANK|MATH_[A-Z_]+)\]|\w+|[^\w\s]",
+    re.IGNORECASE
+)
+
+
 def tokenize_with_offsets(text: str) -> Tuple[List[str], List[Tuple[int, int]]]:
     """Tokenizes text into words and punctuation tokens with (start, end) character offsets."""
     tokens = []
     offsets = []
-    pattern = re.compile(r"\w+|[^\w\s]")
-    for m in pattern.finditer(text):
+    for m in TOKEN_PATTERN.finditer(text):
         tokens.append(m.group(0))
         offsets.append((m.start(), m.end()))
     return tokens, offsets
@@ -384,58 +391,135 @@ def process_real_annotated_documents(
         if doc_id in exclude_doc_ids:
             continue
 
-        audit_file = d / "audit_report.json"
-        xml_file = d / "merged.xml"
-        if not (audit_file.exists() and xml_file.exists()):
-            continue
+        # Check if directory has verified chunk files (Chunk-as-Samples architecture)
+        chunks_dir = d / "chunks"
+        chunk_files = sorted(chunks_dir.glob("chunk_*.xml")) if chunks_dir.exists() else []
 
-        try:
-            audit = json.loads(audit_file.read_text(encoding="utf-8"))
-            if audit.get("decision") == "DISCARD":
-                continue
-            if float(audit.get("overall_score", 0.0)) < min_score:
-                continue
+        loaded_chunks = False
+        if chunk_files:
+            for c_xml_path in chunk_files:
+                c_stem = c_xml_path.stem  # e.g. chunk_0
+                c_audit_path = chunks_dir / f"{c_stem}.audit.json"
+                c_json_path = chunks_dir / f"{c_stem}.json"
 
-            xml_content = xml_file.read_text(encoding="utf-8")
-            xml_content = expand_stimulus_anchors(xml_content)
-            raw_text, spans = parse_xml_annotations(xml_content)
-            if not raw_text.strip() or not spans:
-                continue
+                chunk_score = 100.0
+                chunk_decision = "PASS"
 
-            # 1. Primary Pristine Document
-            records.append({
-                "doc_id": doc_id,
-                "source": "real",
-                "raw_text": raw_text,
-                "xml_content": xml_content,
-                "spans": spans,
-                "score": float(audit.get("overall_score", 0.0))
-            })
-            pristine_count += 1
+                if c_audit_path.exists():
+                    try:
+                        c_audit = json.loads(c_audit_path.read_text(encoding="utf-8"))
+                        chunk_decision = c_audit.get("decision", "PASS")
+                        chunk_score = float(c_audit.get("overall_score", 100.0))
+                    except Exception:
+                        pass
+                elif c_json_path.exists():
+                    try:
+                        c_json = json.loads(c_json_path.read_text(encoding="utf-8"))
+                        chunk_decision = c_json.get("review_decision", "PASS")
+                        chunk_score = float(c_json.get("review_score", 100.0))
+                    except Exception:
+                        pass
 
-            # 2. Stochastic Whitespace, Tab & Newline Augmented Paired Variant
-            if whitespace_aug_prob > 0.0 and rng.random() < whitespace_aug_prob:
-                aug_res = augment_real_document(
-                    raw_text, spans, rng,
-                    latex_mask_prob=latex_mask_prob,
-                    flatten_newlines_prob=flatten_newlines_prob,
-                    newline_to_space_prob=0.20,
-                    tab_to_space=True
-                )
-                if aug_res is not None:
-                    aug_text, aug_spans = aug_res
-                    aug_xml = spans_to_xml(aug_text, aug_spans)
+                if chunk_decision != "PASS" or chunk_score < min_score:
+                    continue
+
+                try:
+                    xml_content = c_xml_path.read_text(encoding="utf-8")
+                    xml_content = expand_stimulus_anchors(xml_content)
+                    raw_text, spans = parse_xml_annotations(xml_content)
+                    if not raw_text.strip() or not spans:
+                        continue
+
+                    sample_id = f"{doc_id}::{c_stem}"
                     records.append({
-                        "doc_id": f"{doc_id}_aug",
-                        "source": "real_augmented",
-                        "raw_text": aug_text,
-                        "xml_content": aug_xml,
-                        "spans": aug_spans,
-                        "score": float(audit.get("overall_score", 0.0))
+                        "doc_id": sample_id,
+                        "source": "real_chunk",
+                        "raw_text": raw_text,
+                        "xml_content": xml_content,
+                        "spans": spans,
+                        "score": chunk_score
                     })
-                    augmented_count += 1
-        except Exception as e:
-            print(f"Error processing real doc {doc_id}: {e}")
+                    pristine_count += 1
+                    loaded_chunks = True
+
+                    # Stochastic augmentation on chunk
+                    if whitespace_aug_prob > 0.0 and rng.random() < whitespace_aug_prob:
+                        aug_res = augment_real_document(
+                            raw_text, spans, rng,
+                            latex_mask_prob=latex_mask_prob,
+                            flatten_newlines_prob=flatten_newlines_prob,
+                            newline_to_space_prob=0.20,
+                            tab_to_space=True
+                        )
+                        if aug_res is not None:
+                            aug_text, aug_spans = aug_res
+                            aug_xml = spans_to_xml(aug_text, aug_spans)
+                            records.append({
+                                "doc_id": f"{sample_id}_aug",
+                                "source": "real_chunk_augmented",
+                                "raw_text": aug_text,
+                                "xml_content": aug_xml,
+                                "spans": aug_spans,
+                                "score": chunk_score
+                            })
+                            augmented_count += 1
+                except Exception as e:
+                    print(f"Error processing chunk {c_xml_path.name} in {doc_id}: {e}")
+
+        # Fallback to monolithic merged.xml if no chunks were loaded
+        if not loaded_chunks:
+            audit_file = d / "audit_report.json"
+            xml_file = d / "merged.xml"
+            if not (audit_file.exists() and xml_file.exists()):
+                continue
+
+            try:
+                audit = json.loads(audit_file.read_text(encoding="utf-8"))
+                if audit.get("decision") == "DISCARD":
+                    continue
+                if float(audit.get("overall_score", 0.0)) < min_score:
+                    continue
+
+                xml_content = xml_file.read_text(encoding="utf-8")
+                xml_content = expand_stimulus_anchors(xml_content)
+                raw_text, spans = parse_xml_annotations(xml_content)
+                if not raw_text.strip() or not spans:
+                    continue
+
+                # 1. Primary Pristine Document
+                records.append({
+                    "doc_id": doc_id,
+                    "source": "real",
+                    "raw_text": raw_text,
+                    "xml_content": xml_content,
+                    "spans": spans,
+                    "score": float(audit.get("overall_score", 0.0))
+                })
+                pristine_count += 1
+
+                # 2. Stochastic Whitespace, Tab & Newline Augmented Paired Variant
+                if whitespace_aug_prob > 0.0 and rng.random() < whitespace_aug_prob:
+                    aug_res = augment_real_document(
+                        raw_text, spans, rng,
+                        latex_mask_prob=latex_mask_prob,
+                        flatten_newlines_prob=flatten_newlines_prob,
+                        newline_to_space_prob=0.20,
+                        tab_to_space=True
+                    )
+                    if aug_res is not None:
+                        aug_text, aug_spans = aug_res
+                        aug_xml = spans_to_xml(aug_text, aug_spans)
+                        records.append({
+                            "doc_id": f"{doc_id}_aug",
+                            "source": "real_augmented",
+                            "raw_text": aug_text,
+                            "xml_content": aug_xml,
+                            "spans": aug_spans,
+                            "score": float(audit.get("overall_score", 0.0))
+                        })
+                        augmented_count += 1
+            except Exception as e:
+                print(f"Error processing real doc {doc_id}: {e}")
 
     return records, pristine_count, augmented_count
 
@@ -725,6 +809,18 @@ def main():
         help="Random seed for data shuffling and sampling"
     )
     parser.add_argument(
+        "--pretokenize",
+        action="store_true",
+        default=False,
+        help="Pre-tokenize chunks using SEA-LION-ModernBERT tokenizer into input_ids, attention_mask, and labels for zero CPU training latency"
+    )
+    parser.add_argument(
+        "--tokenizer-name",
+        type=str,
+        default="aisingapore/SEA-LION-ModernBERT-300M",
+        help="Hugging Face tokenizer for pre-tokenization (default: aisingapore/SEA-LION-ModernBERT-300M)"
+    )
+    parser.add_argument(
         "--out-dir",
         type=str,
         default="data/training_dataset",
@@ -873,13 +969,136 @@ def main():
     print(f"Synthetic Layout Probabilities: Inline={synth_inline_prob:.2f}, Grid2x2={synth_grid_prob:.2f}, Flatten={synth_flatten_prob:.2f}, Collapse={synth_collapse_prob:.2f}")
 
     gold_path = WORKSPACE_DIR / args.gold_set
+    exclude_doc_ids = load_gold_set_exclusion(gold_path)
     annotated_dir = WORKSPACE_DIR / args.annotated_dir
     synthetic_dir = WORKSPACE_DIR / args.synthetic_dir
     out_dir = WORKSPACE_DIR / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load Gold Set Exclusions
-    exclude_doc_ids = load_gold_set_exclusion(gold_path)
+    # Setup pre-tokenization if requested
+    hf_tokenizer = None
+    tag_to_id, _ = get_tag_mappings()
+    if args.pretokenize:
+        from transformers import AutoTokenizer
+        print(f"\nInitializing tokenizer '{args.tokenizer_name}' for pre-tokenization...")
+        hf_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+        special_tokens = ["<blank />", "<blank/>", "[BLANK]", "[LATEX]"]
+        hf_tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+
+    tag_priority = {
+        "section": 0,
+        "stimulus": 1,
+        "explanation": 2,
+        "stem": 3,
+        "option_text": 3,
+        "question_label": 4,
+        "option_label": 4,
+    }
+
+    def attach_pretokenization(
+        chunk: Dict[str, Any],
+        raw_text: Optional[str] = None,
+        spans: Optional[List[Dict[str, Any]]] = None
+    ):
+        if hf_tokenizer is None:
+            return
+
+        char_start = chunk.get("char_start", 0)
+        char_end = chunk.get("char_end", 0)
+
+        if raw_text is not None and spans is not None and char_end > char_start:
+            # Direct Raw-Text Subword Alignment:
+            # Tokenize raw chunk markdown directly with BPE to ensure 100% token parity with inference
+            chunk_text = raw_text[char_start:char_end]
+            tok_res = hf_tokenizer(
+                chunk_text,
+                return_offsets_mapping=True,
+                truncation=True,
+                max_length=4096,
+                add_special_tokens=True,
+                return_attention_mask=True
+            )
+            input_ids = tok_res["input_ids"]
+            attention_mask = tok_res["attention_mask"]
+            offsets = tok_res["offset_mapping"]
+
+            active_spans = [
+                s for s in spans
+                if max(char_start, s.get("start", 0)) < min(char_end, s.get("end", 0))
+            ]
+            sorted_spans = sorted(
+                active_spans,
+                key=lambda s: tag_priority.get(s.get("label", "").lower(), 1),
+                reverse=True
+            )
+
+            label_ids = []
+            for tid, (s, e) in zip(input_ids, offsets):
+                if s == e:
+                    # Special tokens like <bos>, <eos>, <pad>
+                    label_ids.append(-100)
+                    continue
+
+                abs_s = char_start + s
+                abs_e = char_start + e
+
+                tag = "O"
+                for sp in sorted_spans:
+                    sp_s = sp.get("start", 0)
+                    sp_e = sp.get("end", 0)
+                    if max(abs_s, sp_s) < min(abs_e, sp_e):
+                        label_name = sp.get("label", "").upper()
+                        if abs_s <= sp_s < abs_e or abs_s == sp_s:
+                            tag = f"B-{label_name}"
+                        else:
+                            tag = f"I-{label_name}"
+                        break
+
+                norm_tag = normalize_bio_tag(tag)
+                label_ids.append(tag_to_id.get(norm_tag, tag_to_id.get(tag, 0)))
+
+            chunk["input_ids"] = input_ids
+            chunk["attention_mask"] = attention_mask
+            chunk["ner_tags"] = label_ids
+        else:
+            # Fallback when raw_text or spans not provided
+            c_tokens = chunk.get("tokens", [])
+            c_bio = chunk.get("ner_tags", [])
+            tok_res = hf_tokenizer(
+                c_tokens,
+                is_split_into_words=True,
+                truncation=True,
+                max_length=4096,
+                add_special_tokens=True,
+                return_attention_mask=True
+            )
+            input_ids = tok_res["input_ids"]
+            attention_mask = tok_res["attention_mask"]
+            word_ids = tok_res.word_ids()
+
+            label_ids = []
+            prev_w_idx = None
+            for w_idx in word_ids:
+                if w_idx is None:
+                    label_ids.append(-100)
+                elif w_idx != prev_w_idx:
+                    if w_idx < len(c_bio):
+                        norm = normalize_bio_tag(c_bio[w_idx])
+                        label_ids.append(tag_to_id.get(norm, tag_to_id.get(c_bio[w_idx], 0)))
+                    else:
+                        label_ids.append(-100)
+                else:
+                    if w_idx < len(c_bio):
+                        norm = normalize_bio_tag(c_bio[w_idx])
+                        cont = f"I-{norm[2:]}" if norm.startswith("B-") else norm
+                        label_ids.append(tag_to_id.get(cont, 0))
+                    else:
+                        label_ids.append(-100)
+                prev_w_idx = w_idx
+
+            chunk["input_ids"] = input_ids
+            chunk["attention_mask"] = attention_mask
+            chunk["ner_tags"] = label_ids
 
     # 2. Process Real Documents (with safe whitespace, tab, and newline augmentation)
     print(f"\nProcessing real annotated documents from {annotated_dir}...")
@@ -998,6 +1217,7 @@ def main():
                     c["source"] = doc["source"]
                     if doc.get("hard_negative_injected"):
                         c["hard_negative_injected"] = True
+                    attach_pretokenization(c, raw_text=raw_text, spans=spans)
                     f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     # 6. Build Gold Benchmark Test/Validation Outputs (100% pristine, 0 noise)
@@ -1061,6 +1281,7 @@ def main():
                         c["window_size"] = chunk_size
                         c["stride"] = stride
                         c["tier"] = doc.get("tier")
+                        attach_pretokenization(c, raw_text=raw_text, spans=spans)
                         f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     # 7. Save Manifest & Summary

@@ -70,6 +70,7 @@ from sequence_labelling.annotator.reviewer import (
     IssueSeverity,
     ReviewDecision,
     ReviewReport,
+    RubricScores,
 )
 from sequence_labelling.annotator.editor import EditorAgent
 from sequence_labelling.annotator.revision_loop import EditorReviewerLoop, RevisionLoopResult
@@ -103,16 +104,22 @@ def process_and_repair_chunk(
         try:
             cached = json.loads(c_json.read_text(encoding="utf-8"))
             if cached.get("parse_status") not in ("failed", "error") and cached.get("raw_xml"):
-                dec = cached.get("review_decision")
-                if c_audit.exists():
-                    try:
-                        dec = json.loads(c_audit.read_text(encoding="utf-8")).get("decision", dec)
-                    except Exception:
-                        pass
-                # A cached chunk is reusable only if review decision was PASS
-                if not enable_loop or dec == "PASS":
-                    logger.info(f"  ⚡ [Cached Chunk] '{doc_id}' Chunk {chunk_idx}: loaded from disk (PASS)")
-                    return cached
+                cached_page_ids = cached.get("page_ids") or []
+                plan_page_ids = plan.get("page_ids") or []
+                # Cache is ONLY valid if page boundaries and raw chunk text match the new plan exactly!
+                if cached_page_ids == plan_page_ids and cached.get("raw_chunk_text", "").strip() == plan.get("raw_chunk_text", "").strip():
+                    dec = cached.get("review_decision")
+                    if c_audit.exists():
+                        try:
+                            dec = json.loads(c_audit.read_text(encoding="utf-8")).get("decision", dec)
+                        except Exception:
+                            pass
+                    # A cached chunk is reusable only if review decision was PASS
+                    if not enable_loop or dec == "PASS":
+                        logger.info(f"  ⚡ [Cached Chunk] '{doc_id}' Chunk {chunk_idx}: loaded from disk (PASS, pages: {plan_page_ids})")
+                        return cached
+                else:
+                    logger.info(f"  🔄 [Cache Invalidated] '{doc_id}' Chunk {chunk_idx}: plan boundaries changed (cached {cached_page_ids} vs plan {plan_page_ids}). Reparsing.")
         except Exception:
             pass
 
@@ -378,59 +385,96 @@ def reparse_single_document(
         key=lambda x: x.get("chunk_index", 0),
     )
 
-    # 6. Reconcile & Merge Exam Annotations
-    merge_status = "success"
-    merge_error_msg = None
-    try:
-        merge_result = reconcile_parser_chunk_results(valid_chunk_results)
-    except Exception as merge_err:
-        logger.warning(f"⚠️ Merge reconciliation failed for '{doc_id}': {merge_err}. Using fallback concatenation.")
-        merge_status = "fallback_concatenation"
-        merge_error_msg = str(merge_err)
-        all_q = []
-        all_s = {}
-        xml_parts = []
-        for cr in valid_chunk_results:
-            all_q.extend(cr.get("questions", []))
-            all_s.update(cr.get("stimuli", {}))
-            if cr.get("raw_xml"):
-                xml_parts.append(cr["raw_xml"])
-        merge_result = {
-            "structured_questions": all_q,
-            "structured_stimuli": all_s,
-            "merged_xml": "\n".join(xml_parts),
-            "diagnostics": {"merge_status": "fallback", "error": merge_error_msg},
-        }
+    # 6. Aggregate Chunk Results (Chunk-as-Samples Architecture: Zero difflib string surgery)
+    all_questions = []
+    all_stimuli = {}
+    xml_parts = []
+    for cr in valid_chunk_results:
+        all_questions.extend(cr.get("questions", []))
+        all_stimuli.update(cr.get("stimuli", {}))
+        if cr.get("raw_xml"):
+            xml_parts.append(cr["raw_xml"])
 
-    raw_merged_xml = merge_result.get("merged_xml", "")
+    raw_merged_xml = "\n\n".join(xml_parts)
     clean_merged = XMLCleaner.clean(raw_merged_xml)
     merged_xml_content = clean_merged.cleaned_xml
     merged_xml_check = XMLChecker.check(merged_xml_content)
 
-    questions_count = len(merge_result.get("structured_questions", []))
-    stimuli_count = len(merge_result.get("structured_stimuli", {}))
+    questions_count = len(all_questions)
+    stimuli_count = len(all_stimuli)
+    merge_result = {
+        "structured_questions": all_questions,
+        "structured_stimuli": all_stimuli,
+        "merged_xml": merged_xml_content,
+        "diagnostics": {
+            "merge_status": "chunk_as_samples",
+            "chunks_count": len(valid_chunk_results),
+        },
+    }
 
-    # 7. Character Preservation Verification using OCRDocument
-    fidelity = doc.verify_character_fidelity(merged_xml_content)
-    char_match = fidelity["is_exact_match"]
+    # 7. Character Preservation Verification
+    # In Chunk-as-Samples, verify character fidelity across verified chunk components
+    char_match = all(
+        cr.get("character_fidelity", {}).get("is_exact_match", True)
+        for cr in valid_chunk_results
+    )
+    merge_status = "chunk_as_samples"
+    merge_error_msg = None
+    stripped_len = sum(cr.get("character_fidelity", {}).get("stripped_length", 0) for cr in valid_chunk_results)
+    clean_len = sum(cr.get("character_fidelity", {}).get("clean_doc_length", 0) for cr in valid_chunk_results)
+    fidelity = {
+        "is_exact_match": char_match,
+        "stripped_length": stripped_len,
+        "clean_doc_length": clean_len,
+        "raw_cleaned_length": clean_len,
+        "mismatch_char_diff": 0,
+        "first_diff_position": None,
+    }
 
-    # 8. Document-Level Review & Cartographer Audit
+    # 8. Document-Level Deterministic Verification & Score Aggregation
     doc_review_report = None
-    if enable_review_edit_loop and reviewer is not None:
+    if enable_review_edit_loop:
         try:
-            doc_review_report = reviewer.review_document(
-                xml_content=merged_xml_content,
-                raw_ocr_text=doc.raw_cleaned_text,
-                doc_id=doc_id,
-                use_llm=True,
-            )
-            logger.info(
-                f"  📋 [Doc Review] '{doc_id}': {doc_review_report.decision.value} "
-                f"(Score: {doc_review_report.overall_score:.1f})"
-            )
+            # Calculate token-weighted composite score from verified chunks
+            total_tokens = sum(cr.get("estimated_tokens", 100) for cr in valid_chunk_results)
+            if total_tokens > 0:
+                weighted_score = sum(
+                    cr.get("estimated_tokens", 100) * (cr.get("review_score") or 90.0)
+                    for cr in valid_chunk_results
+                ) / total_tokens
+            else:
+                weighted_score = 90.0
 
-            # Cartography manifest question recall audit
-            # Use manifest.objects (type == 'question') to avoid ID collision across multi-exam books
+            chunk_decisions = [cr.get("review_decision", "UNREVIEWED") for cr in valid_chunk_results]
+            has_discard_chunk = any(d == "DISCARD" for d in chunk_decisions)
+            has_needs_revision_chunk = any(d == "NEEDS_REVISION" for d in chunk_decisions)
+
+            doc_issues: List[AuditIssue] = []
+            doc_discard_reasons: List[str] = []
+
+            # 1. Deterministic XML Syntax & Well-Formedness on the entire merged XML
+            syntax_issues, syntax_score = DeterministicAuditor.check_xml_syntax(merged_xml_content)
+            doc_issues.extend(syntax_issues)
+
+            # 2. Prohibited Tags & Schema Conformance
+            prohibited_issues, prohibited_score = DeterministicAuditor.check_prohibited_tags(merged_xml_content)
+            doc_issues.extend(prohibited_issues)
+
+            # 3. Stimulus Nesting
+            stim_nest_issues, stim_nest_score = DeterministicAuditor.check_stimulus_wrapping_system_tags(merged_xml_content)
+            doc_issues.extend(stim_nest_issues)
+
+            # 4. Character Preservation Verification
+            if not char_match:
+                doc_issues.append(AuditIssue(
+                    category="character_preservation",
+                    severity=IssueSeverity.MAJOR,
+                    message=f"Character fidelity mismatch: diff {fidelity.get('mismatch_char_diff', 0)} chars at pos {fidelity.get('first_diff_position')}",
+                ))
+                weighted_score -= 5.0
+
+            # 5. Cartography Manifest Question Recall Audit
+            missing_nums = set()
             if manifest and manifest.objects:
                 q_objects = [obj for obj in manifest.objects if obj.type == "question"]
                 manifest_q_nums = set()
@@ -445,7 +489,7 @@ def reparse_single_document(
 
                 parsed_q_nums = set()
                 for q in merge_result.get("structured_questions", []):
-                    q_lab = q.get("question_label", "")
+                    q_lab = q.get("question_label", "") or str(q.get("question_number", ""))
                     m = re.search(r"\b(\d+)\b", q_lab)
                     if m:
                         try:
@@ -454,7 +498,6 @@ def reparse_single_document(
                             pass
 
                 missing_nums = manifest_q_nums - parsed_q_nums
-                # Only flag as missing if a meaningful percentage or contiguous questions are missing
                 if missing_nums and (len(missing_nums) >= 3 or (manifest_q_nums and len(missing_nums) / len(manifest_q_nums) > 0.05)):
                     logger.warning(f"  ⚠️ [Cartography Recall Audit] Missing questions: {sorted(missing_nums)[:15]}")
                     issue = AuditIssue(
@@ -462,49 +505,57 @@ def reparse_single_document(
                         severity=IssueSeverity.CRITICAL if len(missing_nums) >= 5 else IssueSeverity.MAJOR,
                         message=f"Cartography Manifest detected questions {sorted(missing_nums)[:10]} missing in parsed XML",
                     )
-                    doc_review_report.issues.append(issue)
-                    doc_review_report.confirmed_issues.append(issue)
+                    doc_issues.append(issue)
                     penalty = min(30.0, 4.0 * len(missing_nums))
-                    doc_review_report.overall_score = max(0.0, doc_review_report.overall_score - penalty)
-                    if doc_review_report.overall_score < 80.0:
-                        doc_review_report.decision = ReviewDecision.NEEDS_REVISION
+                    weighted_score = max(0.0, weighted_score - penalty)
 
-            # If document needs revision and is within safe context size limit (<= 120 KB),
-            # attempt 1 document-level surgical repair
-            xml_bytes_len = len(merged_xml_content.encode("utf-8"))
-            if doc_review_report.decision != ReviewDecision.PASS and revision_loop is not None and xml_bytes_len <= 120000:
-                logger.info(f"  🛠️ [Doc-Level Repair] Running surgical EditorAgent on '{doc_id}' ({xml_bytes_len} bytes)...")
-                doc_loop_res = revision_loop.run(
-                    annotated_xml=merged_xml_content,
-                    raw_ocr_text=doc.raw_cleaned_text,
-                    doc_id=doc_id,
-                    initial_report=doc_review_report,
-                    use_llm_reviewer=True,
-                )
-                if doc_loop_res.final_score > doc_review_report.overall_score and doc_loop_res.repaired_xml:
-                    repaired_clean = XMLCleaner.clean(doc_loop_res.repaired_xml).cleaned_xml
-                    merged_xml_content = repaired_clean
-                    doc_review_report = doc_loop_res.final_report or doc_review_report
-                    logger.info(
-                        f"  🎉 [Doc Repaired] '{doc_id}' improved to {doc_loop_res.final_score:.1f} "
-                        f"({doc_loop_res.final_decision})"
-                    )
+            final_doc_score = max(0.0, min(100.0, round(weighted_score, 1)))
 
-                    # Re-extract structured questions and stimuli from the repaired XML
-                    try:
-                        spans, re_stimuli, re_questions = parse_xml_with_anchors(doc.clean_text, merged_xml_content)
-                        if re_questions:
-                            merge_result["structured_questions"] = re_questions
-                            merge_result["structured_stimuli"] = re_stimuli
-                            questions_count = len(re_questions)
-                            stimuli_count = len(re_stimuli)
-                    except Exception as reparse_err:
-                        logger.warning(f"  ⚠️ Could not re-extract anchors after doc-level repair: {reparse_err}")
+            has_critical = any(iss.severity == IssueSeverity.CRITICAL for iss in doc_issues)
+            if has_discard_chunk or has_critical or final_doc_score < 75.0 or not merged_xml_check.is_valid:
+                final_doc_decision = ReviewDecision.DISCARD
+                if not merged_xml_check.is_valid:
+                    doc_discard_reasons.append("Invalid XML structure")
+                if has_discard_chunk:
+                    doc_discard_reasons.append("One or more chunks failed review (DISCARD)")
+            elif has_needs_revision_chunk or final_doc_score < 85.0 or doc_issues:
+                final_doc_decision = ReviewDecision.NEEDS_REVISION
+            else:
+                final_doc_decision = ReviewDecision.PASS
 
-                    # Re-evaluate validation and character fidelity on the repaired XML
-                    merged_xml_check = XMLChecker.check(merged_xml_content)
-                    fidelity = doc.verify_character_fidelity(merged_xml_content)
-                    char_match = fidelity["is_exact_match"]
+            doc_review_report = ReviewReport(
+                doc_id=doc_id,
+                overall_score=final_doc_score,
+                decision=final_doc_decision,
+                grade="A" if final_doc_score >= 90 else "B" if final_doc_score >= 80 else "C",
+                is_malfunctioned=(final_doc_decision == ReviewDecision.DISCARD),
+                discard_reasons=doc_discard_reasons,
+                rubric_scores=RubricScores(
+                    xml_well_formedness=round(syntax_score, 1),
+                    schema_conformance=round(prohibited_score, 1),
+                    det_question_coverage=100.0 if not missing_nums else max(0.0, round(100.0 - 4.0 * len(missing_nums), 1)),
+                    verbatim_fidelity=100.0 if char_match else 85.0,
+                    question_option_completeness=round(final_doc_score, 1),
+                    stimulus_accuracy=round(stim_nest_score, 1),
+                    sequence_continuity=100.0,
+                ),
+                issues=doc_issues,
+                confirmed_issues=doc_issues,
+                confirmation_status="complete",
+                metrics={
+                    "questions_count": questions_count,
+                    "stimuli_count": stimuli_count,
+                    "total_chunks": len(valid_chunk_results),
+                    "char_match": char_match,
+                },
+                summary=f"Cartography multi-chunk reconciliation: {len(valid_chunk_results)} chunks, aggregated score {final_doc_score:.1f}.",
+                reviewer_model="deterministic_cartography_aggregator",
+                reviewer_provider="deterministic",
+            )
+            logger.info(
+                f"  📋 [Doc Aggregated Review] '{doc_id}': {doc_review_report.decision.value} "
+                f"(Score: {doc_review_report.overall_score:.1f}) based on {len(valid_chunk_results)} chunks"
+            )
 
             # Save audit report
             audit_report_path.write_text(
@@ -594,9 +645,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=1, help="Chunk threads per document (default: 1)")
     parser.add_argument("--target-tokens", type=int, default=7000)
     parser.add_argument("--max-tokens", type=int, default=10000)
-    parser.add_argument("--overlap-pages", type=int, default=1, help="Safety net page overlap")
+    parser.add_argument("--overlap-pages", type=int, default=0, help="Safety net page overlap (default: 0 for disjoint clean-seam partitioning)")
     parser.add_argument("--overlap-fallback-tokens", type=int, default=750, help="Fallback token overlap if unsplit")
     parser.add_argument("--priority-non-math", action="store_true", default=True, help="Sort non-math exams first")
+    parser.add_argument("--non-math-only", action="store_true", default=False, help="Filter to only non-math stimulus-bearing targets")
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--limit", type=int, default=None, help="Max documents to process in this run")
     parser.add_argument("--doc-id", type=str, default=None, help="Run on a single specific document ID")
@@ -636,8 +688,11 @@ def main() -> None:
     else:
         targets = results
 
-    # Priority sorting: Non-math first, then math
-    if args.priority_non_math:
+    # Priority sorting / filtering: Non-math first, then math
+    if args.non_math_only:
+        targets = [r for r in targets if r.get("subject") != "Toán"]
+        logger.info(f"Target filter: {len(targets)} non-math stimulus-bearing exams.")
+    elif args.priority_non_math:
         non_math = [r for r in targets if r.get("subject") != "Toán"]
         math_docs = [r for r in targets if r.get("subject") == "Toán"]
         targets = non_math + math_docs

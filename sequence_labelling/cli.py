@@ -233,6 +233,16 @@ def _cmd_audit(args: argparse.Namespace) -> None:
         r_args.append("--no-llm")
     if args.granularity:
         r_args.extend(["--granularity", str(args.granularity)])
+    if args.filter_decision:
+        r_args.extend(["--filter-decision", str(args.filter_decision)])
+    if args.pattern:
+        r_args.extend(["--pattern", str(args.pattern)])
+    if args.manifest:
+        r_args.extend(["--manifest", str(args.manifest)])
+    if args.concurrency:
+        r_args.extend(["--concurrency", str(args.concurrency)])
+    if args.no_rollup:
+        r_args.append("--no-rollup")
 
     old_argv = sys.argv
     try:
@@ -636,6 +646,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--overwrite", action="store_true", default=False)
     p_audit.add_argument("--no-llm", action="store_true", default=False)
     p_audit.add_argument("--granularity", type=str, default="chunk", choices=["chunk", "document"])
+    p_audit.add_argument("--filter-decision", type=str, default=None, help="Only re-evaluate docs matching decisions (e.g. NEEDS_REVISION)")
+    p_audit.add_argument("--pattern", type=str, default=None, help="Glob/substring filter on document directories")
+    p_audit.add_argument("--manifest", type=str, default=None, help="Manifest file of document folders or chunk XMLs")
+    p_audit.add_argument("--concurrency", type=int, default=4)
+    p_audit.add_argument("--no-rollup", action="store_true", default=False, help="Do not roll chunk audits up into document-level reports")
     _add_tmux_args(p_audit)
 
     # repair

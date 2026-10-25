@@ -197,6 +197,10 @@ def build_structured_questions(
         (s for s in selected_spans if s.label == "stimulus"),
         key=lambda span: (span.start, span.end),
     )
+    section_spans = sorted(
+        (s for s in selected_spans if s.label == "section"),
+        key=lambda span: (span.start, span.end),
+    )
     explanation_spans = [s for s in selected_spans if s.label == "explanation"]
 
     questions: List[Dict[str, Any]] = []
@@ -239,30 +243,57 @@ def build_structured_questions(
                 "text": txt_str,
             })
 
-        # Find enclosing or preceding stimulus
+        # Find enclosing or closest preceding stimulus (bounded by section dividers)
         stim_id = None
         stim_text = ""
         if structured_stimuli:
+            # 1. Check enclosing stimulus first
             for s_id, s_data in structured_stimuli.items():
                 s_range = s_data.get("source_range", {})
-                s_end = s_range.get("end", 0)
                 s_start = s_range.get("start", 0)
-                if s_start <= q_lab.start and s_end <= q_lab.start:
-                    if q_lab.start - s_end < 5000:
-                        stim_id = s_id
-                        stim_text = s_data.get("text", "")
+                s_end = s_range.get("end", 0)
+                if s_start <= q_lab.start and s_end >= q_lab.end:
+                    stim_id = s_id
+                    stim_text = s_data.get("text", "")
+                    break
+
+            # 2. Check preceding stimulus (closest without intervening section header)
+            if not stim_id:
+                candidate_preceding = []
+                for s_id, s_data in structured_stimuli.items():
+                    s_range = s_data.get("source_range", {})
+                    s_end = s_range.get("end", 0)
+                    if s_end <= q_lab.start and (q_lab.start - s_end < 5000):
+                        # Verify no section header closed this stimulus context
+                        has_intervening_section = any(
+                            s_end <= sec.start < q_lab.start for sec in section_spans
+                        )
+                        if not has_intervening_section:
+                            candidate_preceding.append((s_end, s_id, s_data.get("text", "")))
+
+                if candidate_preceding:
+                    candidate_preceding.sort(key=lambda x: x[0])
+                    _, stim_id, stim_text = candidate_preceding[-1]
+
         if not stim_id:
-            preceding_stims = [s for s in stimulus_spans if s.end <= q_lab.start]
             enclosing_stims = [
                 s for s in stimulus_spans
                 if s.start <= q_lab.start and s.end >= q_lab.end
             ]
-            active_stim = enclosing_stims[-1] if enclosing_stims else (
-                preceding_stims[-1] if preceding_stims else None
-            )
-            if active_stim:
+            if enclosing_stims:
+                active_stim = enclosing_stims[-1]
                 stim_text = canonical_text[active_stim.start:active_stim.end].strip()
                 stim_id = f"stim_{active_stim.start}_{active_stim.end}"
+            else:
+                preceding_stims = [
+                    s for s in stimulus_spans
+                    if s.end <= q_lab.start
+                    and not any(s.end <= sec.start < q_lab.start for sec in section_spans)
+                ]
+                if preceding_stims:
+                    active_stim = preceding_stims[-1]
+                    stim_text = canonical_text[active_stim.start:active_stim.end].strip()
+                    stim_id = f"stim_{active_stim.start}_{active_stim.end}"
 
         # Find explanation
         exp_text = ""
