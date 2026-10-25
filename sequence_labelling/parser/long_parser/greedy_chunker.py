@@ -45,53 +45,50 @@ def split_unpaged_document(
     text = page.get("text", "")
     global_start = page.get("global_start", 0)
     paragraphs = text.split("\n\n")
-    sub_pages: List[Dict[str, Any]] = []
-    curr_paras: List[str] = []
-    curr_tokens = 0
-    p_num = 1
-    char_offset = 0
-
+    para_offsets: List[int] = []
+    pos = 0
     for para in paragraphs:
-        p_toks = max(1, len(para.split()))
-        curr_paras.append(para)
-        curr_tokens += p_toks
+        para_offsets.append(pos)
+        pos += len(para) + 2
 
-        if curr_tokens >= target_tokens:
-            body = "\n\n".join(curr_paras)
-            sub_pages.append({
-                "p": p_num,
-                "text": body,
-                "estimated_tokens": curr_tokens,
-                "global_start": global_start + char_offset,
-                "global_end": global_start + char_offset + len(body),
-                "head": "CLEAN",
-                "tail": "CLEAN",
-            })
-            char_offset += len(body) + 2
-            p_num += 1
+    sub_pages: List[Dict[str, Any]] = []
+    first_idx = 0  # index of the first paragraph in the current window (may be carried-over overlap)
+    curr_tokens = 0
+    new_paras = 0  # paragraphs in the window that were not already emitted
+    p_num = 1
 
-            overlap_paras: List[str] = []
-            overlap_toks = 0
-            for op in reversed(curr_paras):
-                op_toks = max(1, len(op.split()))
-                overlap_paras.insert(0, op)
-                overlap_toks += op_toks
-                if overlap_toks >= overlap_fallback_tokens:
-                    break
-            curr_paras = list(overlap_paras)
-            curr_tokens = overlap_toks
-
-    if curr_paras:
-        body = "\n\n".join(curr_paras)
+    def emit(last_idx: int) -> None:
+        body = "\n\n".join(paragraphs[first_idx:last_idx + 1])
+        start = global_start + para_offsets[first_idx]
         sub_pages.append({
             "p": p_num,
             "text": body,
             "estimated_tokens": curr_tokens,
-            "global_start": global_start + char_offset,
-            "global_end": global_start + char_offset + len(body),
+            "global_start": start,
+            "global_end": start + len(body),
             "head": "CLEAN",
             "tail": "CLEAN",
         })
+
+    for idx, para in enumerate(paragraphs):
+        curr_tokens += max(1, len(para.split()))
+        new_paras += 1
+
+        if curr_tokens >= target_tokens:
+            emit(idx)
+            p_num += 1
+
+            overlap_first = idx + 1
+            overlap_toks = 0
+            while overlap_first > first_idx + 1 and overlap_toks < overlap_fallback_tokens:
+                overlap_first -= 1
+                overlap_toks += max(1, len(paragraphs[overlap_first].split()))
+            first_idx = overlap_first
+            curr_tokens = overlap_toks
+            new_paras = 0
+
+    if new_paras:
+        emit(len(paragraphs) - 1)
     return sub_pages
 
 
@@ -112,12 +109,16 @@ def greedy_oversize_chunker(
     if not page_list:
         return []
 
-    # Pre-processing: If document has only 1 page (unpaged text) and exceeds max_tokens, split into pseudo-pages
+    # Pre-processing: Split oversized individual pages (> max_tokens) into pseudo-pages
     expanded_pages: List[Dict[str, Any]] = []
     for p in page_list:
         p_toks = p.get("estimated_tokens") or max(50, len(p.get("text", "").split()))
-        if p_toks > max_tokens and len(page_list) == 1:
-            expanded_pages.extend(split_unpaged_document(p, target_tokens, max_tokens, overlap_fallback_tokens))
+        if p_toks > max_tokens:
+            split_pages = split_unpaged_document(p, target_tokens, max_tokens, overlap_fallback_tokens)
+            if len(page_list) > 1:
+                for sp in split_pages:
+                    sp["p"] = p.get("p", 1)
+            expanded_pages.extend(split_pages)
         else:
             expanded_pages.append(p)
 
@@ -125,6 +126,13 @@ def greedy_oversize_chunker(
     current_chunk: List[Dict[str, Any]] = []
     current_tokens = 0
     active_context_header = None
+
+    # Determine terminal exam page from cartography (end of all questions and stimuli)
+    max_manifest_page = 0
+    if cartography is not None:
+        for obj in cartography.objects:
+            if obj.page_span and obj.type in ("question", "stimulus"):
+                max_manifest_page = max(max_manifest_page, obj.page_span[1])
 
     for page in expanded_pages:
         p_num = page.get("p", 1)
@@ -140,7 +148,10 @@ def greedy_oversize_chunker(
         if cartography is not None:
             # Topological boundary snapping: snap cleanly if seam is clean once target budget reached
             is_clean = cartography.is_seam_clean(p_num)
-            if is_clean and current_tokens >= target_tokens:
+            if is_clean and max_manifest_page > 0 and p_num == max_manifest_page and p_num < len(expanded_pages):
+                # Terminal exam boundary cut: cleanly isolate the exam from post-exam appendices / solutions
+                should_cut = True
+            elif is_clean and current_tokens >= target_tokens:
                 should_cut = True
             elif current_tokens >= max_tokens:
                 should_cut = True
