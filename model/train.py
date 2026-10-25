@@ -1221,15 +1221,22 @@ def main():
         raise ValueError(f"max_length={max_length} exceeds the backbone's max_position_embeddings={max_positions}")
     config.output_hidden_states = True
     config._attn_implementation = attn_impl
+    config.torch_dtype = torch.float32
 
     try:
         base_model = AutoModel.from_pretrained(
             model_name,
             config=config,
+            torch_dtype=torch.float32,
             attn_implementation=attn_impl,
         )
     except TypeError:
-        base_model = AutoModel.from_pretrained(model_name, config=config)
+        base_model = AutoModel.from_pretrained(
+            model_name,
+            config=config,
+            torch_dtype=torch.float32,
+        )
+    base_model = base_model.to(torch.float32)
 
     orig_vocab_size = getattr(config, "vocab_size", len(tokenizer))
     base_model.resize_token_embeddings(len(tokenizer))
@@ -1319,7 +1326,7 @@ def main():
         use_conv_refinement=use_conv_refinement,
         conv_kernel_size=conv_kernel_size,
         per_branch_focal_loss=per_branch_focal_loss
-    ).to(device)
+    ).to(device=device, dtype=torch.float32)
 
     # 5b. Checkpoint Resume Resolution (Auto, Local Path, or Hugging Face Hub)
     resume_dir = None
@@ -1671,7 +1678,7 @@ def main():
             interval_batch_count += 1
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
-                if use_amp and amp_dtype == torch.float16:
+                if use_amp and amp_dtype == torch.float16 and scaler.is_enabled():
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(train_cfg.get("max_grad_norm", 1.0)))
                     scale_before = scaler.get_scale()
