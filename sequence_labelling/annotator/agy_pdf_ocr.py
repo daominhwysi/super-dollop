@@ -23,6 +23,7 @@ import pymupdf
 
 from sequence_labelling.annotator.pdf_converter import (
     SYSTEM_PROMPT_LONG_CONTEXT,
+    normalize_batch_metadata,
     prune_code_blocks,
     prune_think_tags,
 )
@@ -376,6 +377,8 @@ class AgyPDFOCRConverter:
         call_duration = time.time() - t_call_start
 
         cleaned_md = prune_code_blocks(prune_think_tags(raw_response))
+        if target_pages:
+            cleaned_md = normalize_batch_metadata(cleaned_md, target_pages[0])
         total_duration = time.time() - t0
 
         telemetry = {

@@ -165,12 +165,23 @@ def heuristic_metadata_fallback(
         subject = "Địa lí"
     elif re.search(r"\b(tin học|tin hoc)\b", combined):
         subject = "Tin học"
-    elif re.search(r"\b(gdcd|kinh tế và pháp luật|gdkt&pl|gdkt)\b", combined):
+    elif re.search(r"\b(gdcd|giáo dục công dân|giao duc cong dan|kinh tế và pháp luật|gdkt&pl|gdkt)\b", combined):
         subject = "GDCD / GDKT&PL"
+    elif re.search(r"\b(khoa học tự nhiên|khtn|khoa hoc tu nhien)\b", combined):
+        subject = "Khoa học tự nhiên"
+    elif re.search(r"\b(lịch sử và địa lí|lịch sử và địa lý|lich su va dia li|ls&đl)\b", combined):
+        subject = "Lịch sử và Địa lí"
 
     # 2. Grade detection
     grade = None
-    grade_match = re.search(r"\b(?:khối|lớp|k|toán|toan|tiếng anh|hóa|lí|sinh)?\s*(10|11|12|9|8|7|6)\b", clean_name)
+    # Check explicit grade markers in clean_name first, then combined context
+    grade_match = re.search(r"\b(?:khối|lớp|k|toán|toan|tiếng anh|hóa|lí|sinh)\s*(10|11|12|9|8|7|6)\b", clean_name)
+    if not grade_match:
+        grade_match = re.search(r"\b(?:khối|lớp|k|toán|toan|tiếng anh|hóa|lí|sinh)\s*(10|11|12|9|8|7|6)\b", combined)
+    if not grade_match:
+        # Standalone number only in clean_name if not preceded by date/ordinal markers (ngày/ngay, tháng/thang, lần/lan, đề/de số)
+        grade_match = re.search(r"(?<!ngày\s)(?<!ngay\s)(?<!tháng\s)(?<!thang\s)(?<!lần\s)(?<!lan\s)(?<!số\s)(?<!so\s)\b(10|11|12|9|8|7|6)\b", clean_name)
+
     if grade_match:
         grade = grade_match.group(1)
     elif "thpt quốc gia" in combined or "tốt nghiệp thpt" in combined or "thpt quoc gia" in combined:
