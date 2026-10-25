@@ -281,13 +281,13 @@ def main():
         "--target-tokens",
         type=int,
         default=350000,
-        help="Target total token budget for gold benchmark (default: 350,000 tokens ~11% of corpus)"
+        help="Target total token budget for gold benchmark (default: 350,000 tokens ~11%% of corpus)"
     )
     parser.add_argument(
         "--token-ratio",
         type=float,
         default=None,
-        help="Target token budget as ratio of total corpus tokens (e.g. 0.10 for 10%)"
+        help="Target token budget as ratio of total corpus tokens (e.g. 0.10 for 10%%)"
     )
     parser.add_argument(
         "--max-doc-tokens",
@@ -342,23 +342,42 @@ def main():
         if not d.is_dir():
             continue
         doc_id = d.name
-        audit_file = d / "audit_report.json"
         merged_json_file = d / "merged.json"
         merged_xml_file = d / "merged.xml"
 
-        if not (audit_file.exists() and merged_json_file.exists() and merged_xml_file.exists()):
+        if not (merged_json_file.exists() and merged_xml_file.exists()):
+            continue
+
+        score = None
+        audit_file = d / "audit_report.json"
+        if audit_file.exists():
+            try:
+                audit = json.loads(audit_file.read_text(encoding="utf-8"))
+                score = float(audit.get("overall_score", 0.0))
+            except Exception:
+                pass
+
+        if score is None:
+            chunk_audits = list((d / "chunks").glob("chunk_*.audit.json"))
+            if chunk_audits:
+                c_scores = []
+                for ca in chunk_audits:
+                    try:
+                        c_data = json.loads(ca.read_text(encoding="utf-8"))
+                        c_scores.append(float(c_data.get("overall_score", 0.0)))
+                    except Exception:
+                        pass
+                if c_scores:
+                    score = sum(c_scores) / len(c_scores)
+
+        if score is None or score < args.min_score:
             continue
 
         try:
-            audit = json.loads(audit_file.read_text(encoding="utf-8"))
             merged_json = json.loads(merged_json_file.read_text(encoding="utf-8"))
             merged_xml = merged_xml_file.read_text(encoding="utf-8")
         except Exception as e:
             print(f"Error reading {doc_id}: {e}")
-            continue
-
-        score = float(audit.get("overall_score", 0.0))
-        if score < args.min_score:
             continue
 
         qs = merged_json.get("questions", [])
