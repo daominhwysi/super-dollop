@@ -109,7 +109,9 @@ class SearchReplacePatcher:
         if not search_str or not search_str.strip():
             return None
 
-        # Level 1: Exact
+        # Level 1: Exact (ambiguous matches are rejected so the caller can disambiguate)
+        if text.count(search_str) > 1:
+            return None
         idx = text.find(search_str)
         if idx != -1:
             return (idx, idx + len(search_str))
@@ -221,8 +223,16 @@ class SearchReplacePatcher:
             search_str = block.search_text
             replace_str = block.replace_text
 
-            # Level 1: Exact substring match
-            if search_str in current_text:
+            # Level 1: Exact substring match (must be unambiguous)
+            exact_count = current_text.count(search_str)
+            if exact_count > 1:
+                snippet = search_str[:80].replace("\n", " ")
+                failed_reasons.append(
+                    f"Block #{idx} SEARCH block is ambiguous ({exact_count} matches); "
+                    f"add surrounding context to make it unique: '{snippet}...'"
+                )
+                continue
+            if exact_count == 1:
                 current_text = current_text.replace(search_str, replace_str, 1)
                 applied_count += 1
                 continue

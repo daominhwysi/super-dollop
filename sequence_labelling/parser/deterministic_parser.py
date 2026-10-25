@@ -358,6 +358,16 @@ def _make_span(text: str, start: int, end: int, label: str) -> Optional[Dict[str
         return None
     return {"start": start, "end": end, "label": label, "text": text[start:end]}
 
+_HEADING_PREFIX_RE = re.compile(r"#{1,6}[ \t]+$")
+
+def _heading_start(text: str, start: int, floor: int = 0) -> int:
+    """Moves `start` back over an immediately preceding Markdown heading marker ('## ') on the same line."""
+    line_start = max(floor, _line_start_index(text, start))
+    m = _HEADING_PREFIX_RE.search(text, line_start, start)
+    if m and not text[line_start:m.start()].strip():
+        return m.start()
+    return start
+
 def _strip_trailing_decor(text: str, start: int, end: int) -> int:
     while end > start and text[start:end].endswith(("**", "__", ":", ".")):
         end -= 1
@@ -420,10 +430,14 @@ def parse_chunk_deterministic(raw_text: str) -> ParseResult:
 
         # 2. Derive question & option spans with local interval scoping
         for i, q in enumerate(questions):
-            next_q_start = questions[i + 1].start if i + 1 < len(questions) else region_end
-            
-            # Question Label
-            lbl_span = _make_span(raw_text, q.start, q.end, "question_label")
+            next_q_start = (
+                _heading_start(raw_text, questions[i + 1].start, q.end)
+                if i + 1 < len(questions)
+                else region_end
+            )
+
+            # Question Label (includes a leading Markdown heading marker such as "## ")
+            lbl_span = _make_span(raw_text, _heading_start(raw_text, q.start, region_start), q.end, "question_label")
             if lbl_span:
                 all_spans.append(lbl_span)
 
