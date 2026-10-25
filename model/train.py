@@ -383,9 +383,9 @@ def generate_model_readme(
     """Generates comprehensive Hugging Face Model Card README.md with YAML metadata, benchmarks, and usage."""
     metrics = metrics or {}
     macro_f1 = metrics.get("macro_f1", 0.0)
-    precision = metrics.get("precision", 0.0)
-    recall = metrics.get("recall", 0.0)
-    micro_f1 = metrics.get("micro_f1", 0.0)
+    precision = metrics.get("precision", None)
+    recall = metrics.get("recall", None)
+    micro_f1 = metrics.get("micro_f1", None)
 
     base_model = base_model_name or (getattr(args, "model_name_or_path", "aisingapore/SEA-LION-ModernBERT-300M") if args else "aisingapore/SEA-LION-ModernBERT-300M")
     lr = getattr(args, "learning_rate", 3e-5) if args else 3e-5
@@ -396,14 +396,18 @@ def generate_model_readme(
     metrics_yaml = f"""    - name: Validation Macro F1
       type: f1
       value: {macro_f1 * 100:.2f}"""
-    if precision > 0:
+    if precision is not None and precision > 0:
         metrics_yaml += f"""\n    - name: Validation Precision
       type: precision
       value: {precision * 100:.2f}"""
-    if recall > 0:
+    if recall is not None and recall > 0:
         metrics_yaml += f"""\n    - name: Validation Recall
       type: recall
       value: {recall * 100:.2f}"""
+    if micro_f1 is not None and micro_f1 > 0:
+        metrics_yaml += f"""\n    - name: Validation Micro F1
+      type: f1
+      value: {micro_f1 * 100:.2f}"""
 
     readme = f"""---
 language:
@@ -414,14 +418,14 @@ base_model: {base_model}
 tags:
 - sequence-labeling
 - token-classification
-- bert
-- mmbert
+- modernbert
+- sea-lion
 - vietnamese
 - exam-parser
 - educational
 - zero-character-mutation
 datasets:
-- daominhwysi/synthetic-seq-labelling-vi-exam-v2
+- daominhwysi/sequence-labelling-vi-exam-v3
 metrics:
 - f1
 - precision
@@ -439,15 +443,15 @@ model-index:
       type: token-classification
       name: Token Classification (Sequence Labelling)
     dataset:
-      name: Vietnamese Exam Sequence Labelling Dataset v2
-      type: daominhwysi/synthetic-seq-labelling-vi-exam-v2
+      name: Vietnamese Exam Sequence Labelling Dataset v3
+      type: daominhwysi/sequence-labelling-vi-exam-v3
     metrics:
 {metrics_yaml}
 ---
 
 # {repo_id.split('/')[-1]}
 
-Production-grade token classification and sequence labelling model fine-tuned from **[{base_model}](https://huggingface.co/{base_model})** on the comprehensive [Vietnamese Exam Sequence Labelling Dataset v2](https://huggingface.co/datasets/daominhwysi/synthetic-seq-labelling-vi-exam-v2).
+Production-grade token classification and sequence labelling model fine-tuned from **[{base_model}](https://huggingface.co/{base_model})** on the comprehensive [Vietnamese Exam Sequence Labelling Dataset v3](https://huggingface.co/datasets/daominhwysi/sequence-labelling-vi-exam-v3).
 
 Designed for granular structural extraction from Vietnamese educational examinations (grades 8–12 across Math, Physics, Chemistry, Biology, History, Geography, Literature, and English), supporting both scanned and digital documents with **Zero Character Mutation guarantee**.
 
@@ -455,9 +459,12 @@ Designed for granular structural extraction from Vietnamese educational examinat
 
 ## Model Architecture
 
-- **Base Encoder**: `{base_model}` (Multilingual ModernBERT)
-- **Classification Head**: `EnhancedBertForTokenClassification` featuring **Multi-Layer Hidden State Fusion** (fusing the last 4 hidden transformer layers via learned scalar weights) + Dropout + Linear projection.
-- **Context Length**: Trained with multi-scale sliding window configurations (`[512, 128]`, `[768, 192]`, `[1024, 256]`, `[2048, 512]`) to preserve both short question boundaries and extended reading comprehension passages.
+- **Base Encoder**: `{base_model}` (Multilingual ModernBERT, 8192 max context, unpad flash attention)
+- **Classification Head**: `EnhancedBertForTokenClassification` featuring:
+  - **SigmoidWeightedLayerPooling**: 4-layer sigmoid-gated layer pooling replacing competing softmax
+  - **1D Depthwise Convolutional Refinement**: `kernel_size=7` capturing local boundary n-grams
+  - **Multi-Sample Dropout (MSD)**: `[0.05, 0.10, 0.15, 0.20, 0.25]`
+- **Context Length**: Trained with dynamic multi-scale windows (`768`, `1024`, `1536`, `2048`) with `LengthGroupedBatchSampler`.
 
 ---
 
@@ -483,14 +490,14 @@ The model performs token-level sequence labelling using standard BIO tagging:
 
 ## Evaluation Results (Gold Benchmark Test Set)
 
-Evaluated on the strictly isolated 4-tier **Gold Benchmark** (63 pristine real exam documents, ~458k tokens):
+Evaluated on the strictly isolated 4-tier **Gold Benchmark** (51 pristine real exam documents, ~458k tokens):
 
 | Metric | Score |
 | :--- | :--- |
 | **Validation Macro F1** | **{macro_f1 * 100:.2f}%** |
-| **Precision** | **{precision * 100:.2f}%** |
-| **Recall** | **{recall * 100:.2f}%** |
-| **Micro F1** | **{micro_f1 * 100:.2f}%** |
+| **Precision** | **{f"{precision * 100:.2f}%" if precision is not None else "N/A"}** |
+| **Recall** | **{f"{recall * 100:.2f}%" if recall is not None else "N/A"}** |
+| **Micro F1** | **{f"{micro_f1 * 100:.2f}%" if micro_f1 is not None else "N/A"}** |
 
 *Checkpoint synced at Epoch {epoch or epochs_val}/{epochs_val}.*
 
@@ -771,6 +778,10 @@ def run_evaluation(
                 id_to_tag=id_to_tag,
                 is_main_process=is_main_process
             )
+            with open(output_dir / "best" / "metrics.json", "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2)
+            with open(output_dir / "best_dev_metrics.json", "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2)
             update_latest_checkpoint_link(output_dir, output_dir / "best", is_main_process=is_main_process)
 
             if args.push_to_hub and args.hub_model_id:
@@ -1810,6 +1821,7 @@ def main():
         if args.dry_run:
             break
 
+    final_metrics: Dict[str, float] = {}
     if test_loader is not None:
         best_dir = output_dir / "best"
         if best_dir.exists():
@@ -1817,14 +1829,27 @@ def main():
         _, test_preds, test_labels = evaluate_split(model, test_loader, device, use_amp, amp_dtype, id_to_tag)
         if is_main_process:
             test_metrics = compute_entity_metrics(test_preds, test_labels)
+            final_metrics = test_metrics
             print(
                 f"\n[Final Gold Benchmark] Macro F1: {test_metrics['macro_f1'] * 100:.2f}% | "
-                f"Precision: {test_metrics['precision'] * 100:.2f}% | Recall: {test_metrics['recall'] * 100:.2f}%"
+                f"Precision: {test_metrics['precision'] * 100:.2f}% | Recall: {test_metrics['recall'] * 100:.2f}% | "
+                f"Micro F1: {test_metrics['micro_f1'] * 100:.2f}%"
             )
             with open(output_dir / "gold_test_metrics.json", "w", encoding="utf-8") as f:
                 json.dump(test_metrics, f, indent=2)
+            if best_dir.exists():
+                with open(best_dir / "gold_test_metrics.json", "w", encoding="utf-8") as f:
+                    json.dump(test_metrics, f, indent=2)
 
     if is_main_process:
+        if not final_metrics and (output_dir / "best_dev_metrics.json").exists():
+            try:
+                final_metrics = json.loads((output_dir / "best_dev_metrics.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if not final_metrics:
+            final_metrics = {"macro_f1": best_macro_f1}
+
         print(f"\nTraining completed! Best Dev Macro F1: {best_macro_f1 * 100:.2f}%")
         if mlflow_client is not None and mlflow_client.active_run() is not None:
             try:
@@ -1834,11 +1859,13 @@ def main():
 
         # Final push to Hugging Face Hub if requested
         if args.push_to_hub and args.hub_model_id:
+            push_folder = output_dir / "best" if (output_dir / "best").exists() else output_dir
+            macro_score = final_metrics.get("macro_f1", best_macro_f1)
             push_checkpoint_to_hub(
                 repo_id=args.hub_model_id,
-                folder_path=output_dir,
-                commit_message=f"Final mmBERT on Vietnamese Exam Sequence Labelling (Macro F1: {best_macro_f1 * 100:.2f}%)",
-                metrics={"macro_f1": best_macro_f1},
+                folder_path=push_folder,
+                commit_message=f"Final SEA-LION-ModernBERT on Vietnamese Exam Sequence Labelling (Macro F1: {macro_score * 100:.2f}%)",
+                metrics=final_metrics,
                 args=args,
                 tag_to_id=tag_to_id,
                 epoch=epochs

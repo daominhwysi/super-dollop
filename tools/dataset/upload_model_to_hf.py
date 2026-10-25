@@ -10,6 +10,9 @@ import json
 import argparse
 import time
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 WORKSPACE_DIR = Path(__file__).resolve().parents[2]
 if str(WORKSPACE_DIR) not in sys.path:
@@ -30,8 +33,14 @@ def parse_args():
     parser.add_argument(
         "--repo-id",
         type=str,
-        default="daominhwysi/mmbert-small-vi-exam-seq-labeling",
-        help="Hugging Face model repository ID (default: daominhwysi/mmbert-small-vi-exam-seq-labeling)"
+        default="daominhwysi/sealior-modernbert-vi-exam-seq-labeling",
+        help="Hugging Face model repository ID (default: daominhwysi/sealior-modernbert-vi-exam-seq-labeling)"
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default="aisingapore/SEA-LION-ModernBERT-300M",
+        help="Base model architecture name (default: aisingapore/SEA-LION-ModernBERT-300M)"
     )
     parser.add_argument(
         "--macro-f1",
@@ -50,6 +59,12 @@ def parse_args():
         type=float,
         default=None,
         help="Validation Recall score"
+    )
+    parser.add_argument(
+        "--micro-f1",
+        type=float,
+        default=None,
+        help="Validation Micro F1 score"
     )
     parser.add_argument(
         "--commit-message",
@@ -102,23 +117,40 @@ def main():
         metrics["precision"] = args.precision
     if args.recall is not None:
         metrics["recall"] = args.recall
+    if args.micro_f1 is not None:
+        metrics["micro_f1"] = args.micro_f1
 
     # Look for evaluation metrics in model_dir if not specified via CLI
-    trainer_state_file = model_dir / "trainer_state.json"
-    if not metrics and trainer_state_file.exists():
-        try:
-            t_state = json.loads(trainer_state_file.read_text(encoding="utf-8"))
-            if "best_macro_f1" in t_state:
-                metrics["macro_f1"] = float(t_state["best_macro_f1"])
-        except Exception:
-            pass
+    metric_candidates = [
+        model_dir / "gold_test_metrics.json",
+        model_dir / "best" / "gold_test_metrics.json",
+        model_dir / "best" / "metrics.json",
+        model_dir / "metrics.json",
+        model_dir / "best_dev_metrics.json",
+        model_dir / "trainer_state.json",
+    ]
+    for cand in metric_candidates:
+        if cand.exists():
+            try:
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                for key in ["macro_f1", "precision", "recall", "micro_f1"]:
+                    if key in data and key not in metrics:
+                        metrics[key] = float(data[key])
+                if "best_macro_f1" in data and "macro_f1" not in metrics:
+                    metrics["macro_f1"] = float(data["best_macro_f1"])
+                if metrics:
+                    print(f"Loaded evaluation metrics from '{cand}': {metrics}")
+                    break
+            except Exception:
+                pass
 
     # 2. Generate and save Model Card README.md
     print("Generating comprehensive Model Card README.md...")
     readme_content = generate_model_readme(
         repo_id=repo_id,
         metrics=metrics,
-        tag_to_id=tag_to_id
+        tag_to_id=tag_to_id,
+        base_model_name=args.base_model
     )
 
     readme_path = model_dir / "README.md"
