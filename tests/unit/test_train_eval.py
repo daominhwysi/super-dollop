@@ -81,3 +81,62 @@ def test_distributed_batch_sampler_padding_and_step_balance():
     for s in samplers:
         assert len(s) == 2
 
+
+def test_run_evaluation_non_best_checkpoint_pruning(tmp_path):
+    import argparse
+    from unittest.mock import MagicMock
+
+    model = _tiny_model()
+    input_ids = torch.randint(3, 200, (2, 8))
+    labels = torch.tensor([
+        [1, 2, 0, 0, 1, 2, 0, 0],
+        [0, 1, 2, 0, 0, 0, 0, 0],
+    ])
+    loader = [{"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "labels": labels}]
+    dummy_tokenizer = MagicMock()
+
+    output_dir = tmp_path / "model_out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "checkpoint-1000").mkdir()
+
+    args = argparse.Namespace(
+        dry_run=False,
+        push_to_hub=False,
+        hub_model_id=None,
+        save_total_limit=1,
+    )
+
+    best_macro_f1, patience, stop_training = train_module.run_evaluation(
+        model=model,
+        val_loader=loader,
+        device=torch.device("cpu"),
+        use_amp=False,
+        amp_dtype=torch.float32,
+        id_to_tag=ID_TO_TAG,
+        tag_to_id=TAG_TO_ID,
+        tokenizer=dummy_tokenizer,
+        optimizer=None,
+        scheduler=None,
+        scaler=None,
+        epoch=2,
+        epochs=8,
+        global_step=1500,
+        output_dir=output_dir,
+        is_main_process=True,
+        is_distributed=False,
+        best_macro_f1=1.0,  # Forces is_best=False (else branch with pruning)
+        patience_counter=0,
+        max_patience=3,
+        args=args,
+        eval_title="Step 1500 Evaluation",
+        save_total_limit=1,
+    )
+
+    assert best_macro_f1 == 1.0
+    assert patience == 1
+    assert not stop_training
+    assert (output_dir / "checkpoint-1500").exists()
+    # Checkpoint 1000 should be pruned because save_total_limit is 1
+    assert not (output_dir / "checkpoint-1000").exists()
+
+

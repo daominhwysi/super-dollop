@@ -303,8 +303,8 @@ def save_training_checkpoint(
         "step_in_epoch": step_in_epoch,
         "best_macro_f1": best_macro_f1,
         "patience_counter": patience_counter,
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state_dict": scaler.state_dict() if scaler and scaler.is_enabled() else None,
         "rng_state": {
             "python": random.getstate(),
@@ -716,7 +716,8 @@ def run_evaluation(
     args: Any,
     mlflow_client: Any = None,
     eval_title: str = "Evaluation",
-    force_push_hub: bool = False
+    force_push_hub: bool = False,
+    save_total_limit: int = 1,
 ) -> Tuple[float, int, bool]:
     """
     Runs full evaluation over the validation/gold test set, computes entity-level metrics,
@@ -801,23 +802,29 @@ def run_evaluation(
                 stop_training = True
 
             eval_step_dir = output_dir / f"checkpoint-{global_step}"
-            save_training_checkpoint(
-                save_dir=eval_step_dir,
-                model=model,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=epoch,
-                global_step=global_step,
-                best_macro_f1=best_macro_f1,
-                patience_counter=patience_counter,
-                tag_to_id=tag_to_id,
-                id_to_tag=id_to_tag,
-                is_main_process=is_main_process
-            )
+            if not eval_step_dir.exists():
+                save_training_checkpoint(
+                    save_dir=eval_step_dir,
+                    model=model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_macro_f1=best_macro_f1,
+                    patience_counter=patience_counter,
+                    tag_to_id=tag_to_id,
+                    id_to_tag=id_to_tag,
+                    is_main_process=is_main_process
+                )
             update_latest_checkpoint_link(output_dir, eval_step_dir, is_main_process=is_main_process)
-            prune_checkpoints(output_dir, save_total_limit, is_main_process=is_main_process)
+            effective_save_limit = (
+                save_total_limit
+                if save_total_limit is not None
+                else getattr(args, "save_total_limit", None) or 1
+            )
+            prune_checkpoints(output_dir, effective_save_limit, is_main_process=is_main_process)
             if force_push_hub and args.push_to_hub and args.hub_model_id:
                 push_checkpoint_to_hub(
                     repo_id=args.hub_model_id,
@@ -1753,7 +1760,8 @@ def main():
                         max_patience=max_patience,
                         args=args,
                         mlflow_client=mlflow_client,
-                        eval_title=f"Step {global_step} Evaluation"
+                        eval_title=f"Step {global_step} Evaluation",
+                        save_total_limit=save_total_limit,
                     )
                     last_eval_step = global_step
                     if stop_training:
@@ -1817,7 +1825,8 @@ def main():
                 args=args,
                 mlflow_client=mlflow_client,
                 eval_title=f"Epoch {epoch} Milestone",
-                force_push_hub=True
+                force_push_hub=True,
+                save_total_limit=save_total_limit,
             )
             last_eval_step = global_step
 
