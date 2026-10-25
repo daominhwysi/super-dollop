@@ -188,6 +188,7 @@ def predict_text(
     Runs sequence labeling on a raw text document with sliding window, batched GPU execution,
     Hann window cosine overlapping logit blending, and Constrained Viterbi BIO decoding.
     """
+    device = torch.device(device)
     model.eval()
     clean_text = text.replace("\r\n", "\n").replace("\r", "\n")
     
