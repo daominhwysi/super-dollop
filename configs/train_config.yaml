@@ -86,15 +86,15 @@ training:
 
   # Checkpointing & Validation
   eval_strategy: "steps"
-  eval_steps: 500                        # Evaluate the dev set every 500 optimization steps (~half an epoch)
+  eval_steps: 1000                       # Evaluate the dev set every 1000 optimization steps (~1 per epoch + milestone)
   save_strategy: "steps"
-  save_steps: 500                        # Save rolling mid-epoch checkpoint every 500 optimization steps
+  save_steps: 1000                       # Save rolling mid-epoch checkpoint every 1000 optimization steps
   save_total_limit: 1                    # Keep 1 rolling checkpoint to prevent disk exhaustion on Kaggle/Colab (20GB quota)
   # The best dev checkpoint is written to <output_dir>/best and is the one scored on the gold benchmark.
   load_best_model_at_end: true
   metric_for_best_model: "eval_macro_f1"  # Selected on the dev split, never on the gold benchmark
   greater_is_better: true
-  early_stopping_patience: 4             # Stop training after 4 evals without improvement (2000 steps tolerance)
+  early_stopping_patience: 8             # Stop training after 8 evals without improvement (8000 steps tolerance)
 
 # ------------------------------------------------------------------------------
 # 5. Logging & Tracking
