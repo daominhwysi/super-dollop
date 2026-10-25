@@ -73,7 +73,7 @@ training:
   per_device_train_batch_size: 4         # Batch size per GPU/device
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4         # Effective batch size = 16
-  num_train_epochs: 4
+  num_train_epochs: 8
   lr_scheduler_type: "cosine"            # Cosine annealing with warmup
   warmup_ratio: 0.10                     # 10% warmup steps
   max_grad_norm: 1.0                     # Gradient clipping threshold
@@ -86,15 +86,15 @@ training:
 
   # Checkpointing & Validation
   eval_strategy: "steps"
-  eval_steps: 1000                        # Evaluate the dev set every 1000 optimization steps
+  eval_steps: 500                        # Evaluate the dev set every 500 optimization steps (~half an epoch)
   save_strategy: "steps"
-  save_steps: 1000                       # Save rolling mid-epoch checkpoint every 1000 optimization steps
+  save_steps: 500                        # Save rolling mid-epoch checkpoint every 500 optimization steps
   save_total_limit: 1                    # Keep 1 rolling checkpoint to prevent disk exhaustion on Kaggle/Colab (20GB quota)
   # The best dev checkpoint is written to <output_dir>/best and is the one scored on the gold benchmark.
   load_best_model_at_end: true
   metric_for_best_model: "eval_macro_f1"  # Selected on the dev split, never on the gold benchmark
   greater_is_better: true
-  early_stopping_patience: 3             # Stop training after 3 evals without improvement
+  early_stopping_patience: 4             # Stop training after 4 evals without improvement (2000 steps tolerance)
 
 # ------------------------------------------------------------------------------
 # 5. Logging & Tracking

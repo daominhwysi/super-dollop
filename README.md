@@ -1,120 +1,117 @@
 # Vietnamese Sequence Labelling v2
 
-Vietnamese examination-document processing tools for OCR, sequence-labelling annotation, structural merging, deterministic auditing, LLM review, and surgical XML repair.
+Vietnamese examination-document processing engine and neural sequence-labelling framework for autonomous OCR ingestion, spatial document cartography, character-preserving XML annotation, deterministic auditing, LLM semantic review, surgical XML repair, and sub-millisecond transformer inference.
 
-The project is designed for school exams, cloze tests, reading passages, multiple-choice questions, answer keys, figures, tables, and long multi-page stimuli. It preserves source text while adding structural tags such as `<question_label>`, `<stem>`, `<option_label>`, `<option_text>`, and `<stimulus>`.
+The project is built specifically for Vietnamese national high school examinations (TN THPT, GDPT 2018), cloze tests, reading passages, multiple-choice questions, true/false propositional items, short answers, figures, tables, and multi-page reading stimuli. It guarantees 100% character fidelity against the raw source text while annotating structural spans (`<question_label>`, `<stem>`, `<option_label>`, `<option_text>`, `<stimulus>`, `<section>`, `<explanation>`, `<figure>`).
 
-## What is in the repository?
+---
 
-The main processing path is:
+## Architecture Pipeline
 
-```text
-PDF / image → OCR Markdown → chunking/parser/reconciliation
-           → merged.xml + merged.json → deterministic audit
-           → semantic review → PASS / NEEDS_REVISION / DISCARD
-           → editor/reviewer repair loop for NEEDS_REVISION
+```mermaid
+flowchart TD
+    A[Raw Exam PDFs / Images] --> B["Vision OCR (vsl ocr)"]
+    B --> C["Standardized Page-Aware Markdown + Metadata"]
+    
+    C --> D1["Stage 1: Document Cartographer (vsl cartography)"]
+    C --> D2["Exam Metadata Catalog (vsl metadata)"]
+    
+    D1 --> E["Stage 2: Cartography-Locked Chunks (~4K Tokens, Clean Seams)"]
+    
+    E -->|"Fast Path (< 0.5ms)"| F1["Deterministic Parser (deterministic_parser.py)"]
+    E -->|Deep LLM Path| F2["Stage 3: Parallel LLM Workers (vsl parse)"]
+    
+    F2 --> G["Stage 4: Chunk-as-Samples & Source Merger (serializer_validator.py)"]
+    F1 --> G
+    
+    G --> H["Stage 5: Dual-Granularity Auditor & Reviewer (vsl audit)"]
+    
+    H -->|"PASS (Score >= 85)"| I["Canonical Ground Truth (data/sequence_labelling_annotated/)"]
+    H -->|NEEDS_REVISION| J["Stage 6: Surgical Editor Loop (vsl repair)"]
+    
+    J -->|Isolated Branch Staging| K["data/sequence_labelling_annotated_branch/"]
+    K -->|vsl branch merge| I
+    
+    I --> L["Dataset Compiler (vsl dataset build)"]
+    L --> M1["Hugging Face Hub (Default Spans, BIO Chunks, Generative)"]
+    L --> M2["Direct Raw-Text BPE Pretokenization"]
+    
+    M2 --> N["ModernBERT-300M Fine-Tuning (seqlabel-train)"]
+    N --> O["Sliding-Window Constrained Viterbi Inference (seqlabel-predict)"]
 ```
 
-Important components:
+---
 
-- `sequence_labelling/annotator/pdf_converter.py`: PDF/image OCR with optional RF-DETR figure detection.
-- `sequence_labelling/annotator/annotate_ocr.py`: OCR/annotation-oriented text processing.
-- `sequence_labelling/parser/long_parser/`: passage-locked chunking, parser workers, reconciliation, anchoring, and serialization.
-- `sequence_labelling/annotator/reviewer.py`: deterministic auditing, LLM semantic review, scoring, and routing.
-- `sequence_labelling/annotator/editor.py`: exact Search/Replace XML repair.
-- `sequence_labelling/annotator/revision_loop.py`: isolated editor/reviewer rounds.
-- `sequence_labelling/api.py`: OCR/job and OpenAI-compatible worker API.
+## Requirements & Setup
 
-## Requirements and setup
+- **Python**: 3.10 or newer
+- **Package Manager**: [`uv`](https://docs.astral.sh/uv/)
+- **Hardware**: CPU supported for OCR/parsing/deterministic audits; GPU (NVIDIA T4 / V100 / A100 / H100) required for neural transformer training.
 
-- Python 3.10 or newer
-- [`uv`](https://docs.astral.sh/uv/)
-- Credentials for the providers/models you use
-
-Install the project environment:
+### 1. Installation
 
 ```bash
+# Clone the repository
+git clone https://github.com/daominhwysi/super-dollop.git
+cd super-dollop
+
+# Install core dependencies (CLI, OCR, parsers, APIs)
 uv sync
+
+# (Optional) Install neural training & evaluation dependencies (PyTorch, Transformers, Accelerate, MLflow)
+uv sync --extra train
 ```
 
-If you will run Review Studio:
+### 2. Environment Configuration
 
-```bash
-uv pip install jinja2
-```
-
-Create a local `.env` file for provider credentials. Do not commit it.
+Create a local `.env` file in the project root:
 
 ```dotenv
-OPENAI_API_KEY=...
-# Optional provider-specific credentials:
-# XAH_API_KEY=...
-# LLM_API_KEY=...
-# NVIDIA_API_KEY=...
-# DEEPSEEK_API_KEY=...
-# CMD_API_KEY=...
+OPENAI_API_KEY=your_key_here
+
+# Optional Provider Credentials
+DEEPSEEK_API_KEY=your_key_here
+XAH_API_KEY=your_key_here
+NVIDIA_API_KEY=your_key_here
+
+# Optional Remote MLflow / DagsHub Tracking
+MLFLOW_TRACKING_USERNAME=your_username
+MLFLOW_TRACKING_PASSWORD=your_token
 ```
 
-Provider endpoints, default models, token budgets, reviewer thresholds, and figure detection are configured in [`configs/parser_config.yaml`](configs/parser_config.yaml). Training configurations reside in [`configs/train_config.yaml`](configs/train_config.yaml) and augmentation settings in [`configs/augmentation_config.yaml`](configs/augmentation_config.yaml). The main data locations can be overridden with:
+Verify resolved paths:
 
 ```bash
-export SEQUENCE_LABEL_DATA_DIR=/path/to/data
-export SEQUENCE_LABEL_MODEL_DIR=/path/to/models
-export SEQUENCE_LABEL_ARTIFACTS_DIR=/path/to/artifacts
+uv run vsl paths
 ```
 
-Inspect resolved defaults with:
+---
+
+## CLI Entrypoints Reference
+
+The toolkit installs five dedicated console scripts defined in [`pyproject.toml`](pyproject.toml):
+
+| Command | Entrypoint | Description |
+|---|---|---|
+| `vsl` / `sequence-label` | `sequence_labelling.cli:main` | **Unified operational CLI** covering the entire dataset, parsing, audit, repair, and monitoring lifecycle. |
+| `synthetic-exam-gen` | `synthetic_exam_generator.cli:main` | Synthesizes curriculum-grounded Vietnamese examinations across difficulty tiers. |
+| `seqlabel-train` | `model.train:main` | Distributed fine-tuning of `aisingapore/SEA-LION-ModernBERT-300M` with `LengthGroupedBatchSampler`. |
+| `seqlabel-predict` | `model.inference.predict:main` | High-throughput sliding-window inference with Constrained Viterbi BIO decoding. |
+| `seqlabel-export` | `model.export:main` | Exports trained models to ONNX and deployable checkpoint bundles. |
+
+---
+
+## End-to-End Operational Workflow (`vsl` CLI)
+
+Check the live status of all pipeline components anytime:
 
 ```bash
-uv run sequence-label paths
-```
-
-## Training metrics
-
-Install the optional training dependencies with `uv sync --extra train`. Copy `.env.example` to `.env` for local training credentials; shell and Kaggle environment variables take precedence. Training logs parameters, periodic loss and learning rate, and validation metrics to a local MLflow run by default. DagsHub tracking is configured in [`configs/dagshub_config.yaml`](configs/dagshub_config.yaml); set `MLFLOW_TRACKING_USERNAME` and `MLFLOW_TRACKING_PASSWORD` to authenticate. Each DagsHub run uses the configured experiment name with a timestamp suffix. Set `enabled: false` to disable DagsHub and use the normal local MLflow setup. Start the local UI with:
-
-```bash
-uv run mlflow ui
-```
-
-## Data layout
-
-Runtime datasets are intentionally local and ignored by Git:
-
-```text
-data/
-├── sequence_labelling_input_data_raw/   # source PDFs/images
-├── sequence_labelling_input_data/       # OCR Markdown
-├── sequence_labelling_annotated/        # canonical merged XML/JSON
-├── sequence_labelling_annotated_branch/ # editor candidates/checkpoints
-└── ...
-
-artifacts/
-└── ocr_logs/                            # generated reports/logs
-```
-
-An annotated document commonly contains:
-
-```text
-<document>/
-├── merged.xml
-├── merged.json
-├── audit_report.json
-└── chunks/
-```
-
-`merged.xml` is the source-preserving sequence-labelled representation. `merged.json` contains structured questions and stimuli derived from the XML. The merger validates that removing annotation tags reproduces the canonical source text.
-
-## End-to-end batch workflow (Unified `vsl` CLI)
-
-The project provides a unified CLI tool `vsl` (also accessible as `sequence-label` or `python -m sequence_labelling.cli`) that wraps the end-to-end dataset pipeline:
-
-```bash
-# Check status across OCR, annotation, quality review, and branch staging
 uv run vsl status
 ```
 
-### 1. OCR PDFs or images
+### 1. Vision OCR Ingestion
+
+Converts raw examination PDFs and images into standardized, page-aware Markdown with automatic rate-limit recovery:
 
 ```bash
 uv run vsl ocr \
@@ -123,9 +120,26 @@ uv run vsl ocr \
   --concurrency 2
 ```
 
-Use `--overwrite` only when intentionally regenerating existing Markdown. The OCR stage supports PDF and common image formats and emits page-aware Markdown with figure metadata where configured.
+### 2. Document Cartography & Metadata Catalog
 
-### 2. Annotate OCR Markdown
+Scans document layout top-to-bottom to extract topological page boundaries and catalog subject, grade, and year:
+
+```bash
+# Generate spatial cartography manifests (clean-cut seams, stimuli spans, question ranges)
+uv run vsl cartography \
+  --input-dir data/sequence_labelling_input_data \
+  --out-dir data/document_cartography \
+  --model gpt-6-luna
+
+# Extract structured exam metadata catalog
+uv run vsl metadata \
+  --input-dir data/sequence_labelling_input_data \
+  --out-file data/dataset_metadata_catalog.json
+```
+
+### 3. Cartography-Locked Annotation (`parse`)
+
+Runs parallel LLM parser workers on cartography-locked chunks (~4K tokens):
 
 ```bash
 uv run vsl parse \
@@ -136,156 +150,196 @@ uv run vsl parse \
   --concurrency 4
 ```
 
-The tool skips documents with existing `merged.json` unless `--overwrite` is supplied. Use `--limit` and concurrency settings for controlled batches.
+### 4. Quality Audit (`audit`)
 
-### 3. Audit the annotated dataset
+Performs dual-granularity deterministic and LLM semantic quality auditing:
 
 ```bash
+# Document or chunk level audit with semantic review
 uv run vsl audit \
   --annotated-dir data/sequence_labelling_annotated \
   --raw-dir data/sequence_labelling_input_data \
+  --granularity chunk \
   --provider codex \
   --model gpt-5.6-luna \
   --thinking high \
-  --out-report artifacts/review_report.md
-```
+  --out-report data/review_report.json
 
-The reviewer writes a Markdown report and a JSON report beside the requested output. Existing per-document `audit_report.json` files are reused unless `--overwrite` is supplied.
-
-For a fast deterministic-only audit:
-
-```bash
+# Fast deterministic-only audit (<0.5ms per chunk, no LLM cost)
 uv run vsl audit \
   --annotated-dir data/sequence_labelling_annotated \
   --raw-dir data/sequence_labelling_input_data \
   --no-llm
 ```
 
-### 4. Repair `NEEDS_REVISION` documents
+### 5. Surgical Repair Loop (`repair`)
 
-The editor/reviewer loop never overwrites the canonical annotated directory. It writes candidates and checkpoint artifacts to the branch directory.
+Executes multi-round surgical search-and-replace repairs on `NEEDS_REVISION` documents. **All edits stage strictly in an isolated branch directory**:
 
 ```bash
 uv run vsl repair \
   --report data/review_report.json \
   --filter needs_revision \
   --concurrency 4 \
-  --reuse-prerun-logs \
-  --auto-save \
+  --granularity chunk \
   --branch-dir data/sequence_labelling_annotated_branch \
   --out-report artifacts/reports/revision_resolution_report.json
 ```
 
-Safe continuation is the default:
+- **Unambiguous Patching**: `SearchReplacePatcher` rejects search blocks with `count > 1` to prevent misaligned edits.
+- **Cache Invalidation**: Chunks are re-parsed automatically if cartography boundaries or raw text changed.
 
-- compatible branch checkpoints are resumed;
-- documents checkpointed as `PASS` are skipped;
-- unresolved candidates are reviewed from their latest branch XML;
-- `--no-resume` starts from the original annotated XML;
-- `--retry-unresolved` retries prior unresolved checkpoints;
-- `--dry-run` performs no file writes;
-- `--force-large` includes documents above the default 300 KB XML limit.
+### 6. Merge Approved Branch Candidates (`branch merge`)
 
-Each resumed document can contain:
-
-```text
-<branch>/<document>/
-├── merged.xml
-├── merged.json
-├── revision_state.json
-└── revisions/
-    ├── initial_review.json
-    └── round_001.json
-```
-
-The aggregate report is checkpointed as documents finish. Any `vsl` command can run inside a detached background TMUX session by appending `--tmux [SESSION_NAME]`:
-
-```bash
-# Launch in detached background tmux session
-uv run vsl repair --tmux vsl-repair --filter needs_revision --concurrency 4
-
-# Inspect, attach, tail logs, or kill TMUX sessions directly
-uv run vsl tmux list
-uv run vsl tmux attach vsl-repair
-uv run vsl tmux logs vsl-repair
-uv run vsl tmux kill vsl-repair
-```
-
-### 5. Merge approved branch repairs to canonical dataset
+Verifies character fidelity (`strip_tags(candidate) == strip_tags(original)`), valid XML syntax, and minimum score threshold before promoting branch candidates into the canonical dataset:
 
 ```bash
 uv run vsl branch merge \
   --branch-dir data/sequence_labelling_annotated_branch \
-  --target-dir data/sequence_labelling_annotated
+  --target-dir data/sequence_labelling_annotated \
+  --min-score 60.0
 ```
 
-### 6. Build Token Classification & Span Training Splits
+### 7. Compile Dataset Splits & Publish (`dataset build`)
+
+Compiles verified annotations into token classification, character span, and generative instruction splits:
 
 ```bash
 uv run vsl dataset build \
   --output-dir data/dataset_training_splits \
-  --synthetic-ratio 0.2
+  --synthetic-ratio 0.4 \
+  --train-ratio 0.8 \
+  --val-ratio 0.1 \
+  --test-ratio 0.1
 ```
 
-### 7. Re-merge annotation chunks (Source Merger)
+- **Direct BPE Pretokenization**: Uses `attach_pretokenization` to align raw subwords directly with character offsets, guaranteeing 100% token parity between training and inference.
+- **Multi-Config Hugging Face Export**: Publishes three distinct subsets via [`tools/dataset/upload_dataset_to_hf.py`](tools/dataset/upload_dataset_to_hf.py):
+  1. `default`: Document-level character spans.
+  2. `bio_chunks`: Multi-scale sliding-window BIO chunks.
+  3. `generative`: Structured question-answering instruction pairs.
+
+### 8. Benchmark Evaluation (`evaluate`)
 
 ```bash
-uv run python tools/annotation/remerge_annotated_dataset.py \
-  --input data/sequence_labelling_annotated \
-  --concurrency 8
+# Evaluate against 63 Gold Benchmark documents
+uv run vsl evaluate gold --gold-manifest data/gold_benchmark_63_documents.json
+
+# Evaluate Deterministic Parser F1 accuracy
+uv run vsl evaluate det-f1
+
+# Evaluate full 500-document corpus invariants
+uv run vsl evaluate corpus-500
 ```
 
-This rebuilds merged files from retained chunk outputs and is useful after chunk-level repairs or parser changes.
+---
 
-## Annotation contract
+## Native Detached TMUX Orchestration
 
-Recognized structural tags include:
+Any `vsl` operational command can run as an independent background session by appending `--tmux [SESSION_NAME]`:
+
+```bash
+# Launch a 4-worker repair job in background TMUX
+uv run vsl repair --tmux vsl-repair-batch --concurrency 4
+
+# Inspect active sessions
+uv run vsl tmux list
+
+# Tail live output logs
+uv run vsl tmux logs vsl-repair-batch
+
+# Attach interactively
+uv run vsl tmux attach vsl-repair-batch
+
+# Terminate session
+uv run vsl tmux kill vsl-repair-batch
+```
+
+---
+
+## Neural Model Architecture & Training
+
+### Backbone: `aisingapore/SEA-LION-ModernBERT-300M`
+
+- **Context Window**: 8,192 tokens (configured to 2,048 for sliding windows).
+- **Attention**: PyTorch Native SDPA (`attn_implementation: "sdpa"`), RoPE, and Unpad token packing.
+- **Enhanced Classification Head (`model/module/head.py`)**:
+  - `SigmoidWeightedLayerPooling`: 4-layer sigmoid-gated layer pooling replacing competing softmax.
+  - 1D Depthwise Convolutional Refinement (`kernel_size=7`).
+  - Tightened Multi-Sample Dropout (MSD): 5 branches with rates `[0.05, 0.10, 0.15, 0.20, 0.25]`.
+  - `per_branch_focal_loss: true`: Evaluates Focal Loss ($\gamma=2.0$, smoothed inverse frequency $\alpha$) per branch prior to ensemble averaging.
+- **Efficient Batching**: `LengthGroupedBatchSampler` buckets sequences of similar length (512, 768, 1024, 2048) by 64-token intervals to eliminate GPU pad-token waste.
+
+### Launch Distributed Training
+
+```bash
+uv run seqlabel-train \
+  --config configs/train_config.yaml
+```
+
+Track training metrics in real-time with local MLflow:
+
+```bash
+uv run mlflow ui
+```
+
+---
+
+## Synthetic Exam Generation & Data Augmentation
+
+Configuration resides in [`configs/augmentation_config.yaml`](configs/augmentation_config.yaml):
+
+- **Curriculum Synthesis**: Generates diverse question stems and distractors across high-school subjects (Math, Physics, Chemistry, Biology, History, Geography, GDCD, KHTN).
+- **Layout Permutations**: Horizontal inline choices (`A. ... B. ...`), 2x2 grids, and barem variations.
+- **Paired Real Whitespace Augmentation**: Prevents noise compounding on scanned documents by keeping 100% of real docs pristine while generating paired whitespace-augmented clones for 25% of training records.
+- **Adversarial Hard Negatives**: Spliced definitions, formula cards, and outlines injected as background `'O'` tokens to minimize false-positive question detection.
+
+Generate synthetic curriculum sets:
+
+```bash
+uv run synthetic-exam-gen \
+  --output-dir data/synthetic_exams \
+  --count 100 \
+  --subject toan
+```
+
+---
+
+## Annotation Contract & Tag Specifications
+
+Recognized sequence labeling XML tags:
 
 ```xml
-<section>...</section>
-<stimulus id="stim_1" start_anchor="..." end_anchor="..." />
-<question_label>Câu 1</question_label>
-<stem>...</stem>
-<option_label>A</option_label>
-<option_text>...</option_text>
-<explanation>...</explanation>
-<figure id="fig_1" description="..." />
+<section>Phần I. Câu trắc nghiệm nhiều phương án lựa chọn</section>
+<stimulus id="stim_1" start_anchor="Dựa vào thông tin" end_anchor="trả lời các câu hỏi sau." />
+<question_label>## Câu 1.</question_label>
+<stem>Cho hàm số bậc ba $y = f(x)$ có đồ thị như hình vẽ...</stem>
+<option_label>A.</option_label> <option_text>$y = 1$</option_text>
+<option_label>B.</option_label> <option_text>$y = -1$</option_text>
+<option_label>C.</option_label> <option_text>$y = 2$</option_text>
+<option_label>D.</option_label> <option_text>$y = 0$</option_text>
+<explanation>Lời giải chi tiết: Ta có đạo hàm...</explanation>
+<figure id="fig_1" description="Đồ thị hàm số bậc ba" />
 ```
 
-The source text must remain unchanged after annotation tags are removed. The merger and serializer enforce this invariant and reject out-of-bounds or unbalanced spans.
+### Core Tagging Invariants
 
-### Questions without explicit stems are valid
+1. **Stemless Cloze / Fill-in Questions**:
+   `<question_label>` does **not** require a following `<stem>`. Questions indexing passage blanks (e.g. `<question_label>Câu 631</question_label> <option_label>A.</option_label>...`) are 100% valid.
+2. **Heading Marker Preservation**:
+   Markdown heading markers immediately preceding question labels belong inside the tag: `<question_label>## Câu 1.</question_label>`.
+3. **Sentence Arrangement Exception**:
+   In sentence/paragraph rearrangement items, sentences labeled `a., b., c., d.` belong inside `<stem>`, while `A., B., C., D.` are tagged as `<option_label>`.
+4. **Section-Bounded Stimuli**:
+   Intervening `<section>` dividers terminate preceding `<stimulus>` context, preventing stimulus leakage into subsequent exam parts.
+5. **Character Identity Invariant**:
+   `strip_tags(annotated_xml) == raw_ocr_text` must hold with 100% character precision.
 
-A question label does not always need a following `<stem>`. Cloze, fill-in-the-blank, and passage-indexed questions may validly begin with options:
+---
 
-```xml
-<question_label>Câu 631</question_label>
-<option_label>A.</option_label><option_text>...</option_text>
-```
+## HTTP Services (FastAPI Worker API)
 
-The parser, reviewer, editor, and deterministic auditor must preserve this form. The editor must not invent an empty or synthetic stem when the raw source contains no explicit question prompt.
-
-### Review routing
-
-The reviewer combines deterministic checks with semantic review. Deterministic findings are not automatically actionable: the semantic reviewer confirms true positives before they are sent to the editor. Critical and major defects remain routing gates even when the numeric score is high.
-
-The editor uses exact Search/Replace blocks:
-
-```text
-<<<<<<< SEARCH
-old XML text
-=======
-new XML text
->>>>>>> REPLACE
-```
-
-The reviewer is stateless across rounds and receives only the raw source plus the current candidate XML. Editor conversation history is retained only by the editor for that document’s repair rounds.
-
-## HTTP services
-
-### OCR and worker API
-
-Start the worker:
+Launch the background worker service:
 
 ```bash
 PYTHONPATH=. uv run uvicorn sequence_labelling.api:app \
@@ -293,88 +347,45 @@ PYTHONPATH=. uv run uvicorn sequence_labelling.api:app \
   --port 8100
 ```
 
-Endpoints:
+### Endpoints
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/v1/health` | Health check |
-| `POST` | `/v1/jobs` | Submit a PDF/image upload or `raw_text` job |
-| `GET` | `/v1/jobs` | List in-memory jobs |
-| `GET` | `/v1/jobs/{job_id}` | Get job status and result |
-| `DELETE` | `/v1/jobs/{job_id}` | Remove an in-memory job |
-| `POST` | `/v1/answer-keys/map` | Extract and map answer keys to supplied questions |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat proxy |
+| `GET` | `/v1/health` | Health check and worker readiness |
+| `POST` | `/v1/jobs` | Submit PDF/image upload or raw text sequence labelling job |
+| `GET` | `/v1/jobs` | List active in-memory jobs |
+| `GET` | `/v1/jobs/{job_id}` | Inspect job progress and output XML/JSON |
+| `DELETE` | `/v1/jobs/{job_id}` | Cancel/delete an in-memory job |
+| `POST` | `/v1/answer-keys/map` | Extract and map answer keys to structured question IDs |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible LLM proxy endpoint |
 
-Example raw-text job:
+---
 
-```bash
-curl -X POST http://localhost:8100/v1/jobs \
-  -F 'raw_text=Câu 1. Chọn đáp án đúng. A. Một B. Hai'
-```
+## Testing & Quality Assurance
 
-Jobs are held in process memory. They are not a durable queue and disappear when the worker restarts.
-
-## Configuration and providers
-
-`configs/parser_config.yaml` defines provider base URLs and default model assignments for OCR, parser/annotation, linker, answer-key mapping, reviewer, editor, figure detection, and chunking.
-
-The provider adapter in `sequence_labelling/llm/deepseek_client.py` routes requests to configured OpenAI-compatible services, Codex, or the local `agy` adapter. Keep API keys in `.env` or the process environment; never place secrets in `configs/parser_config.yaml` or committed reports.
-
-## Testing
-
-Focused editor/reviewer tests:
+Run the comprehensive unit test suite:
 
 ```bash
-UV_CACHE_DIR=/tmp/vsl-uv-cache uv run pytest \
-  tests/unit/ocr/test_revision_loop.py \
-  tests/unit/ocr/test_editor_agent.py -q
+UV_CACHE_DIR=/tmp/vsl-uv-cache uv run pytest tests/unit/ -q
 ```
 
-Configured suite:
+Run source merger and chunk provenance integration tests:
 
 ```bash
-UV_CACHE_DIR=/tmp/vsl-uv-cache uv run pytest -q
+UV_CACHE_DIR=/tmp/vsl-uv-cache uv run pytest tests/test_merger/ -q
 ```
 
-The tests cover OCR helpers, XML cleaning/checking, deterministic auditing, parser/merger invariants, review payloads, editor patching, revision loops, and provider adapters.
+The test suites validate OCR helpers, XML checkers/cleaners, deterministic auditing, boundary seam reconcilers, multi-scale sliding windows, classification heads, Viterbi decoders, and unified CLI operations.
 
-## Troubleshooting
+---
 
-### `uv` cannot create its cache
+## Directory Data Invariant
 
-Point the cache at a writable location:
+- `data/` and `artifacts/ocr_logs/` are local runtime directories and are gitignored.
+- All candidate edits and re-annotations stage in `data/sequence_labelling_annotated_branch/`.
+- All research reports and benchmark evaluations reside in `artifacts/reports/`.
 
-```bash
-UV_CACHE_DIR=/tmp/vsl-uv-cache uv run ...
-```
-
-### Review Studio fails with a Jinja2 import error
-
-Install the currently undeclared optional dependency:
-
-```bash
-uv pip install jinja2
-```
-
-### A document is skipped as oversized
-
-The editor/reviewer loop defaults to 300 KB per XML document. Inspect the document first, then use `--force-large` when the larger request is intentional.
-
-### A revision loop is interrupted
-
-Rerun the same command. Compatible `revision_state.json` checkpoints and branch candidates are used automatically. Inspect `revision_resolution_report.json` and each document’s `revisions/` directory before retrying unresolved documents.
-
-### A provider request fails
-
-Check the selected provider in `configs/parser_config.yaml`, the matching environment variable, the model name, and the provider base URL. Start with `--limit 1` or `--doc-id ...` before launching a large batch.
-
-## Repository rules
-
-- Treat `data/`, model files, artifacts, and logs as runtime state, not source-controlled code.
-- Preserve the canonical annotated directory during automated repair; use a branch directory for candidates.
-- Do not infer missing stems for valid cloze or passage-indexed questions.
-- Do not bypass major or critical review defects because a composite score is high.
-- Keep source-fidelity and structural validation enabled when changing parser, merger, reviewer, or editor behavior.
+---
 
 ## License
 

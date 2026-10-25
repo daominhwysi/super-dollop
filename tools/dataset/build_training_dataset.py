@@ -181,6 +181,181 @@ def chunk_bio_sequence(
     return chunks
 
 
+def tokenize_and_align_subwords(
+    raw_text: str,
+    spans: List[Dict[str, Any]],
+    tokenizer: Any,
+    tag_to_id: Dict[str, int],
+    tag_priority: Optional[Dict[str, int]] = None
+) -> Tuple[List[int], List[int], List[Tuple[int, int]], List[str]]:
+    """
+    Directly tokenizes raw examination markdown using ModernBERT tokenizer
+    without regex word splitting intermediaries, mapping character spans directly
+    to subword token BIO labels. Ensures 100% token length parity with model
+    context limits and inference runtime.
+    """
+    tok_res = tokenizer(
+        raw_text,
+        return_offsets_mapping=True,
+        truncation=False,
+        add_special_tokens=False
+    )
+    input_ids = tok_res["input_ids"]
+    offsets = tok_res["offset_mapping"]
+
+    if not spans:
+        labels = [tag_to_id.get("O", 0)] * len(input_ids)
+        bio_tags = ["O"] * len(input_ids)
+        return input_ids, labels, offsets, bio_tags
+
+    priority = tag_priority or {
+        "section": 0,
+        "stimulus": 1,
+        "explanation": 2,
+        "stem": 3,
+        "option_text": 3,
+        "question_label": 4,
+        "option_label": 4,
+    }
+    sorted_spans = sorted(
+        spans,
+        key=lambda s: (priority.get(s.get("label", "").lower(), 1), s.get("start", 0)),
+        reverse=True
+    )
+
+    labels = []
+    bio_tags = []
+    for tid, (s, e) in zip(input_ids, offsets):
+        if s == e:
+            labels.append(-100)
+            bio_tags.append("O")
+            continue
+
+        tag = "O"
+        for sp in sorted_spans:
+            sp_s = sp.get("start", 0)
+            sp_e = sp.get("end", 0)
+            if max(s, sp_s) < min(e, sp_e):
+                label_name = sp.get("label", "").upper()
+                if s <= sp_s < e or s == sp_s:
+                    tag = f"B-{label_name}"
+                else:
+                    tag = f"I-{label_name}"
+                break
+
+        norm_tag = normalize_bio_tag(tag)
+        labels.append(tag_to_id.get(norm_tag, tag_to_id.get(tag, 0)))
+        bio_tags.append(norm_tag)
+
+    return input_ids, labels, offsets, bio_tags
+
+
+def chunk_subword_sequence(
+    doc_id: str,
+    raw_text: str,
+    input_ids: List[int],
+    labels: List[int],
+    offsets: List[Tuple[int, int]],
+    window_configs: List[Tuple[int, int]],
+    source: str = "real",
+    is_dynamic: bool = False,
+    dynamic_choices: Optional[List[Tuple[int, int]]] = None,
+    rng: Optional[random.Random] = None,
+    tier: Optional[str] = None,
+    hard_negative_injected: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Chunks a subword token sequence into sliding windows.
+    When is_dynamic is True, applies Mechanical Dynamic Single-Pass chunking:
+    samples window size from dynamic_choices at each step, stepping by stride.
+    Otherwise, generates sliding windows for each configuration in window_configs.
+    """
+    n = len(input_ids)
+    if n == 0:
+        return []
+
+    chunks = []
+    chunk_idx = 0
+
+    if is_dynamic and dynamic_choices:
+        local_rng = rng or random.Random(42)
+        idx = 0
+        while idx < n:
+            chunk_size, stride = local_rng.choice(dynamic_choices)
+            end = min(idx + chunk_size, n)
+            c_input_ids = input_ids[idx:end]
+            c_labels = labels[idx:end]
+            c_offsets = offsets[idx:end]
+
+            c_start = c_offsets[0][0] if c_offsets else 0
+            c_end = c_offsets[-1][1] if c_offsets else 0
+
+            c_data = {
+                "chunk_id": f"{doc_id}_chunk_{chunk_idx:03d}",
+                "doc_id": doc_id,
+                "start_token_idx": idx,
+                "end_token_idx": end,
+                "char_start": c_start,
+                "char_end": c_end,
+                "window_size": chunk_size,
+                "stride": stride,
+                "source": source,
+                "tokens": [raw_text[s:e] for s, e in c_offsets],
+                "input_ids": c_input_ids,
+                "attention_mask": [1] * len(c_input_ids),
+                "ner_tags": c_labels,
+            }
+            if tier:
+                c_data["tier"] = tier
+            if hard_negative_injected:
+                c_data["hard_negative_injected"] = True
+
+            chunks.append(c_data)
+            chunk_idx += 1
+            if end >= n:
+                break
+            idx += stride
+    else:
+        for chunk_size, stride in window_configs:
+            idx = 0
+            while idx < n:
+                end = min(idx + chunk_size, n)
+                c_input_ids = input_ids[idx:end]
+                c_labels = labels[idx:end]
+                c_offsets = offsets[idx:end]
+
+                c_start = c_offsets[0][0] if c_offsets else 0
+                c_end = c_offsets[-1][1] if c_offsets else 0
+
+                c_data = {
+                    "chunk_id": f"{doc_id}_chunk_{chunk_idx:03d}",
+                    "doc_id": doc_id,
+                    "start_token_idx": idx,
+                    "end_token_idx": end,
+                    "char_start": c_start,
+                    "char_end": c_end,
+                    "window_size": chunk_size,
+                    "stride": stride,
+                    "source": source,
+                    "tokens": [raw_text[s:e] for s, e in c_offsets],
+                    "input_ids": c_input_ids,
+                    "attention_mask": [1] * len(c_input_ids),
+                    "ner_tags": c_labels,
+                }
+                if tier:
+                    c_data["tier"] = tier
+                if hard_negative_injected:
+                    c_data["hard_negative_injected"] = True
+
+                chunks.append(c_data)
+                chunk_idx += 1
+                if end >= n:
+                    break
+                idx += stride
+
+    return chunks
+
+
 def augment_real_document(
     raw_text: str,
     spans: List[Dict[str, Any]],
@@ -821,6 +996,24 @@ def main():
         help="Hugging Face tokenizer for pre-tokenization (default: aisingapore/SEA-LION-ModernBERT-300M)"
     )
     parser.add_argument(
+        "--dynamic-chunking",
+        action="store_true",
+        default=False,
+        help="Enable Single-Pass Mechanical Dynamic Window Chunking for training (e.g. 768, 1024, 1536, 2048 subwords)"
+    )
+    parser.add_argument(
+        "--dynamic-scales",
+        type=str,
+        default="768:576,1024:768,1536:1152,2048:1536",
+        help="Comma-separated window:stride subword scales for dynamic chunking"
+    )
+    parser.add_argument(
+        "--test-window-config",
+        type=str,
+        default="1024:768",
+        help="Window:stride configuration for Gold Benchmark test evaluation (default: 1024:768)"
+    )
+    parser.add_argument(
         "--out-dir",
         type=str,
         default="data/training_dataset",
@@ -963,7 +1156,33 @@ def main():
     if not window_configs:
         window_configs = [(args.chunk_size, args.stride)]
 
-    print(f"Active Multi-Scale Window Configs: {window_configs}")
+    dynamic_choices = []
+    if args.dynamic_scales:
+        for item in args.dynamic_scales.split(","):
+            parts = [int(p.strip()) for p in item.split(":") if p.strip()]
+            if len(parts) == 2:
+                dynamic_choices.append((parts[0], parts[1]))
+            elif len(parts) == 1:
+                dynamic_choices.append((parts[0], int(parts[0] * 0.75)))
+    if not dynamic_choices:
+        dynamic_choices = [(768, 576), (1024, 768), (1536, 1152), (2048, 1536)]
+
+    test_window_configs = []
+    if args.test_window_config:
+        for item in args.test_window_config.split(","):
+            parts = [int(p.strip()) for p in item.split(":") if p.strip()]
+            if len(parts) == 2:
+                test_window_configs.append((parts[0], parts[1]))
+            elif len(parts) == 1:
+                test_window_configs.append((parts[0], int(parts[0] * 0.75)))
+    if not test_window_configs:
+        test_window_configs = [(1024, 768)]
+
+    if args.dynamic_chunking:
+        print(f"Active Single-Pass Dynamic Window Scales: {dynamic_choices}")
+    else:
+        print(f"Active Multi-Scale Window Configs: {window_configs}")
+    print(f"Gold Benchmark Test Window Config: {test_window_configs}")
     print(f"Synthetic Administrative Header Probability: {synth_admin_prob:.2f}")
     print(f"Real Data Whitespace/Flatten Probabilities: WS={real_ws_prob:.2f}, Flatten={real_flatten_prob:.2f}")
     print(f"Synthetic Layout Probabilities: Inline={synth_inline_prob:.2f}, Grid2x2={synth_grid_prob:.2f}, Flatten={synth_flatten_prob:.2f}, Collapse={synth_collapse_prob:.2f}")
@@ -1192,33 +1411,58 @@ def main():
             }
             f_gen.write(json.dumps(gen_entry, ensure_ascii=False) + "\n")
 
-            # Format 3: BIO Token Chunks across Multi-Scale Windows
-            tokens, offsets = tokenize_with_offsets(raw_text)
-            total_tokens += len(tokens)
-            bio_tags = align_spans_to_bio(offsets, spans)
+            # Format 3: BIO Token Chunks
+            if hf_tokenizer is not None:
+                sub_ids, sub_lbls, sub_offs, sub_tags = tokenize_and_align_subwords(
+                    raw_text, spans, hf_tokenizer, tag_to_id, tag_priority
+                )
+                total_tokens += len(sub_ids)
+                for tag in sub_tags:
+                    tag_counts[tag] += 1
 
-            for tag in bio_tags:
-                tag_counts[tag] += 1
-
-            for chunk_size, stride in window_configs:
-                chunks = chunk_bio_sequence(
-                    doc_id,
-                    tokens,
-                    bio_tags,
-                    offsets,
-                    chunk_size=chunk_size,
-                    stride=stride
+                chunks = chunk_subword_sequence(
+                    doc_id=doc_id,
+                    raw_text=raw_text,
+                    input_ids=sub_ids,
+                    labels=sub_lbls,
+                    offsets=sub_offs,
+                    window_configs=window_configs,
+                    source=doc["source"],
+                    is_dynamic=args.dynamic_chunking,
+                    dynamic_choices=dynamic_choices,
+                    rng=rng,
+                    hard_negative_injected=bool(doc.get("hard_negative_injected")),
                 )
                 total_chunks += len(chunks)
-
                 for c in chunks:
-                    c["window_size"] = chunk_size
-                    c["stride"] = stride
-                    c["source"] = doc["source"]
-                    if doc.get("hard_negative_injected"):
-                        c["hard_negative_injected"] = True
-                    attach_pretokenization(c, raw_text=raw_text, spans=spans)
                     f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
+            else:
+                tokens, offsets = tokenize_with_offsets(raw_text)
+                total_tokens += len(tokens)
+                bio_tags = align_spans_to_bio(offsets, spans)
+
+                for tag in bio_tags:
+                    tag_counts[tag] += 1
+
+                for chunk_size, stride in window_configs:
+                    chunks = chunk_bio_sequence(
+                        doc_id,
+                        tokens,
+                        bio_tags,
+                        offsets,
+                        chunk_size=chunk_size,
+                        stride=stride
+                    )
+                    total_chunks += len(chunks)
+
+                    for c in chunks:
+                        c["window_size"] = chunk_size
+                        c["stride"] = stride
+                        c["source"] = doc["source"]
+                        if doc.get("hard_negative_injected"):
+                            c["hard_negative_injected"] = True
+                        attach_pretokenization(c, raw_text=raw_text, spans=spans)
+                        f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     # 6. Build Gold Benchmark Test/Validation Outputs (100% pristine, 0 noise)
     test_spans_path = out_dir / "test_spans.jsonl"
@@ -1261,30 +1505,54 @@ def main():
                 }
                 f_gen.write(json.dumps(gen_entry, ensure_ascii=False) + "\n")
 
-                tokens, offsets = tokenize_with_offsets(raw_text)
-                test_total_tokens += len(tokens)
-                bio_tags = align_spans_to_bio(offsets, spans)
-                for tag in bio_tags:
-                    test_tag_counts[tag] += 1
+                if hf_tokenizer is not None:
+                    sub_ids, sub_lbls, sub_offs, sub_tags = tokenize_and_align_subwords(
+                        raw_text, spans, hf_tokenizer, tag_to_id, tag_priority
+                    )
+                    test_total_tokens += len(sub_ids)
+                    for tag in sub_tags:
+                        test_tag_counts[tag] += 1
 
-                for chunk_size, stride in window_configs:
-                    chunks = chunk_bio_sequence(
-                        doc_id,
-                        tokens,
-                        bio_tags,
-                        offsets,
-                        chunk_size=chunk_size,
-                        stride=stride
+                    chunks = chunk_subword_sequence(
+                        doc_id=doc_id,
+                        raw_text=raw_text,
+                        input_ids=sub_ids,
+                        labels=sub_lbls,
+                        offsets=sub_offs,
+                        window_configs=test_window_configs,
+                        source=doc["source"],
+                        is_dynamic=False,
+                        tier=doc.get("tier"),
                     )
                     test_total_chunks += len(chunks)
                     for c in chunks:
-                        c["window_size"] = chunk_size
-                        c["stride"] = stride
-                        c["tier"] = doc.get("tier")
-                        attach_pretokenization(c, raw_text=raw_text, spans=spans)
                         f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
+                else:
+                    tokens, offsets = tokenize_with_offsets(raw_text)
+                    test_total_tokens += len(tokens)
+                    bio_tags = align_spans_to_bio(offsets, spans)
+                    for tag in bio_tags:
+                        test_tag_counts[tag] += 1
+
+                    for chunk_size, stride in test_window_configs:
+                        chunks = chunk_bio_sequence(
+                            doc_id,
+                            tokens,
+                            bio_tags,
+                            offsets,
+                            chunk_size=chunk_size,
+                            stride=stride
+                        )
+                        test_total_chunks += len(chunks)
+                        for c in chunks:
+                            c["window_size"] = chunk_size
+                            c["stride"] = stride
+                            c["tier"] = doc.get("tier")
+                            attach_pretokenization(c, raw_text=raw_text, spans=spans)
+                            f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     # 7. Save Manifest & Summary
+    active_train_configs = dynamic_choices if args.dynamic_chunking else window_configs
     manifest = {
         "train": {
             "total_documents": len(all_documents),
@@ -1299,7 +1567,8 @@ def main():
             "synthetic_admin_header_prob": synth_admin_prob,
             "total_tokens": total_tokens,
             "total_bio_chunks": total_chunks,
-            "window_configs": window_configs,
+            "dynamic_chunking": args.dynamic_chunking,
+            "window_configs": active_train_configs,
             "tag_distribution": dict(tag_counts.most_common()),
             "output_files": {
                 "spans": str(spans_jsonl_path),
@@ -1312,7 +1581,7 @@ def main():
             "total_documents": len(test_records),
             "total_tokens": test_total_tokens,
             "total_bio_chunks": test_total_chunks,
-            "window_configs": window_configs,
+            "window_configs": test_window_configs,
             "tag_distribution": dict(test_tag_counts.most_common()),
             "output_files": {
                 "spans": str(test_spans_path),
@@ -1323,7 +1592,8 @@ def main():
         "total_documents": len(all_documents),
         "total_tokens": total_tokens,
         "total_bio_chunks": total_chunks,
-        "window_configs": window_configs,
+        "dynamic_chunking": args.dynamic_chunking,
+        "window_configs": active_train_configs,
         "tag_distribution": dict(tag_counts.most_common()),
         "output_files": {
             "spans": str(spans_jsonl_path),
