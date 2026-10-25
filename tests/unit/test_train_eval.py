@@ -57,3 +57,27 @@ def test_evaluate_split_returns_decoded_sequences_aligned_to_gold_labels():
     assert [len(p) for p in preds] == [len(g) for g in gold] == [8, 5]
     assert all(tag in TAG_TO_ID for seq in preds for tag in seq)
     assert gold[0] == ["B-QUESTION_LABEL", "I-QUESTION_LABEL", "O", "O", "O", "B-QUESTION_LABEL", "I-QUESTION_LABEL", "O"]
+
+
+def test_distributed_batch_sampler_padding_and_step_balance():
+    lengths = [100, 200, 300, 400, 500, 600, 700]  # 7 items, batch_size=2 -> 4 batches total
+    num_replicas = 3
+    # 4 batches % 3 replicas != 0 -> needs wrap-around padding so all ranks get 2 batches
+    samplers = [
+        train_module.DistributedLengthGroupedBatchSampler(
+            lengths=lengths,
+            batch_size=2,
+            num_replicas=num_replicas,
+            rank=r,
+            drop_last=False,
+            shuffle=False,
+            seed=42,
+        )
+        for r in range(num_replicas)
+    ]
+    rank_batches = [list(s) for s in samplers]
+    # Every rank must yield exactly the same number of batches to prevent DDP deadlock
+    assert len(rank_batches[0]) == len(rank_batches[1]) == len(rank_batches[2]) == 2
+    for s in samplers:
+        assert len(s) == 2
+

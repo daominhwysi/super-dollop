@@ -13,11 +13,10 @@ version: "2.0"
 model:
   name_or_path: "aisingapore/SEA-LION-ModernBERT-300M"
   tokenizer_name: "aisingapore/SEA-LION-ModernBERT-300M"
-  max_sequence_length: 8192
+  max_sequence_length: 2048
   attn_implementation: "sdpa"            # Enforce PyTorch Native SDPA (supports NVIDIA T4 Turing sm_75 & Ampere+)
   use_lora: false                        # Full fine-tuning of all parameters (no LoRA)
   latex_placeholder: "[LATEX]"
-  mask_latex_during_inference: true
 
 # ------------------------------------------------------------------------------
 # 2. Classification Head & Loss Function
@@ -28,28 +27,24 @@ loss:
   focal_alpha: "smoothed_inverse_freq" # Smoothing power = 0.25
   label_smoothing: 0.05
 
-model_head:
-  layer_pooling: "sigmoid"            # Replaces softmax
-  num_pooling_layers: 4
-  use_conv_refinement: true           # 1D Depthwise Conv (kernel size = 7)
-  conv_kernel_size: 7
-  dropout_rates: [0.05, 0.10, 0.15, 0.20, 0.25] # Tightened MSD
-  per_branch_focal_loss: true         # Fix ensemble smoothing
-
-# Backward compatibility alias
-head:
-  type: "enhanced"                       # "enhanced" (SigmoidWeightedLayerPooling + Conv1D + Tightened MSD)
+# ------------------------------------------------------------------------------
+# 2. Enhanced Token Classification Head (Sigmoid Layer Pooling + Conv1D + Tightened MSD)
+# ------------------------------------------------------------------------------
+head: &head_config
+  type: "enhanced"
   layers_to_pool: 4
-  layer_pooling: "sigmoid"
-  use_conv_refinement: true
+  num_pooling_layers: 4
+  layer_pooling: "sigmoid"               # Sigmoid-gated layer pooling replaces competing softmax
+  use_conv_refinement: true              # 1D Depthwise Conv (kernel size = 7)
   conv_kernel_size: 7
   multi_sample_dropout: true
-  dropout_rates: [0.05, 0.10, 0.15, 0.20, 0.25]
+  dropout_rates: [0.05, 0.10, 0.15, 0.20, 0.25] # Tightened MSD
   dropout_prob: 0.10
   dropout_samples: 5
-  focal_gamma: 2.0                       # Calibrated parameter
-  label_smoothing: 0.05
-  per_branch_focal_loss: true
+  per_branch_focal_loss: true            # Compute focal loss per branch before averaging
+
+# Backward compatibility alias
+model_head: *head_config
 
 # ------------------------------------------------------------------------------
 # 3. Dataset & Sliding Window Contexts

@@ -1,5 +1,5 @@
 import pytest
-from model.module.dataset import classify_latex, extract_layout_features
+from model.module.dataset import classify_latex
 from model.inference.predict import get_latex_spans, build_tagged_xml
 
 
@@ -24,37 +24,6 @@ def test_classify_latex_categories():
     assert classify_latex(r"$\frac{\alpha + \beta}{\gamma + \delta} + \sin(\theta) + \cos(\phi)$") == "[MATH_EXPR_LONG]"
 
 
-def test_extract_layout_features():
-    text = (
-        "## Câu 1: Cho hàm số sau:\n"     # line 0, starts at 0
-        "\n"                              # line 1 (blank line)
-        "A. Đáp án một\n"                 # line 2, starts after \n\n, preceded by blank
-        "B. Đáp án hai"                   # line 3, col 0
-    )
-
-    # Let's define some offsets:
-    # "##" (0, 2) -> line 0, col 0, bucket 0, is_line_start=1, is_blank_preceded=0
-    # "Câu" (3, 6) -> line 0, col 3, bucket 1, is_line_start=0, is_blank_preceded=0
-    # "A." on line 2 -> starts after len("## Câu 1: Cho hàm số sau:\n") + len("\n")
-    l0_len = len("## Câu 1: Cho hàm số sau:\n")
-    l1_len = len("\n")
-    a_start = l0_len + l1_len
-    # "A." (a_start, a_start+2) -> line 2, col 0, bucket 0, is_line_start=1, is_blank_preceded=1
-
-    offsets = [
-        (0, 2),
-        (3, 6),
-        (a_start, a_start + 2)
-    ]
-
-    features = extract_layout_features(text, offsets)
-
-    assert features["column_indices"] == [0, 3, 0]
-    assert features["col_buckets"] == [0, 1, 0]
-    assert features["is_line_start"] == [1, 0, 1]
-    assert features["is_blank_preceded"] == [0, 0, 1]
-
-
 def test_zero_corruption_with_typed_latex_masking():
     raw_text = "Câu 1: Cho $x$ và $$y = f(x) + 1$$. Giá trị lớn nhất là?\nA. $1$\nB. $2$"
     latex_spans = get_latex_spans(raw_text)
@@ -75,3 +44,17 @@ def test_zero_corruption_with_typed_latex_masking():
     import re
     stripped = re.sub(r"<[^>]+>", "", xml)
     assert stripped == raw_text, "Stripping tags MUST strictly reproduce the exact raw text!"
+
+
+def test_atomic_token_pattern_special_tokens():
+    from tools.dataset.build_training_dataset import tokenize_with_offsets
+
+    text = "Câu 1. Điền vào chỗ trống: <blank /> hoặc <blank/> hoặc [BLANK]. Công thức là [LATEX] và [MATH_VAR_SHORT]."
+    tokens, offsets = tokenize_with_offsets(text)
+
+    # Special tokens must be kept atomic and whole
+    assert "<blank />" in tokens
+    assert "<blank/>" in tokens
+    assert "[BLANK]" in tokens
+    assert "[LATEX]" in tokens
+    assert "[MATH_VAR_SHORT]" in tokens

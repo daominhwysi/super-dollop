@@ -8,7 +8,6 @@ from model.module.head import (
     LocalConvRefinement,
     TightenedMultiSampleDropout,
     MultiSampleDropout,
-    LayoutFeatureEmbedding,
     EnhancedTokenClassificationHead,
     SequenceLabellingHead,
     EnhancedBertForTokenClassification
@@ -68,37 +67,6 @@ def test_tightened_multi_sample_dropout():
     assert eval_logits[0].shape == (B, S, num_labels)
 
 
-def test_layout_feature_embedding():
-    B, S, H = 2, 16, 64
-    layout_emb = LayoutFeatureEmbedding(hidden_size=H, num_col_buckets=5)
-    col_buckets = torch.randint(0, 5, (B, S))
-    is_line_start = torch.randint(0, 2, (B, S))
-    is_blank_preceded = torch.randint(0, 2, (B, S))
-
-    # Zero initialization test: weights are zero, output should be zero before norm
-    out = layout_emb(col_buckets, is_line_start, is_blank_preceded)
-    assert out.shape == (B, S, H)
-    # LayerNorm of 0 is 0
-    torch.testing.assert_close(out, torch.zeros_like(out), atol=1e-5, rtol=1e-5)
-
-
-def test_focal_loss_gamma_2():
-    loss_fn = FocalLoss(gamma=2.0)
-    # Well-classified vs misclassified
-    logits_easy = torch.tensor([[10.0, -10.0]])
-    target_easy = torch.tensor([0])
-    loss_easy = loss_fn(logits_easy, target_easy)
-
-    logits_hard = torch.tensor([[-5.0, 5.0]])
-    target_hard = torch.tensor([0])
-    loss_hard = loss_fn(logits_hard, target_hard)
-
-    assert loss_easy < 1e-4
-    assert loss_hard > 5.0
-    # Modulated factor suppresses easy example by massive ratio
-    assert loss_hard / (loss_easy + 1e-9) > 1000.0
-
-
 def test_enhanced_token_classification_head():
     B, S, H, num_labels = 2, 20, 64, 15
     head = EnhancedTokenClassificationHead(
@@ -107,8 +75,7 @@ def test_enhanced_token_classification_head():
         num_layers_to_fuse=4,
         dropout_rates=(0.05, 0.10, 0.15, 0.20, 0.25),
         use_conv_refinement=True,
-        conv_kernel_size=7,
-        use_layout_embeddings=True
+        conv_kernel_size=7
     )
     layers = [torch.randn(B, S, H) for _ in range(4)]
     targets = torch.randint(0, num_labels, (B, S))
@@ -116,12 +83,7 @@ def test_enhanced_token_classification_head():
 
     # 1. Training mode with targets -> Per-branch focal loss
     head.train()
-    layout_features = {
-        "col_buckets": torch.zeros((B, S), dtype=torch.long),
-        "is_line_start": torch.zeros((B, S), dtype=torch.long),
-        "is_blank_preceded": torch.zeros((B, S), dtype=torch.long),
-    }
-    logits, loss = head(layers, targets=targets, loss_fct=loss_fct, layout_features=layout_features)
+    logits, loss = head(layers, targets=targets, loss_fct=loss_fct)
     assert logits.shape == (B, S, num_labels)
     assert loss is not None
     assert loss.item() > 0

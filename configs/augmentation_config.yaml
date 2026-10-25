@@ -24,11 +24,11 @@ corpus:
   min_real_score: 85.0               # Minimum review quality score for real documents
   chunk_size: 512                    # Token window size for sliding chunk BIO extraction
   stride: 128                        # Stride for sliding window
-  sliding_windows:                   # Multi-scale sliding window configurations (512 to 2048)
-    - [512, 128]
-    - [768, 192]
-    - [1024, 256]
-    - [2048, 512]
+  sliding_windows:                   # Multi-scale sliding window configurations (512 to 2048 with ~20-25% edge overlap)
+    - [512, 384]
+    - [768, 576]
+    - [1024, 768]
+    - [2048, 1536]
   seed: 42                           # Master random seed for sampling and shuffling
 
 # ------------------------------------------------------------------------------
