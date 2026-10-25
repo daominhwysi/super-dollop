@@ -1107,6 +1107,12 @@ def main():
             record_filter=dev_record_filter if not args.dry_run else None,
             **dataset_kwargs,
         )
+        if len(test_dataset) == 0:
+            # Fallback to unfiltered gold test if no 1024-scale chunk was matched
+            test_dataset = MultiWindowBIODataset(
+                chunks_file_path=val_chunks_file,
+                **dataset_kwargs,
+            )
 
     if is_main_process:
         print(

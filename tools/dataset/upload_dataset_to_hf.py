@@ -10,7 +10,10 @@ import json
 import argparse
 import time
 from pathlib import Path
+from dotenv import load_dotenv
 from huggingface_hub import HfApi
+
+load_dotenv()
 
 WORKSPACE_DIR = Path(__file__).resolve().parents[2]
 
@@ -235,8 +238,14 @@ def parse_args():
     parser.add_argument(
         "--commit-message",
         type=str,
-        default="Update v2 dataset with documentation, multi-scale BIO chunks, Spans, and Gold Benchmark Test set",
+        default="Update v3 dataset with documentation, pre-tokenized ModernBERT BIO chunks, Spans, and Gold Benchmark Test set",
         help="Commit message for upload"
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        default=False,
+        help="Make repository private if created"
     )
     return parser.parse_args()
 
@@ -281,9 +290,18 @@ def main():
     print(f"  Total Size   : {total_bytes / (1024 * 1024):.2f} MB ({total_bytes / (1024 * 1024 * 1024):.2f} GB)")
     print("============================================================\n")
 
-    api = HfApi()
+    token = os.environ.get("HF_TOKEN")
+    api = HfApi(token=token)
     user_info = api.whoami()
     print(f"Authenticated as: {user_info.get('name', 'Unknown')} ({user_info.get('fullname', '')})")
+
+    print(f"Ensuring repository '{args.repo_id}' exists on Hugging Face Hub (private={args.private})...")
+    api.create_repo(
+        repo_id=args.repo_id,
+        repo_type="dataset",
+        exist_ok=True,
+        private=args.private
+    )
 
     # 3. Upload each file sequentially with status
     start_time = time.time()
