@@ -32,6 +32,9 @@ Your task is to annotate raw OCR text of exam papers by wrapping specific compon
 13. **TABULAR & UNLABELED TRUE/FALSE SUB-QUESTIONS:** When sub-questions or True/False statements are presented inside HTML tables (`<table>...</table>`), Markdown tables, or lists without explicit option labels (such as `a)`, `b)` or `A.`), each statement cell or item text to be evaluated MUST still be tagged as `<option_text>...</option_text>` (e.g., `<td><option_text>Statement text...</option_text></td>`). Table formatting tags (`<table>`, `<tr>`, `<th>`, `<td>`), header titles ("Phát biểu", "Đúng", "Sai"), and choice indicators (`○`, `✓`, `[ ]`) remain un-tagged structure.
 14. **PAGE TAGS & METADATA PRUNING:** Prune and omit `<pages>`, `</pages>`, `<page>`, `</page>`, and `<page_metadata>...</page_metadata>` from the XML output. Do not retain page boundary tags or metadata blocks in the annotated XML. Maintain continuous elements (<stem>, <option_text>, <explanation>, <section>) seamlessly across page breaks without splitting them.
 15. **XML TAG MATCHING & INTEGRITY (NO MISMATCHED/UNCLOSED TAGS):** Every opened tag (`<section>`, `<question_label>`, `<stem>`, `<option_label>`, `<option_text>`, `<explanation>`) MUST have its exact matching closing tag (`</section>`, `</question_label>`, `</stem>`, `</option_label>`, `</option_text>`, `</explanation>`). NEVER produce mismatched closing tags (e.g. `<stem>...</option_text>`) or leave opening tags unclosed. Compact stimulus anchor tags `<stimulus ... />` and vision figures `<figure ... />` MUST always be formatted as self-closing tags with `/>`.
+16. **TABLE BOUNDARY RULE (NO TABLE NESTING INSIDE STEM):** In questions containing tables (`<table>` or Markdown tables), `<stem>` MUST close immediately BEFORE the table opens (`<question_label>Câu 1.</question_label> <stem>...</stem><table>...`). NEVER wrap a `<table>` inside `<stem>`, as doing so illegally swallows `<option_label>` and `<option_text>` elements into `<stem>`.
+17. **CLOZE & EMBEDDED BLANKS (EMPTY STEM VALIDITY):** In cloze tests and fill-in passages where question items refer directly to numbered blanks inside a reading passage, emit `<question_label>` directly followed by `<option_label>`, or with `<stem></stem>`. Both forms are 100% valid sequence labeling outputs.
+18. **SECTION 4-LOCK PROTOCOL:** (1) Markdown question headings (e.g. `## Câu 1.`) belong 100% inside `<question_label>`, NEVER `<section>`. (2) Administrative metadata (school name, exam code, exam duration, footer `--- HẾT ---`) MUST remain completely UNTAGGED plain text. (3) Major section headers (`PHẦN I`, `PART 5`) and answer key titles (`### BẢNG ĐÁP ÁN`) are tagged `<section>`. (4) Rubric and answer tables below answer key headers are wrapped in `<explanation>`.
 
 
 ## 💡 Demonstration Examples (FOR REFERENCE ONLY):
@@ -237,7 +240,7 @@ Chọn đáp án đúng:
 <question_label>Question 1.</question_label> <option_label>A.</option_label> <option_text>a</option_text> <option_label>B.</option_label> <option_text>an</option_text> <option_label>C.</option_label> <option_text>the</option_text> <option_label>D.</option_label> <option_text>Ø</option_text>
 <question_label>Question 2.</question_label> <option_label>A.</option_label> <option_text>a</option_text> <option_label>B.</option_label> <option_text>an</option_text> <option_label>C.</option_label> <option_text>the</option_text> <option_label>D.</option_label> <option_text>Ø</option_text>
 
-<stimulus id="stim_2" start_anchor="**2.** To build a healthy lifestyle" end_anchor="as early as possible." />
+<stem>**2.** To build a healthy lifestyle, people need **(3)** **\_\_\_** balanced diet and an active routine. Making good habits should start as early as possible.</stem>
 
 <question_label>Question 3.</question_label> <option_label>A.</option_label> <option_text>a</option_text> <option_label>B.</option_label> <option_text>an</option_text> <option_label>C.</option_label> <option_text>the</option_text> <option_label>D.</option_label> <option_text>Ø</option_text>
 
@@ -253,10 +256,16 @@ Chọn đáp án đúng:
 | <question_label>**Question 6.**</question_label> | <option_text>whom</option_text> | <option_text>who</option_text> | <option_text>whose</option_text> | <option_text>which</option_text> |
 
 <question_label>**5.**</question_label>
-<stimulus id="stim_3" start_anchor="Dear Minh," end_anchor="Sincerely," />
+<stem>Dear Minh,
+a. The [...] connection.
+b. I've [...] word.
+c. What's [...] you.
+d. I [...] competition.
+e. It's [...] talk.
+Sincerely,</stem>
 <option_label>A.</option_label> <option_text>d – a – e – b – c</option_text>     <option_label>B.</option_label> <option_text>c – d – b – a – e</option_text>     <option_label>C.</option_label> <option_text>e – d – c – a – b</option_text>     <option_label>D.</option_label> <option_text>d – e – c – b – a</option_text>
 
-<stimulus id="stim_4" start_anchor="*Read the following passage" end_anchor="essential natural sanctuaries." />
+<stimulus id="stim_2" start_anchor="*Read the following passage" end_anchor="essential natural sanctuaries." />
 
 <question_label>Question 6.</question_label> <stem>Which of the following best serves as the title for the passage?</stem>
 <option_label>A.</option_label> <option_text>[...]</option_text>
@@ -272,11 +281,11 @@ Chọn đáp án đúng:
 
 --- HẾT ---
 
-### BẢNG ĐÁP ÁN
+<section>### BẢNG ĐÁP ÁN</section>
 
-| Câu hỏi | 1 | 2 | 3 | 5 | 6 | 7 |
+<explanation>| Câu hỏi | 1 | 2 | 3 | 5 | 6 | 7 |
 |---|---|---|---|---|---|---|
-| **Đáp án** | D | B | A | D | B | B |<|END|>
+| **Đáp án** | D | B | A | D | B | B |</explanation><|END|>
 </output>
 </example>
 
@@ -325,12 +334,13 @@ You must mark your answers on the separate answer sheet. Do not write your answe
 Apex Fitness Center
 456 Oak Avenue
 
-Are you ready to transform your routine? Apex Fitness Center features top-grade machinery and expert coaches to assist you in meeting your personal targets.
+Are you ready to transform your routine? Apex Fitness Center features top-grade machinery and expert coaches to assist you in meeting your personal targets. We offer flexible membership plans designed to ------ your lifestyle.
 
-**131.** Horizon Finance offers a wide range of consultancy options ------ the requirements of its clients.
-(A) meet
-(B) to meet
-(D) meetings
+**131.**
+(A) suit
+(B) to suit
+(C) suits
+(D) suited
 </input>
 <output>
 **READING TEST**
@@ -371,12 +381,13 @@ You must mark your answers on the separate answer sheet. Do not write your answe
 
 <section>**Directions:** Read the texts that follow. A word, phrase, or sentence is missing in parts of each text. Four answer choices for each question are given below the text. Select the best answer to complete the text.</section>
 
-<stimulus id="stim_1" start_anchor="**Questions 131-134** refer" end_anchor="your personal targets." />
+<stimulus id="stim_1" start_anchor="**Questions 131-134** refer" end_anchor="your lifestyle." />
 
-<question_label>**131.**</question_label> <stem>Horizon Finance offers a wide range of consultancy options ------ the requirements of its clients.</stem>
-<option_label>(A)</option_label> <option_text>meet</option_text>
-<option_label>(B)</option_label> <option_text>to meet</option_text>
-<option_label>(D)</option_label> <option_text>meetings</option_text><|END|>
+<question_label>**131.**</question_label>
+<option_label>(A)</option_label> <option_text>suit</option_text>
+<option_label>(B)</option_label> <option_text>to suit</option_text>
+<option_label>(C)</option_label> <option_text>suits</option_text>
+<option_label>(D)</option_label> <option_text>suited</option_text><|END|>
 </output>
 </example>
 
@@ -390,22 +401,22 @@ You must mark your answers on the separate answer sheet. Do not write your answe
 <th>Sai</th>
 </tr>
 <tr>
-<td>Chất chỉ thị màu là chất có màu biến đổi phụ thuộc vào giá trị pH của dung dịch.</td>
+<td>a) Chất chỉ thị màu là chất có màu biến đổi phụ thuộc vào giá trị pH của dung dịch.</td>
 <td>○</td>
 <td>○</td>
 </tr>
 <tr>
-<td>So với thymolphthalein, methyl da cam chuyển màu ở độ pH cao hơn.</td>
+<td>b) So với thymolphthalein, methyl da cam chuyển màu ở độ pH cao hơn.</td>
 <td>○</td>
 <td>○</td>
 </tr>
 <tr>
-<td>Chất chỉ thị có sự thay đổi màu sắc từ vàng sang tím là alizarin vàng R.</td>
+<td>c) Chất chỉ thị có sự thay đổi màu sắc từ vàng sang tím là alizarin vàng R.</td>
 <td>○</td>
 <td>○</td>
 </tr>
 <tr>
-<td>Cho biết kem đánh răng có độ pH khoảng 9. Chất chỉ thị phù hợp trong việc xác định độ pH của kem đánh răng là bromthymol xanh.</td>
+<td>d) Cho biết kem đánh răng có độ pH khoảng 9. Chất chỉ thị phù hợp trong việc xác định độ pH của kem đánh răng là bromthymol xanh.</td>
 <td>○</td>
 <td>○</td>
 </tr>
@@ -420,22 +431,22 @@ You must mark your answers on the separate answer sheet. Do not write your answe
 <th>Sai</th>
 </tr>
 <tr>
-<td><option_text>Chất chỉ thị màu là chất có màu biến đổi phụ thuộc vào giá trị pH của dung dịch.</option_text></td>
+<td><option_label>a)</option_label> <option_text>Chất chỉ thị màu là chất có màu biến đổi phụ thuộc vào giá trị pH của dung dịch.</option_text></td>
 <td>○</td>
 <td>○</td>
 </tr>
 <tr>
-<td><option_text>So với thymolphthalein, methyl da cam chuyển màu ở độ pH cao hơn.</option_text></td>
+<td><option_label>b)</option_label> <option_text>So với thymolphthalein, methyl da cam chuyển màu ở độ pH cao hơn.</option_text></td>
 <td>○</td>
 <td>○</td>
 </tr>
 <tr>
-<td><option_text>Chất chỉ thị có sự thay đổi màu sắc từ vàng sang tím là alizarin vàng R.</option_text></td>
+<td><option_label>c)</option_label> <option_text>Chất chỉ thị có sự thay đổi màu sắc từ vàng sang tím là alizarin vàng R.</option_text></td>
 <td>○</td>
 <td>○</td>
 </tr>
 <tr>
-<td><option_text>Cho biết kem đánh răng có độ pH khoảng 9. Chất chỉ thị phù hợp trong việc xác định độ pH của kem đánh răng là bromthymol xanh.</option_text></td>
+<td><option_label>d)</option_label> <option_text>Cho biết kem đánh răng có độ pH khoảng 9. Chất chỉ thị phù hợp trong việc xác định độ pH của kem đánh răng là bromthymol xanh.</option_text></td>
 <td>○</td>
 <td>○</td>
 </tr>

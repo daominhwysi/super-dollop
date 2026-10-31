@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-Batch Section Classification & Branch Repair with OpenAI Codex (GPT-5.6 Luna).
+scripts/curate_sections.py — Universal Section Curation & Surgical Branch Repair.
 
 Extracts all <section> tags from annotated documents, deduplicates unique section strings,
-batches them up to a target token budget (Xk tokens), and uses Codex to classify whether
-each section is VALID (EXAM_SECTION) or INVALID (junk: metadata titles, footers, reading directions,
-textbook theory, answer keys, absorbed question content).
+batches them up to a target token budget, and uses an LLM (any supported provider)
+to classify whether each section is:
+  - VALID (EXAM_SECTION)
+  - INVALID (metadata headers, footers, reading directions, textbook theory, answers, absorbed question content, noise).
 
-For documents with invalid or mislabelled sections, surgically unwraps or adjusts the tags
-and writes the repaired merged.xml and merged.json to the branch folder
-(data/sequence_labelling_annotated_branch), strictly preserving the canonical dataset.
+For documents with invalid or mixed sections, surgically unwraps junk tags or adjusts
+partial headers (retaining only genuine section boundaries) and writes the repaired
+merged.xml, chunks, and merged.json to the branch folder (data/sequence_labelling_annotated_branch),
+strictly preserving the canonical dataset.
 
 Usage:
   # Dry-run inspection of batches and token counts:
-  uv run python scripts/classify_sections_codex.py --dry-run --target-tokens 4000
+  uv run python scripts/curate_sections.py --dry-run --target-tokens 4000
 
-  # Run test with limit:
-  uv run python scripts/classify_sections_codex.py --limit 10 --thinking medium
+  # Run test with limit using gpt-6-luna (aixingialaire provider):
+  uv run python scripts/curate_sections.py --limit 10 --model gpt-6-luna --provider aixingialaire
 
-  # Full run with 4k token batches and medium thinking:
-  uv run python scripts/classify_sections_codex.py --target-tokens 4000 --thinking medium --save-branch
+  # Full production run with 4k token batches and saving to branch:
+  uv run python scripts/curate_sections.py --model gpt-6-luna --provider aixingialaire --target-tokens 4000 --save-branch
 """
 
 from __future__ import annotations
@@ -111,11 +113,9 @@ Each object in the array must strictly have these fields:
 def _clean_json_response(raw_resp: str) -> str:
     """Strips Markdown fences or surrounding conversational wrappers."""
     text = raw_resp.strip()
-    # Find ```json ... ``` or ``` ... ```
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    # Find outer array bracket
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
@@ -218,7 +218,6 @@ def create_batches(
     current_tokens = base_prompt_tokens
 
     for item in items_to_classify:
-        # Approximate formatted XML representation tokens
         item_text = item["inner_text"]
         item_tokens = count_tokens(item_text) + 20
 
@@ -255,17 +254,17 @@ def format_batch_user_prompt(batch: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-# ── Codex Classifier Engine ───────────────────────────────────────────────────
+# ── Generic LLM Classifier Engine ─────────────────────────────────────────────
 
-def run_codex_batch(
+def run_llm_batch(
     batch: List[Dict[str, Any]],
-    model: str = "gpt-5.6-luna",
-    provider: str = "codex",
+    model: str = "gpt-6-luna",
+    provider: str = "aixingialaire",
     thinking: Any = "medium",
     max_retries: int = 3,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Sends a batch of sections to Codex and parses the JSON response.
+    Sends a batch of sections to any configured LLM provider and parses the JSON response.
     Returns a dictionary mapping assigned_id -> classification dict.
     """
     user_prompt = format_batch_user_prompt(batch)
@@ -326,7 +325,7 @@ def run_codex_batch(
             if attempt < max_retries:
                 time.sleep(3 * attempt)
             else:
-                raise RuntimeError(f"Codex classification failed after {max_retries} attempts: {exc}")
+                raise RuntimeError(f"LLM classification failed after {max_retries} attempts: {exc}")
 
     return {}
 
@@ -359,20 +358,19 @@ def apply_section_edits_to_xml(
         decision = cls_info.get("decision", "VALID")
         clean_header = cls_info.get("clean_header")
 
-        if decision == "VALID":
-            # Genuine section: keep untouched
-            return m.group(0)
-
-        # Handle INVALID
         # Case A: Partial/mixed header where clean_header is an exact substring
         if clean_header and isinstance(clean_header, str):
             clean_hdr_str = clean_header.strip()
-            if clean_hdr_str and clean_hdr_str in raw_inner:
+            if clean_hdr_str and clean_hdr_str in raw_inner and clean_hdr_str != raw_inner.strip():
                 idx = raw_inner.find(clean_hdr_str)
                 prefix = raw_inner[:idx]
                 suffix = raw_inner[idx + len(clean_hdr_str):]
                 adjusted_count += 1
                 return f"{prefix}<section>{clean_hdr_str}</section>{suffix}"
+
+        if decision == "VALID":
+            # Genuine section: keep untouched
+            return m.group(0)
 
         # Case B: Pure junk -> unwrap <section> tag completely, keep verbatim text
         unwrapped_count += 1
@@ -390,15 +388,34 @@ def save_document_to_branch(
     branch_dir: Path,
     unwrapped_count: int,
     adjusted_count: int,
+    classifications_by_hash: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Saves edited merged.xml and re-parsed merged.json to the branch folder.
+    Saves edited merged.xml, synchronized chunks, and re-parsed merged.json to the branch folder.
     """
     doc_branch_dir = branch_dir / doc_id
     doc_branch_dir.mkdir(parents=True, exist_ok=True)
 
     branch_xml_path = doc_branch_dir / "merged.xml"
     branch_xml_path.write_text(edited_xml, encoding="utf-8")
+
+    # Synchronize chunks in branch if chunks exist in canonical directory
+    orig_chunks_dir = original_xml_path.parent / "chunks"
+    if orig_chunks_dir.exists() and classifications_by_hash:
+        branch_chunks_dir = doc_branch_dir / "chunks"
+        branch_chunks_dir.mkdir(parents=True, exist_ok=True)
+        for c_file in sorted(orig_chunks_dir.glob("chunk_*.xml")):
+            if c_file.name.endswith(".bak"):
+                continue
+            c_xml = c_file.read_text(encoding="utf-8")
+            c_edited, _, _ = apply_section_edits_to_xml(c_xml, classifications_by_hash)
+            (branch_chunks_dir / c_file.name).write_text(c_edited, encoding="utf-8")
+            c_json = orig_chunks_dir / f"{c_file.stem}.json"
+            if c_json.exists():
+                shutil.copy2(c_json, branch_chunks_dir / c_json.name)
+            c_audit = orig_chunks_dir / f"{c_file.stem}.audit.json"
+            if c_audit.exists():
+                shutil.copy2(c_audit, branch_chunks_dir / c_audit.name)
 
     # Re-generate structured merged.json
     raw_ocr_text = ""
@@ -466,7 +483,7 @@ def save_document_to_branch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Batch Section Classification and Branch Repair using OpenAI Codex (GPT-5.6 Luna)."
+        description="Universal Section Curation and Surgical Branch Repair."
     )
     parser.add_argument(
         "--input-dir",
@@ -501,20 +518,20 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="gpt-5.6-luna",
-        help="Codex model name (default: gpt-5.6-luna)",
+        default="gpt-6-luna",
+        help="LLM model name (default: gpt-6-luna)",
     )
     parser.add_argument(
         "--provider",
         type=str,
-        default="codex",
-        help="LLM provider (default: codex)",
+        default="aixingialaire",
+        help="LLM provider name (e.g. aixingialaire, agy, codex, xah, vilao, default: aixingialaire)",
     )
     parser.add_argument(
         "--thinking",
         type=str,
         default="medium",
-        help="Codex reasoning effort: none, low, medium, high (default: medium)",
+        help="Reasoning effort: none, low, medium, high (default: medium)",
     )
     parser.add_argument(
         "--limit",
@@ -536,7 +553,7 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Extract and batch sections without invoking Codex or modifying disk",
+        help="Extract and batch sections without invoking LLM or modifying disk",
     )
     parser.add_argument(
         "--save-branch",
@@ -553,12 +570,12 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 80)
-    print("BATCH SECTION CLASSIFIER & BRANCH REPAIR (CODEX GPT-5.6 LUNA)")
+    print("UNIVERSAL SECTION CURATION & BRANCH REPAIR")
     print(f"  Input Directory   : {args.input_dir}")
     print(f"  Branch Directory  : {args.branch_dir}")
     print(f"  Report Output     : {args.output}")
     print(f"  Target Tokens     : {args.target_tokens} tokens/batch")
-    print(f"  Codex Model       : {args.model} (thinking: {args.thinking})")
+    print(f"  LLM Model         : {args.model} (thinking: {args.thinking})")
     print(f"  Provider          : {args.provider}")
     print(f"  Save to Branch    : {'YES' if args.save_branch and not args.dry_run else 'NO (Dry Run / Report Only)'}")
     print("=" * 80)
@@ -613,13 +630,12 @@ def main() -> None:
         print("\n✅ [Dry Run Complete] No LLM calls made and no files modified.")
         sys.exit(0)
 
-    # 4. Process batches with Codex
-    print(f"\n[Step 3/4] Running Codex classification on {len(batches)} batches...")
+    # 4. Process batches with LLM
+    print(f"\n[Step 3/4] Running LLM classification on {len(batches)} batches...")
     new_classifications: Dict[str, Dict[str, Any]] = dict(cached_classifications)
     global_item_counter = len(cached_classifications)
 
     for b_idx, batch in enumerate(batches, 1):
-        # Assign unique IDs
         for it in batch:
             global_item_counter += 1
             it["assigned_id"] = f"SEC_{global_item_counter:04d}"
@@ -627,7 +643,7 @@ def main() -> None:
         b_tokens = sum(it["tokens"] for it in batch)
         print(f"\n>> Batch [{b_idx}/{len(batches)}] ({len(batch)} items, ~{b_tokens} tokens)...", end="", flush=True)
 
-        batch_res = run_codex_batch(
+        batch_res = run_llm_batch(
             batch=batch,
             model=args.model,
             provider=args.provider,
@@ -638,7 +654,6 @@ def main() -> None:
         invalid_in_batch = len(batch_res) - valid_in_batch
         print(f" Done => {valid_in_batch} VALID, {invalid_in_batch} INVALID")
 
-        # Map batch results back by text_hash
         for it in batch:
             assigned_id = it["assigned_id"]
             h = it["text_hash"]
@@ -681,7 +696,6 @@ def main() -> None:
         print(f"\n[Step 4/4] Surgically repairing documents with invalid sections -> {args.branch_dir}...")
         args.branch_dir.mkdir(parents=True, exist_ok=True)
 
-        # Identify documents that have at least one classified invalid or adjusted section
         affected_doc_ids: Set[str] = set()
         for h, cls_info in new_classifications.items():
             if cls_info.get("decision") == "INVALID" or cls_info.get("clean_header"):
@@ -713,6 +727,7 @@ def main() -> None:
                         branch_dir=args.branch_dir,
                         unwrapped_count=unwrapped,
                         adjusted_count=adjusted,
+                        classifications_by_hash=new_classifications,
                     )
                     repaired_docs_count += 1
                     total_unwrapped += unwrapped

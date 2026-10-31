@@ -95,6 +95,19 @@ This document outlines critical architectural constraints, data contracts, and d
 
 ---
 
+### 1.5 Architectural Anti-Pattern: Rejection of Post-Hoc Regex Mutators (`xml_cleaner.py`)
+
+> [!CAUTION]
+> **`xml_cleaner.py` and post-hoc regex string-mutating cleaners are classified as ARCHITECTURAL ANTI-PATTERNS.**
+> 
+> The core pipeline guarantees **100% Verbatim Source Fidelity**. Relying on heuristic regex scripts (`xml_cleaner.py`) to auto-close, auto-splice, or rebalance XML tags post-generation is strictly deprecated for the following reasons:
+> 1. **Masking Root Errors**: Post-hoc regex cleaners treat superficial symptoms while hiding underlying prompt ambiguities and few-shot flaws.
+> 2. **Corruption Risk**: Heuristic regex substitutions risk introducing unintended line breaks, corrupting mathematical LaTeX expressions (e.g. `$x < 0$` or `\begin{matrix}`), and invalidating character offset alignments.
+> 3. **"First-Time Right" Principle**: All structural boundaries (stems before tables, cloze blanks, question prefixes) must be enforced at generation time via precise Prompt Specifications and mathematically verified Few-Shot Examples.
+> 4. **Read-Only Validation**: Post-generation checks must be strictly non-mutating validators (such as `xml_checker.py`), while structural corrections must occur via LLM diff-patching (`EditorAgent`), never through heuristic regex mutation.
+
+---
+
 ## 2. Deterministic Pipeline Invariant Check
 
 A full audit of the project's deterministic (DET) components confirms:

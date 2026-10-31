@@ -242,7 +242,18 @@ class AnchorHelper:
             tag_start, tag_end = m.span()
 
             if not (s_m and e_m):
-                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                boundary_m = re.search(r"<question_label\b", modified_xml[tag_end:])
+                if boundary_m:
+                    abs_passage_start = tag_end
+                    while abs_passage_start < len(modified_xml) and modified_xml[abs_passage_start].isspace():
+                        abs_passage_start += 1
+                    abs_passage_end = tag_end + boundary_m.start()
+                    while abs_passage_end > abs_passage_start and modified_xml[abs_passage_end - 1].isspace():
+                        abs_passage_end -= 1
+                    if abs_passage_end > abs_passage_start:
+                        passage_text = modified_xml[abs_passage_start:abs_passage_end]
+                        wrapped = f'<stimulus id="{stim_id}">{passage_text}</stimulus>'
+                        modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:abs_passage_start] + wrapped + modified_xml[abs_passage_end:]
                 continue
 
             sa = _clean_anchor_text(s_m.group(1))
@@ -251,7 +262,18 @@ class AnchorHelper:
             s_words = [w for w in sa.split() if w]
             e_words = [w for w in ea.split() if w]
             if not s_words or not e_words:
-                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                boundary_m = re.search(r"<question_label\b", modified_xml[tag_end:])
+                if boundary_m:
+                    abs_passage_start = tag_end
+                    while abs_passage_start < len(modified_xml) and modified_xml[abs_passage_start].isspace():
+                        abs_passage_start += 1
+                    abs_passage_end = tag_end + boundary_m.start()
+                    while abs_passage_end > abs_passage_start and modified_xml[abs_passage_end - 1].isspace():
+                        abs_passage_end -= 1
+                    if abs_passage_end > abs_passage_start:
+                        passage_text = modified_xml[abs_passage_start:abs_passage_end]
+                        wrapped = f'<stimulus id="{stim_id}">{passage_text}</stimulus>'
+                        modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:abs_passage_start] + wrapped + modified_xml[abs_passage_end:]
                 continue
 
             # Search after tag_end first to avoid matching inside attribute string; fall back to tag_start
@@ -264,21 +286,32 @@ class AnchorHelper:
                 offset_base = tag_start
 
             if not s_match:
-                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-                continue
-
-            abs_passage_start = offset_base + s_match.start()
-            if tag_start <= abs_passage_start < tag_end:
-                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-                continue
+                # Resilient Fallback for start_anchor:
+                # If probe match failed, start immediately after tag_end (skipping whitespace)
+                abs_passage_start = tag_end
+                while abs_passage_start < len(modified_xml) and modified_xml[abs_passage_start].isspace():
+                    abs_passage_start += 1
+            else:
+                abs_passage_start = offset_base + s_match.start()
+                if tag_start <= abs_passage_start < tag_end:
+                    abs_passage_start = tag_end
+                    while abs_passage_start < len(modified_xml) and modified_xml[abs_passage_start].isspace():
+                        abs_passage_start += 1
 
             after_start_region = modified_xml[abs_passage_start:]
             e_match = _find_end_probe_match(e_words, after_start_region)
             if not e_match:
-                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
-                continue
-
-            abs_passage_end = abs_passage_start + e_match.end()
+                # Resilient Fallback for end_anchor:
+                # Reading passages naturally terminate right before the subsequent question or section header!
+                boundary_match = re.search(r"<(?:question_label|section|explanation)\b", after_start_region)
+                if boundary_match:
+                    abs_passage_end = abs_passage_start + boundary_match.start()
+                    while abs_passage_end > abs_passage_start and modified_xml[abs_passage_end - 1].isspace():
+                        abs_passage_end -= 1
+                else:
+                    abs_passage_end = len(modified_xml)
+            else:
+                abs_passage_end = abs_passage_start + e_match.end()
 
             # Ensure abs_passage_end does not cut an existing XML tag (e.g. <figure ... />) in half
             open_b = modified_xml.rfind("<", 0, abs_passage_end)
@@ -287,6 +320,9 @@ class AnchorHelper:
                 next_close = modified_xml.find(">", abs_passage_end)
                 if next_close != -1:
                     abs_passage_end = next_close + 1
+
+            if abs_passage_end <= abs_passage_start:
+                continue
 
             passage_text = modified_xml[abs_passage_start:abs_passage_end]
             wrapped = f'<stimulus id="{stim_id}">{passage_text}</stimulus>'
@@ -297,7 +333,11 @@ class AnchorHelper:
                 after_passage = modified_xml[abs_passage_end:]
                 modified_xml = before_tag + between_tag_and_passage + wrapped + after_passage
             else:
-                # If passage overlapped before or around the tag
-                modified_xml = modified_xml[:tag_start] + modified_xml[tag_end:]
+                # Passage overlapped before or around the tag: splice neatly without losing text
+                before_passage = modified_xml[:abs_passage_start]
+                after_passage = modified_xml[abs_passage_end:]
+                cleaned_passage = passage_text.replace(m.group(0), "").strip()
+                wrapped = f'<stimulus id="{stim_id}">{cleaned_passage}</stimulus>'
+                modified_xml = before_passage + wrapped + after_passage
 
         return modified_xml

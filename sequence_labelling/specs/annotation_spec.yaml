@@ -1,0 +1,93 @@
+# ==============================================================================
+# SINGLE SOURCE OF TRUTH (SSOT) FOR VIETNAMESE EXAM SEQUENCE LABELLING
+# ==============================================================================
+version: "2.1.0"
+description: "Canonical definition of tags, structural invariants, and rules for Sequence Labelling pipelines"
+
+tags:
+  section:
+    type: paired
+    description: "Major section or part titles, exam directions, and answer key headers"
+    examples:
+      - "<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn (3,0 điểm).</section>"
+      - "<section>## PART 5</section>"
+      - "<section>### BẢNG ĐÁP ÁN</section>"
+    rules:
+      - "MUST wrap major part dividers (PHẦN I, PART 5, ĐỌC HIỂU)"
+      - "MUST wrap answer key header (### BẢNG ĐÁP ÁN, ### HƯỚNG DẪN GIẢI)"
+      - "NEVER wrap markdown question headings (## Câu 1.) -> belongs in question_label"
+      - "NEVER wrap administrative metadata (SỞ GD&ĐT, TRƯỜNG THPT, MÃ ĐỀ: 101, --- HẾT ---) -> plain text"
+
+  stimulus:
+    type: self_closing_anchor
+    format: '<stimulus id="{id}" start_anchor="{start_anchor}" end_anchor="{end_anchor}" />'
+    description: "Shared reading passages, datasets, or context prompts serving 2 OR MORE questions"
+    attributes:
+      id: "stim_N"
+      start_anchor: "first 3-10 verbatim words"
+      end_anchor: "last 3-10 verbatim words, including citation if present"
+    rules:
+      - "Applies ONLY if shared by 2 OR MORE questions"
+      - "Single-question context belongs directly inside that question's <stem>"
+      - "NEVER wrap other system tags (stem, question_label, option_label, option_text, explanation)"
+      - "Sentence arrangement questions (Dear Minh, a. b. c.) must stay in <stem>, NEVER <stimulus>"
+
+  question_label:
+    type: paired
+    description: "Question prefix indicator ONLY"
+    examples:
+      - "<question_label>Câu 1.</question_label>"
+      - "<question_label>Question 1:</question_label>"
+      - "<question_label>## Câu 1.</question_label>"
+      - "<question_label>**101.**</question_label>"
+    rules:
+      - "Contains ONLY the question number/indicator"
+      - "Includes leading markdown hashes if formatted with hashes (## Câu 1.)"
+      - "NEVER extends to wrap stem text or reading passages"
+
+  stem:
+    type: paired
+    description: "Main statement or body text of the question"
+    rules:
+      - "MUST strictly close immediately BEFORE opening <table> tags"
+      - "In cloze tests referencing blanks in a preceding stimulus, stem may be empty (<stem></stem>) or omitted"
+      - "Contains the full prompt text before choices or sub-items"
+
+  option_label:
+    type: paired
+    description: "Choice letters or sub-question indicators"
+    examples:
+      - "<option_label>A.</option_label>"
+      - "<option_label>(B)</option_label>"
+      - "<option_label>a)</option_label>"
+      - "<option_label>b)</option_label>"
+    rules:
+      - "Wraps choice markers (A., B., C., D., (A), (B))"
+      - "Wraps sub-question markers (a), b), c), d)) in True/False or constructed-response questions"
+      - "In sentence arrangement questions, sentences a., b., c. stay in <stem>; sequences A. d-a-b stay in <option_label>"
+
+  option_text:
+    type: paired
+    description: "Text of choices or sub-question statement items"
+    rules:
+      - "Wraps option text cleanly outside LaTeX math delimiters: <option_label>A.</option_label> <option_text>$x = 1$</option_text>"
+      - "In True/False tables without row letters, wraps statement cells: <td><option_text>Statement</option_text></td>"
+
+  explanation:
+    type: paired
+    description: "Solutions, explanations, rubric tables, and answer keys"
+    rules:
+      - "Wraps worked solutions and explanations"
+      - "Wraps rubric tables and answer keys under answer key section headers"
+
+invariants:
+  verbatim_fidelity: "100% preservation of all source characters, whitespace, LaTeX math, and typos"
+  table_boundary: "<stem> must close before <table>; tables must NEVER be wrapped inside <stem>"
+  stimulus_multi_question: "A stimulus must serve 2 or more questions; single question context belongs in stem"
+  cloze_empty_stem: "Empty or absent stem in cloze/fill-in items with choices is 100% valid; reviewer must not penalize"
+  section_4_lock:
+    lock_1: "Question headings with markdown hashes (## Câu 1.) belong in question_label, NEVER section"
+    lock_2: "Administrative metadata (school name, exam code, footer --- HẾT ---) must remain UNTAGGED"
+    lock_3: "Answer key headers (### BẢNG ĐÁP ÁN) are section; solutions and tables are explanation"
+    lock_4: "Reviewer audits sections consistently according to Locks 1-3"
+  architectural_anti_pattern: "Rejection of post-hoc regex mutators (xml_cleaner.py); First-Time Right via prompts and few-shots"

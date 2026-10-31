@@ -54,6 +54,9 @@ Annotate the raw OCR text with inline XML sequence tags and compact stimulus anc
 10. XML TAG MATCHING & INTEGRITY: Every opened tag (<section>, <question_label>, <stem>, <option_label>, <option_text>, <explanation>) MUST have its exact matching closing tag. NEVER produce mismatched closing tags (e.g. <stem>...</option_text>) or leave tags unclosed. Compact stimulus anchor tags <stimulus ... /> MUST be self-closing.
 11. ACCEPTABLE TEXT OMISSION: If extraneous non-question lecture notes or book study guides are omitted while all exam questions, stems, choices, and solutions are fully annotated, this is valid and acceptable.
 12. LATEX DELIMITER INTEGRITY: Ensure <option_text> cleanly wraps math formulas: e.g. <option_label>A.</option_label> <option_text>$3x - 1 = 0$</option_text>. NEVER place tags inside LaTeX delimiters like $<option_text>...$.
+13. TABLE BOUNDARY RULE: In questions containing tables (<table> or Markdown tables), <stem> MUST close immediately BEFORE the table opens (<question_label>Câu 1.</question_label> <stem>...</stem><table>...). NEVER wrap a <table> inside <stem>.
+14. CLOZE & EMBEDDED BLANKS (EMPTY STEM VALIDITY): In cloze tests and fill-in passages where question items refer directly to numbered blanks inside a reading passage, emit <question_label> directly followed by <option_label>, or with <stem></stem>. Both forms are 100% valid sequence labeling outputs.
+15. SECTION 4-LOCK PROTOCOL: Markdown question headings (## Câu 1.) belong in <question_label>, NEVER <section>. Administrative metadata (school name, exam code, footer '--- HẾT ---') MUST remain completely UNTAGGED plain text. Major section headers (PHẦN I, PART 5) and answer key titles (### BẢNG ĐÁP ÁN) are tagged <section>. Rubric and answer tables below answer key headers are wrapped in <explanation>.
 """
 
 

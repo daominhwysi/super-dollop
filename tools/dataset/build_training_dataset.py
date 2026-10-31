@@ -147,16 +147,49 @@ def chunk_bio_sequence(
     bio_tags: List[str],
     token_offsets: List[Tuple[int, int]],
     chunk_size: int = 512,
-    stride: int = 448
+    stride: int = 448,
+    is_dynamic: bool = False,
+    dynamic_choices: Optional[List[Tuple[int, int]]] = None,
+    rng: Optional[random.Random] = None,
 ) -> List[Dict[str, Any]]:
-    """Chunks token sequences into sliding windows for transformer training."""
+    """Chunks token sequences into sliding windows for transformer training.
+    When is_dynamic is True, applies Single-Pass Mechanical Dynamic Window chunking.
+    """
     chunks = []
     n = len(tokens)
     if n == 0:
         return chunks
 
-    idx = 0
     chunk_idx = 0
+    if is_dynamic and dynamic_choices:
+        local_rng = rng or random.Random(42)
+        idx = 0
+        while idx < n:
+            c_size, s_stride = local_rng.choice(dynamic_choices)
+            end = min(idx + c_size, n)
+            c_tokens = tokens[idx:end]
+            c_tags = bio_tags[idx:end]
+            c_offsets = token_offsets[idx:end]
+
+            chunks.append({
+                "chunk_id": f"{doc_id}_chunk_{chunk_idx:03d}",
+                "doc_id": doc_id,
+                "start_token_idx": idx,
+                "end_token_idx": end,
+                "char_start": c_offsets[0][0] if c_offsets else 0,
+                "char_end": c_offsets[-1][1] if c_offsets else 0,
+                "window_size": c_size,
+                "stride": s_stride,
+                "tokens": c_tokens,
+                "ner_tags": c_tags,
+            })
+            chunk_idx += 1
+            if end >= n:
+                break
+            idx += s_stride
+        return chunks
+
+    idx = 0
     while idx < n:
         end = min(idx + chunk_size, n)
         c_tokens = tokens[idx:end]
@@ -170,6 +203,8 @@ def chunk_bio_sequence(
             "end_token_idx": end,
             "char_start": c_offsets[0][0] if c_offsets else 0,
             "char_end": c_offsets[-1][1] if c_offsets else 0,
+            "window_size": chunk_size,
+            "stride": stride,
             "tokens": c_tokens,
             "ner_tags": c_tags,
         })
@@ -1444,25 +1479,44 @@ def main():
                 for tag in bio_tags:
                     tag_counts[tag] += 1
 
-                for chunk_size, stride in window_configs:
+                if args.dynamic_chunking and dynamic_choices:
                     chunks = chunk_bio_sequence(
                         doc_id,
                         tokens,
                         bio_tags,
                         offsets,
-                        chunk_size=chunk_size,
-                        stride=stride
+                        is_dynamic=True,
+                        dynamic_choices=dynamic_choices,
+                        rng=rng,
                     )
                     total_chunks += len(chunks)
 
                     for c in chunks:
-                        c["window_size"] = chunk_size
-                        c["stride"] = stride
                         c["source"] = doc["source"]
                         if doc.get("hard_negative_injected"):
                             c["hard_negative_injected"] = True
                         attach_pretokenization(c, raw_text=raw_text, spans=spans)
                         f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
+                else:
+                    for chunk_size, stride in window_configs:
+                        chunks = chunk_bio_sequence(
+                            doc_id,
+                            tokens,
+                            bio_tags,
+                            offsets,
+                            chunk_size=chunk_size,
+                            stride=stride
+                        )
+                        total_chunks += len(chunks)
+
+                        for c in chunks:
+                            c["window_size"] = chunk_size
+                            c["stride"] = stride
+                            c["source"] = doc["source"]
+                            if doc.get("hard_negative_injected"):
+                                c["hard_negative_injected"] = True
+                            attach_pretokenization(c, raw_text=raw_text, spans=spans)
+                            f_bio.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     # 6. Build Gold Benchmark Test/Validation Outputs (100% pristine, 0 noise)
     test_spans_path = out_dir / "test_spans.jsonl"

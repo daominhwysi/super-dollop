@@ -463,6 +463,8 @@ If you include the block, assess only supplied issue IDs. A missing assessment m
 14. SUB-QUESTION & TRUE/FALSE SEGMENTATION (ERR-02): When sub-items a), b), c), d) were absorbed into `<stem>`, split them out cleanly into `<stem>Prompt...</stem>` followed by `<option_label>a)</option_label> <option_text>Statement...</option_text>`.
 15. SOLUTION & GRADING KEY WRAPPING (ERR-03): If grading guides, answer key tables, or scoring rubrics ('HƯỚNG DẪN CHẤM', 'ĐÁP ÁN') were erroneously tagged as exam questions, replace them with `<explanation>...</explanation>`.
 16. LATEX DELIMITER REPAIR (ERR-04): When LaTeX math choices have inverted tags like `$<option_text>...$</option_text>`, replace with `<option_text>$...$</option_text>`. If figure attributes have accidental self-closing delimiters like `x /> 0`, remove or escape the accidental delimiter.
+17. TABLE BOUNDARY EXTRACTION (ERR-05): When a table containing choices or True/False statements is nested inside `<stem>`, close the stem BEFORE the table with `</stem>`, and tag the choice rows/cells with `<option_label>a)</option_label>` and `<option_text>Statement</option_text>`.
+18. ADMINISTRATIVE METADATA STRIPPING (ERR-06): When school headers, exam metadata, or administrative titles ('SỞ GD&ĐT', 'TRƯỜNG THPT', 'UBND TỈNH') are wrapped in `<section>`, remove `<section>` and `</section>`, leaving the text untagged plain text.
 """
 
 
