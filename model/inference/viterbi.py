@@ -88,21 +88,49 @@ void viterbi_forward_backward(
 """
 
 
+_CACHED_C_LIB = None
+_CACHED_C_LIB_INITIALIZED = False
+
+
 def _get_compiled_c_lib():
-    """Compiles or retrieves cached C shared library for Viterbi decoding."""
+    """Compiles or retrieves cached C shared library for Viterbi decoding (process-safe & singleton-cached)."""
+    global _CACHED_C_LIB, _CACHED_C_LIB_INITIALIZED
+    if _CACHED_C_LIB_INITIALIZED:
+        return _CACHED_C_LIB
+
+    import subprocess
     cache_dir = Path.home() / ".cache" / "vietnamese_seq_label"
     cache_dir.mkdir(parents=True, exist_ok=True)
     so_path = cache_dir / "libviterbi.so"
-    c_path = cache_dir / "viterbi.c"
 
     if not so_path.exists() or os.path.getmtime(so_path) < os.path.getmtime(__file__):
+        pid = os.getpid()
+        tmp_c_path = cache_dir / f"viterbi.{pid}.c"
+        tmp_so_path = cache_dir / f"libviterbi.{pid}.so"
         try:
-            c_path.write_text(_C_VITERBI_SOURCE, encoding="utf-8")
-            ret = os.system(f"gcc -O3 -shared -fPIC -o {so_path} {c_path} 2>/dev/null")
-            if ret != 0 or not so_path.exists():
-                return None
+            tmp_c_path.write_text(_C_VITERBI_SOURCE, encoding="utf-8")
+            res = subprocess.run(
+                ["gcc", "-O3", "-shared", "-fPIC", "-o", str(tmp_so_path), str(tmp_c_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if res.returncode == 0 and tmp_so_path.exists():
+                os.replace(tmp_so_path, so_path)
         except Exception:
-            return None
+            pass
+        finally:
+            for p in (tmp_c_path, tmp_so_path):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+
+    if not so_path.exists():
+        _CACHED_C_LIB_INITIALIZED = True
+        _CACHED_C_LIB = None
+        return None
 
     try:
         lib = ctypes.CDLL(str(so_path))
@@ -114,8 +142,12 @@ def _get_compiled_c_lib():
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_int)
         ]
+        _CACHED_C_LIB = lib
+        _CACHED_C_LIB_INITIALIZED = True
         return lib
     except Exception:
+        _CACHED_C_LIB_INITIALIZED = True
+        _CACHED_C_LIB = None
         return None
 
 
@@ -217,9 +249,9 @@ class ConstrainedViterbiDecoder:
         Decodes sequence of token logits [T, K] into an optimal BIO-valid tag ID sequence.
         """
         if isinstance(logits, torch.Tensor):
-            logits_np = logits.detach().cpu().to(torch.float32).numpy()
+            logits_np = np.ascontiguousarray(logits.detach().cpu().to(torch.float32).numpy())
         else:
-            logits_np = np.asarray(logits, dtype=np.float32)
+            logits_np = np.ascontiguousarray(logits, dtype=np.float32)
 
         T, K = logits_np.shape
         if K != self.K:
