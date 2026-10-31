@@ -490,8 +490,9 @@ class EnhancedBertForTokenClassification(nn.Module):
         saved_safetensors = False
         try:
             from safetensors.torch import save_file
-            tensors = {k: v.contiguous() for k, v in self.state_dict().items()}
+            tensors = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
             save_file(tensors, os.path.join(save_directory, "model.safetensors"))
+            del tensors
             saved_safetensors = True
         except Exception:
             saved_safetensors = False
@@ -499,7 +500,9 @@ class EnhancedBertForTokenClassification(nn.Module):
         # Only fall back to pytorch_model.bin if safetensors failed or is unavailable
         if not saved_safetensors:
             model_save_path = os.path.join(save_directory, "pytorch_model.bin")
-            torch.save(self.state_dict(), model_save_path)
+            cpu_state = {k: v.detach().cpu() for k, v in self.state_dict().items()}
+            torch.save(cpu_state, model_save_path)
+            del cpu_state
 
         meta = {
             "model_type": "enhanced_token_classifier",
@@ -587,64 +590,6 @@ class EnhancedBertForTokenClassification(nn.Module):
                     use_layout_embeddings = meta.get("use_layout_embeddings", False)
             except Exception:
                 pass
-
-        loaded_state_dict = None
-        if safetensors_file and os.path.exists(safetensors_file):
-            try:
-                from safetensors.torch import load_file
-                loaded_state_dict = load_file(safetensors_file, device="cpu")
-            except Exception:
-                pass
-        elif model_bin_file and os.path.exists(model_bin_file):
-            try:
-                loaded_state_dict = torch.load(model_bin_file, map_location="cpu")
-            except Exception:
-                pass
-
-        # If this checkpoint already contains full model weights (base_model.* + head.*),
-        # initialize base_model from config directly to avoid misleading missing/unexpected warnings from AutoModel
-        has_full_weights = loaded_state_dict is not None and any(k.startswith("base_model.") for k in loaded_state_dict.keys())
-        if has_full_weights:
-            base_model = AutoModel.from_config(config)
-        else:
-            load_kwargs = dict(kwargs)
-            if attn_implementation is not None:
-                load_kwargs["attn_implementation"] = attn_implementation
-            try:
-                base_model = AutoModel.from_pretrained(
-                    model_name_or_path,
-                    config=config,
-                    token=token,
-                    torch_dtype=torch_dtype,
-                    **load_kwargs
-                )
-            except TypeError:
-                base_model = AutoModel.from_pretrained(
-                    model_name_or_path,
-                    config=config,
-                    token=token,
-                    torch_dtype=torch_dtype,
-                    **kwargs
-                )
-
-        # Check and align vocabulary size if token embeddings were expanded during training
-        if loaded_state_dict is not None:
-            emb_weight = loaded_state_dict.get("base_model.embeddings.tok_embeddings.weight", None)
-            if emb_weight is not None and base_model.get_input_embeddings().weight.shape[0] != emb_weight.shape[0]:
-                base_model.resize_token_embeddings(emb_weight.shape[0])
-
-        model = cls(
-            config=config,
-            base_model=base_model,
-            num_layers_to_fuse=num_layers_to_fuse,
-            use_conv_refinement=use_conv_refinement,
-            use_layout_embeddings=use_layout_embeddings
-        )
-
-        if loaded_state_dict is not None:
-            model.load_state_dict(loaded_state_dict, strict=False)
-
-        return model
 
         loaded_state_dict = None
         if safetensors_file and os.path.exists(safetensors_file):
