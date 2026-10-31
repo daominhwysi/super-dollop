@@ -457,6 +457,17 @@ class DeterministicAuditor:
         }
 
         if total_questions == 0:
+            # Check if this is a continuation chunk containing options from a split question
+            if len(opt_labels) > 0:
+                issues.append(
+                    AuditIssue(
+                        category="question_structure",
+                        severity=IssueSeverity.INFO,
+                        message="Zero question labels in chunk, but contains continuation options from multi-chunk partitioning (valid chunk).",
+                    )
+                )
+                return issues, 100.0, metrics
+
             # Check if raw source text also has 0 questions via DET parser (alien format: reference table, spec matrix, lecture notes)
             if raw_ocr_text and raw_ocr_text.strip():
                 clean_raw = DeterministicAuditor.clean_raw_ocr_text(raw_ocr_text)
@@ -485,19 +496,30 @@ class DeterministicAuditor:
             )
             return issues, 0.0, metrics
 
-        # Empty stems check - scale severity and deduction by total questions
+        # Empty stems check - only penalize if the document/question has no options and no stimuli
+        # (Cloze test questions and passage blanks legitimately have empty or absent stems).
         empty_stems = [s for s in stems if not s.strip()]
-        if empty_stems:
+        has_options_or_stimuli = (len(opt_labels) > 0 or len(opt_texts) > 0 or len(stimuli) > 0)
+        if empty_stems and not has_options_or_stimuli:
             stem_err_rate = len(empty_stems) / max(1, total_questions)
             is_major = stem_err_rate >= 0.15 or len(empty_stems) >= 4
             issues.append(
                 AuditIssue(
                     category="question_structure",
                     severity=IssueSeverity.MAJOR if is_major else IssueSeverity.MINOR,
-                    message=f"Detected {len(empty_stems)}/{total_questions} ({stem_err_rate:.1%}) empty <stem> tags.",
+                    message=f"Detected {len(empty_stems)}/{total_questions} ({stem_err_rate:.1%}) empty <stem> tags without options or stimulus.",
                 )
             )
             deductions += min(35.0, stem_err_rate * 40.0 + (3.0 if not is_major else 15.0))
+        elif empty_stems and has_options_or_stimuli:
+            # Informational only, completely valid in cloze / fill-in items
+            issues.append(
+                AuditIssue(
+                    category="question_structure",
+                    severity=IssueSeverity.INFO,
+                    message=f"Detected {len(empty_stems)} empty <stem> tags in cloze/choice context (100% valid).",
+                )
+            )
 
         # Empty option text check - scale severity and deduction
         empty_opts = [o for o in opt_texts if not o.strip()]
@@ -562,6 +584,84 @@ class DeterministicAuditor:
                 )
             )
             deductions += min(30.0, subitem_ratio * 40.0 + (3.0 if not is_major else 12.0))
+
+        # 1. Table Nested in Stem Check (Rule 16 / GDPT 2018 format: table encloses choices inside stem)
+        table_in_stem_matches = list(re.finditer(
+            r"<stem>(?:(?!</stem>).)*?<table>(?:(?!</table>).)*?(?:<option_label>|<td>\s*[-*•]?\s*[a-d]\)\s+)",
+            xml_content,
+            re.DOTALL,
+        ))
+        if table_in_stem_matches:
+            count = len(table_in_stem_matches)
+            first_m = table_in_stem_matches[0]
+            line_num = xml_content.count("\n", 0, first_m.start()) + 1
+            snippet = xml_content[first_m.start():first_m.start() + 150].replace("\n", " ")
+            issues.append(
+                AuditIssue(
+                    category="mislabelled_element",
+                    severity=IssueSeverity.MAJOR,
+                    message=(
+                        f"Found {count} instance(s) where <table> is illegally nested inside <stem>. "
+                        f"Per Rule 16 (Table boundary), <stem> must close with </stem> BEFORE <table>. "
+                        f"Extract choices into <option_label> and <option_text> inside <td> cells."
+                    ),
+                    line_number=line_num,
+                    context_snippet=snippet,
+                )
+            )
+            deductions += min(30.0, 15.0 * count)
+
+        # 2. Section on Administrative Metadata Check (Rule 18 / Lock 2)
+        admin_sec_matches = list(re.finditer(
+            r"<section>\s*(?:#+\s*)?(?:SỞ\s+GD|TRƯỜNG\s+THPT|UBND\s+TỈNH|PHÒNG\s+GD|KỲ\s+THI|BỘ\s+GIÁO\s+DỤC)",
+            xml_content,
+            re.IGNORECASE,
+        ))
+        if admin_sec_matches:
+            count = len(admin_sec_matches)
+            first_m = admin_sec_matches[0]
+            line_num = xml_content.count("\n", 0, first_m.start()) + 1
+            snippet = xml_content[first_m.start():first_m.start() + 120].replace("\n", " ")
+            issues.append(
+                AuditIssue(
+                    category="mislabelled_element",
+                    severity=IssueSeverity.MAJOR,
+                    message=(
+                        f"Found {count} instance(s) where administrative school/exam header is illegally wrapped in <section>. "
+                        f"Per Rule 18 (Section 4-Lock Protocol: Lock 2), header metadata MUST remain untagged plain text. "
+                        f"Remove <section> and </section> tags around this header."
+                    ),
+                    line_number=line_num,
+                    context_snippet=snippet,
+                )
+            )
+            deductions += min(25.0, 15.0 * count)
+
+        # 3. Section on Question Header Check (Rule 18 / Lock 4)
+        q_sec_matches = list(re.finditer(
+            r"<section>\s*(?:#+\s*)?(?:Câu|Question|Bài\s+\d+|Part\s+\d+)\b",
+            xml_content,
+            re.IGNORECASE,
+        ))
+        if q_sec_matches:
+            count = len(q_sec_matches)
+            first_m = q_sec_matches[0]
+            line_num = xml_content.count("\n", 0, first_m.start()) + 1
+            snippet = xml_content[first_m.start():first_m.start() + 120].replace("\n", " ")
+            issues.append(
+                AuditIssue(
+                    category="mislabelled_element",
+                    severity=IssueSeverity.MAJOR,
+                    message=(
+                        f"Found {count} instance(s) where question header is illegally tagged as <section>. "
+                        f"Per Rule 18 (Section 4-Lock Protocol: Lock 4), individual question headers must be tagged with "
+                        f"<question_label>, NEVER <section>."
+                    ),
+                    line_number=line_num,
+                    context_snippet=snippet,
+                )
+            )
+            deductions += min(25.0, 15.0 * count)
 
         score = max(0.0, 100.0 - deductions)
         return issues, score, metrics
@@ -644,6 +744,10 @@ class DeterministicAuditor:
         # If DET finds 0 questions in the raw document:
         # Non-exam / reference / specification text has no questions to annotate -> 100% valid
         if len(det_questions) == 0:
+            return issues, 100.0, metrics
+
+        # If XML has 0 questions but has continuation options from a split question
+        if len(xml_questions) == 0 and bool(re.search(r"<option_label\b", xml_content)):
             return issues, 100.0, metrics
 
         # Extract option labels and sections from XML to avoid false positives for sub-questions or sections
@@ -1462,12 +1566,12 @@ Câu 2: Bước sóng $\\lambda = c / f = 3 \\cdot 10^8 / 10^8 = 3\\text{ m}$. C
 
 #### Expected Parser Output XML:
 ```xml
-<section>SỞ GD&ĐT HÀ NỘI
+SỞ GD&ĐT HÀ NỘI
 TRƯỜNG THPT CHUYÊN HÀ NỘI - AMSTERDAM
 ĐỀ THI THỬ TỐT NGHIỆP THPT NĂM 2025
 Môn: KHOA HỌC TỰ NHIÊN - VẬT LÍ
 
-PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn. Thí sinh trả lời từ câu 1 đến câu 2.</section>
+<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn. Thí sinh trả lời từ câu 1 đến câu 2.</section>
 
 <stimulus id="stim_1" start_anchor="Dựa vào thông tin sau đây" end_anchor="NXB Giáo dục Việt Nam)" />
 
@@ -1557,8 +1661,8 @@ When reporting issues, you MUST categorize each error using one of the following
    - Example: "Question stem 'Cho hình chóp...' has no preceding <question_label> tag."
 
 8. `missing_stem`:
-   - A question has question statement or prompt text in the raw source document, but the parser omitted the `<stem>` tag or left an empty `<stem></stem>`.
-   - IMPORTANT INVARIANT: A `<question_label>` does NOT have to be followed by a `<stem>`. In cloze tests, fill-in-the-blank passages, or reading comprehension items where blanks are numbered within a reading passage or stimulus, questions legitimately consist of only `<question_label>` followed immediately by `<option_label>`. These are 100% VALID sequence labeling outputs. NEVER flag `<question_label>` followed by `<option_label>` as `missing_stem`.
+   - A question has question statement or prompt text in the raw source document, but the parser omitted the `<stem>` tag.
+   - IMPORTANT INVARIANT: A `<question_label>` does NOT have to be followed by a non-empty `<stem>`. In cloze tests, fill-in-the-blank passages, or reading comprehension items where blanks are numbered within a reading passage or stimulus, questions legitimately consist of only `<question_label>` followed immediately by `<option_label>`, or explicit empty stems `<stem></stem>`. These are 100% VALID sequence labeling outputs. NEVER flag `<question_label>` followed by `<option_label>` or empty `<stem></stem>` as `missing_stem` or as an error when choices or stimuli are present.
    - Example: "Raw text has question statement 'Tính thể tích khối lăng trụ...', but parser omitted the <stem> tag and jumped directly to choices."
 
 9. `missing_options`:
@@ -1593,7 +1697,7 @@ When reporting issues, you MUST categorize each error using one of the following
 ## 💡 Evaluation Rules & Tolerances:
 1. **Acceptable Text Omission**: If extraneous non-exam lecture notes, study guides, or teacher info blurbs were omitted BUT all questions, stems, choices, and solutions were fully annotated, this omission is ACCEPTABLE. Do NOT report as an error.
 2. **Figures Out of Scope**: Do NOT evaluate or report issues on `<figure ... />` tags.
-3. **Question Labels without Stems (Cloze / Fill-in Exams)**: A `<question_label>` does NOT need to be followed by a `<stem>`. In cloze tests, fill-in-the-blank items, or passage items where the blank/prompt is embedded in a reading passage or stimulus, questions legitimately contain only `<question_label>` followed immediately by `<option_label>`. These are completely VALID. NEVER report `missing_stem` for cloze items or questions with valid choices.
+3. **Question Labels with Absent or Empty Stems (Cloze / Fill-in Exams)**: A `<question_label>` does NOT need to be followed by a non-empty `<stem>`. In cloze tests, fill-in-the-blank items, or passage items where the blank/prompt is embedded in a reading passage or stimulus, questions legitimately contain only `<question_label>` followed immediately by `<option_label>`, or explicit empty stems `<stem></stem>`. These are completely VALID. NEVER report `missing_stem` or any defect for cloze items or questions with valid choices or stimuli.
 4. **Format Invariance**: Non-consecutive question numbering, essay/short-answer questions without choices, and non-exam reference documents with 0 questions in both raw text and XML are completely VALID.
 5. **Terminal Sentinel (<|END|>)**: Annotated XML documents are stored WITHOUT `<|END|>` (it is automatically stripped after generation). Normal documents end with standard XML closing tags (such as `</explanation>`, `</option_text>`, or `</stem>`). The absence of `<|END|>` is completely EXPECTED and NORMAL. You MUST NEVER report missing `<|END|>` as an error, truncation, or defect. (If `<|END|>` happens to be present, it is also harmless and must not be flagged as a syntax error).
 6. **Markdown Headers inside Question Labels (## Câu X)**: In markdown-formatted OCR exams, question labels legitimately include markdown heading hashes (e.g. `<question_label>## Câu 1.</question_label>` or `<question_label>## Bài 1:</question_label>`). This is 100% VALID and EXPECTED. NEVER flag markdown header hashes inside `<question_label>` as `mislabelled_element` or formatting errors! Tagging individual question headers as `<section>` instead of `<question_label>` IS a `mislabelled_element` defect.
@@ -1601,6 +1705,8 @@ When reporting issues, you MUST categorize each error using one of the following
 8. **LaTeX Math Comparisons & Angle Brackets**: Mathematical comparisons such as `$x < 0$`, `$a > b$`, `$\\alpha < \\beta$`, or fractions inside LaTeX math spans are literal source text, NEVER XML tags. NEVER report unclosed angle brackets inside LaTeX formulas as `broken_system_tag`!
 9. **Severity Calibration on Isolated Errors**: If a formatting discrepancy is an isolated one-off occurrence (e.g. 1 question label or 1 option tag in a 40+ question document), rate it as MINOR, NOT MAJOR, to prevent compound penalty distortion on otherwise high-quality documents.
 10. **Zero Questions / Non-Exam Front Matter**: If a document or chunk consists of front matter (book cover, table of contents, foreword, user guide, exam matrix analysis, syllabus summary) and contains no actual exam questions, having 0 questions in XML is 100% CORRECT and VALID. If a deterministic finding claims zero questions or unannotated questions for such non-exam text, confirm it as a FALSE POSITIVE (`is_true_positive: false`).
+11. **Section Tags & 4-Lock Protocol**: Tagging section dividers is governed strictly by the 4-Lock Protocol: (1) Markdown question headings (e.g. `## Câu 1.`) belong 100% inside `<question_label>`, NEVER `<section>`. Tagging question headers as `<section>` is a `mislabelled_element` defect. (2) Administrative metadata (school name `SỞ GD&ĐT`, exam title, code `MÃ ĐỀ: 101`, footer `--- HẾT ---`) MUST remain UNTAGGED plain text. Tagging metadata as `<section>` is a `mislabelled_element` defect. (3) Major exam part titles (`PHẦN I`, `PART 5`, `ĐỌC HIỂU`) and answer key headers (`### BẢNG ĐÁP ÁN`, `### HƯỚNG DẪN GIẢI`) are valid `<section>` tags. (4) Worked solutions below answer keys belong in `<explanation>`.
+12. **Neural Sequence Model Tags (Paired Stimulus Tags Valid)**: In this model evaluation, the system evaluates a neural token classification model (ModernBERT BIO tags). Therefore, `<stimulus>...</stimulus>` legitimately appears as standard paired XML tags wrapping the stimulus text. Both paired `<stimulus>...</stimulus>` and self-closing anchor `<stimulus id="..." />` tags are 100% VALID and ACCEPTED. NEVER report paired `<stimulus>...</stimulus>` as malformed, broken syntax, or missing anchor attributes!
 
 ---
 
@@ -1732,7 +1838,8 @@ Respond ONLY with a valid JSON object with NO markdown codeblocks or extra text:
             f"11. If an [AUDITOR_SAMPLING_WINDOW] comment is present, it was injected by the test auditor tool for large files; do not treat the sampling marker or jump across it as an omission or error.\n"
             f"12. Terminal Sentinel (<|END|>): Do NOT require or expect '<|END|>'. In annotated XML documents, '<|END|>' is stripped upon saving; its absence is completely normal and valid. NEVER report missing '<|END|>' as an error or truncation.\n"
             f"13. Deterministic Confirmations & False Positives: In `parser_error_confirmations`, mark `is_true_positive: true` ONLY IF a finding represents an ACTUAL PARSER ERROR. If a finding claims zero questions or unannotated questions, but the text is front matter, table of contents, foreword, study guide, formula summary, or non-exam material where no actual exam questions exist, report `is_true_positive: false`. The parser was correct not to fabricate questions! Return only additional errors in `issues`.\n"
-            f"14. Question Labels without Stems: In cloze tests, fill-in-the-blank items, or reading passage questions with embedded blanks, questions legitimately consist of only <question_label> followed immediately by <option_label>. NEVER flag these as 'missing_stem' or as an error.\n\n"
+            f"14. Question Labels with Absent or Empty Stems: In cloze tests, fill-in-the-blank items, or reading passage questions with embedded blanks, questions legitimately consist of only <question_label> followed immediately by <option_label>, or explicit empty stems <stem></stem>. NEVER flag these as 'missing_stem' or as an error when options or preceding stimulus exist.\n"
+            f"15. Chunk-Level Boundary Awareness: If evaluating an individual chunk (doc_id containing '::chunk_' or standalone chunk XML), questions may naturally start in a preceding chunk or continue into the next chunk. If a question's stem is near the chunk end and its options appear in the subsequent chunk, or if options appear at the start without an immediate stem, do NOT flag 'truncated_output' or 'missing_options' solely due to normal chunk boundary splits.\n\n"
             f"Inspect the document, confirm the supplied deterministic findings, identify only additional parser errors, and return your JSON report."
         )
 

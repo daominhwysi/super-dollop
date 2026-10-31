@@ -113,3 +113,46 @@ def test_parse_spans_reading_subprompt_preserves_active_stimulus():
     assert q["stimulus_id"] == "stim_1"
     assert q["stimulus_text"] == "Reading passage text here."
     assert "stim_1" in stimuli
+
+
+def test_anchor_helper_end_anchor_mismatch_falls_back_without_deleting():
+    """Verify that an unmatched end_anchor falls back to question_label boundary rather than deleting the stimulus."""
+    xml = """
+<stimulus id="stim_test" start_anchor="This is the start" end_anchor="non existent citation text" />
+
+This is the start of the reading comprehension text that discusses important matters.
+
+<question_label>Question 1:</question_label> <stem>What is the topic?</stem>
+<option_label>A.</option_label> <option_text>Topic A</option_text>
+"""
+    expanded = AnchorHelper.expand_stimulus_anchors(xml)
+    # MUST retain stimulus tag, NOT silently delete it
+    assert '<stimulus id="stim_test">' in expanded
+    assert "</stimulus>" in expanded
+    assert "discusses important matters." in expanded
+    assert "<question_label>Question 1:</question_label>" in expanded
+    # The stimulus must terminate before Question 1 starts
+    stim_close_idx = expanded.find("</stimulus>")
+    q_label_idx = expanded.find("<question_label>")
+    assert stim_close_idx < q_label_idx
+
+
+def test_empty_stem_policy_in_reviewer_deterministic_precheck():
+    """Verify that empty stems in cloze tests or questions with options are not penalized."""
+    from sequence_labelling.annotator.reviewer import DeterministicAuditor, IssueSeverity
+
+    # Cloze test XML with empty stem and choices
+    cloze_xml = """
+<question_label>Question 1.</question_label> <stem></stem>
+<option_label>A.</option_label> <option_text>option 1</option_text>
+<option_label>B.</option_label> <option_text>option 2</option_text>
+<question_label>Question 2.</question_label>
+<option_label>A.</option_label> <option_text>option A</option_text>
+<option_label>B.</option_label> <option_text>option B</option_text>
+"""
+    issues, score, metrics = DeterministicAuditor.check_question_and_option_structure(cloze_xml, raw_ocr_text="")
+    # Score should be 100.0 (no penalty for empty stem in cloze context)
+    assert score == 100.0
+    critical_or_major = [i for i in issues if i.severity in (IssueSeverity.CRITICAL, IssueSeverity.MAJOR)]
+    assert len(critical_or_major) == 0
+

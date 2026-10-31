@@ -887,7 +887,8 @@ def test_reviewer_system_prompt_contains_parser_example_and_rules():
     assert "Raw OCR Input Text:" in prompt
     assert "Expected Parser Output XML:" in prompt
     assert "<stimulus id=\"stim_1\" start_anchor=" in prompt
-    assert "<section>SỞ GD&ĐT HÀ NỘI" in prompt
+    assert "SỞ GD&ĐT HÀ NỘI" in prompt
+    assert "<section>PHẦN I." in prompt
     assert "<question_label>Câu 1:</question_label>" in prompt
     assert "<option_label>a)</option_label>" in prompt
     assert "<explanation>HƯỚNG DẪN GIẢI CHI TIẾT:" in prompt
