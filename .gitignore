@@ -18,3 +18,4 @@ results/
 .agents/
 .scratch/
 scratch/
+*.xlsx
