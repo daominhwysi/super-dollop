@@ -182,7 +182,8 @@ def predict_text(
     batch_size: int = 8,
     mask_latex: bool = False,
     use_viterbi: bool = True,
-    use_typed_latex: bool = True
+    use_typed_latex: bool = True,
+    ignore_section: bool = False
 ) -> Dict[str, Any]:
     """
     Runs sequence labeling on a raw text document with sliding window, batched GPU execution,
@@ -339,6 +340,8 @@ def predict_text(
     token_predictions = []
     for span, pred_id in zip(sorted_spans, pred_ids):
         tag = id_to_tag.get(pred_id, "O")
+        if ignore_section and tag in ("B-section", "I-section"):
+            tag = "O"
         token_predictions.append({
             "start": span[0],
             "end": span[1],
@@ -408,6 +411,9 @@ def predict_text(
     if current_seg:
         segments.append(current_seg)
 
+    if ignore_section:
+        segments = [s for s in segments if s.get("label") != "section"]
+
     xml_text = build_tagged_xml(clean_text, segments)
 
     return {
@@ -430,7 +436,8 @@ class SequenceLabelPredictor:
         stride: int = 256,
         batch_size: int = 8,
         mask_latex: bool = False,
-        use_viterbi: bool = True
+        use_viterbi: bool = True,
+        ignore_section: bool = False
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_length = max_length
@@ -438,6 +445,7 @@ class SequenceLabelPredictor:
         self.batch_size = batch_size
         self.mask_latex = mask_latex
         self.use_viterbi = use_viterbi
+        self.ignore_section = ignore_section
         self.model_dir = Path(model_dir)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
@@ -461,7 +469,8 @@ class SequenceLabelPredictor:
             stride=self.stride,
             batch_size=self.batch_size,
             mask_latex=self.mask_latex,
-            use_viterbi=self.use_viterbi
+            use_viterbi=self.use_viterbi,
+            ignore_section=self.ignore_section
         )
 
 
