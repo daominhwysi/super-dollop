@@ -11,9 +11,11 @@ import sys
 import hashlib
 from pathlib import Path
 
-# Configure PyTorch memory allocator to avoid fragmentation on T4 / constrained GPUs
+# Configure PyTorch memory allocator & thread pools to avoid fragmentation / OOM on T4 / Kaggle
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "4")
 
 # Ensure repository root is in sys.path regardless of execution entrypoint
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
@@ -26,7 +28,7 @@ import math
 import random
 import argparse
 import contextlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 
@@ -264,7 +266,7 @@ def save_training_checkpoint(
     save_dir: Path,
     model: nn.Module,
     tokenizer: Any,
-    optimizer: torch.optim.Optimizer,
+    optimizer: Optional[torch.optim.Optimizer],
     scheduler: Any,
     scaler: Any,
     epoch: int,
@@ -274,21 +276,21 @@ def save_training_checkpoint(
     tag_to_id: Dict[str, int],
     id_to_tag: Dict[int, str],
     step_in_epoch: int = 0,
-    is_main_process: bool = True
+    is_main_process: bool = True,
+    save_optimizer_state: bool = True,
 ):
-    """Saves model weights, config, tokenizer, label map, and full trainer state for continuity."""
+    """Saves model weights, config, tokenizer, label map, and trainer state for continuity."""
     if not is_main_process:
         return
 
     import gc
-    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     save_dir.mkdir(parents=True, exist_ok=True)
     raw_model = model.module if hasattr(model, "module") else model
 
-    # 1. Save model weights, config, enhanced head config, safetensors, pytorch_model.bin
+    # 1. Save model weights, config, enhanced head config, safetensors
     raw_model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
 
@@ -297,14 +299,29 @@ def save_training_checkpoint(
     with open(label_map_file, "w", encoding="utf-8") as f:
         json.dump({"tag_to_id": tag_to_id, "id_to_tag": id_to_tag}, f, indent=2)
 
-    # 3. Save complete trainer state bundle (optimizer, scheduler, scaler, steps, epochs)
+    # 3. Save trainer state bundle (move optimizer tensors to CPU first to avoid GPU->CPU serialization spike)
+    opt_state_cpu = None
+    if save_optimizer_state and optimizer is not None:
+        raw_opt = optimizer.state_dict()
+        cpu_state = {}
+        for k, v in raw_opt.get("state", {}).items():
+            cpu_state[k] = {
+                sk: (sv.detach().cpu() if isinstance(sv, torch.Tensor) else sv)
+                for sk, sv in v.items()
+            }
+        opt_state_cpu = {
+            "state": cpu_state,
+            "param_groups": raw_opt.get("param_groups", []),
+        }
+        del raw_opt
+
     trainer_state = {
         "epoch": epoch,
         "global_step": global_step,
         "step_in_epoch": step_in_epoch,
         "best_macro_f1": best_macro_f1,
         "patience_counter": patience_counter,
-        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "optimizer_state_dict": opt_state_cpu,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state_dict": scaler.state_dict() if scaler and scaler.is_enabled() else None,
         "rng_state": {
@@ -315,7 +332,7 @@ def save_training_checkpoint(
         }
     }
     torch.save(trainer_state, save_dir / "trainer_state.pt")
-    del trainer_state
+    del trainer_state, opt_state_cpu
     gc.collect()
 
 
@@ -609,8 +626,24 @@ def push_checkpoint_to_hub(
             repo_id=repo_id,
             repo_type="model",
             commit_message=commit_message,
-            ignore_patterns=["checkpoint-*", "checkpoint-*/*", "step_*", "latest_checkpoint*", "*.tmp"]
+            ignore_patterns=[
+                "checkpoint-*",
+                "checkpoint-*/*",
+                "step_*",
+                "latest_checkpoint*",
+                "*.tmp",
+                "trainer_state.pt",
+                "optimizer.pt",
+                "scheduler.pt",
+                "scaler.pt",
+                "mlruns",
+                "mlruns/*",
+                "best",
+                "best/*",
+            ]
         )
+        import gc
+        gc.collect()
         print(f"Checkpoint successfully synchronized to: https://huggingface.co/{repo_id}")
     except Exception as e:
         print(f"Notice: Failed to push checkpoint to Hugging Face Hub: {e}")
@@ -778,7 +811,8 @@ def run_evaluation(
                 patience_counter=patience_counter,
                 tag_to_id=tag_to_id,
                 id_to_tag=id_to_tag,
-                is_main_process=is_main_process
+                is_main_process=is_main_process,
+                save_optimizer_state=False,
             )
             with open(output_dir / "best" / "metrics.json", "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2)
@@ -802,8 +836,14 @@ def run_evaluation(
                 print(f"Early stopping triggered after {patience_counter} evaluations without improvement.")
                 stop_training = True
 
+            effective_save_limit = (
+                save_total_limit
+                if save_total_limit is not None
+                else getattr(args, "save_total_limit", None) or 1
+            )
             eval_step_dir = output_dir / f"checkpoint-{global_step}"
             if not eval_step_dir.exists():
+                prune_checkpoints(output_dir, max(0, effective_save_limit - 1), is_main_process=is_main_process)
                 save_training_checkpoint(
                     save_dir=eval_step_dir,
                     model=model,
@@ -820,16 +860,12 @@ def run_evaluation(
                     is_main_process=is_main_process
                 )
             update_latest_checkpoint_link(output_dir, eval_step_dir, is_main_process=is_main_process)
-            effective_save_limit = (
-                save_total_limit
-                if save_total_limit is not None
-                else getattr(args, "save_total_limit", None) or 1
-            )
             prune_checkpoints(output_dir, effective_save_limit, is_main_process=is_main_process)
             if force_push_hub and args.push_to_hub and args.hub_model_id:
+                push_folder = output_dir / "best" if (output_dir / "best").exists() else eval_step_dir
                 push_checkpoint_to_hub(
                     repo_id=args.hub_model_id,
-                    folder_path=output_dir,
+                    folder_path=push_folder,
                     commit_message=f"Epoch {epoch}/{epochs} End - Macro F1: {current_macro_f1 * 100:.2f}% (Best: {best_macro_f1 * 100:.2f}%)",
                     metrics=metrics,
                     args=args,
@@ -857,7 +893,7 @@ def main():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         torch.cuda.set_device(local_rank)
-        torch.distributed.init_process_group(backend="nccl")
+        torch.distributed.init_process_group(backend="nccl", timeout=timedelta(minutes=30))
         device = torch.device("cuda", local_rank)
     else:
         local_rank = 0
@@ -988,9 +1024,16 @@ def main():
         print(f"  Label Smoothing      : {label_smoothing}")
         print(f"============================================================\n")
 
-    # 2. Setup Tokenizer and Tag Mappings
+    # 2. Setup Tokenizer, Tag Mappings, and Pre-compile Viterbi C-Engine (before memory allocation)
     tag_to_id, id_to_tag = get_tag_mappings()
     num_labels = len(tag_to_id)
+
+    if is_main_process:
+        _ = ConstrainedViterbiDecoder(id_to_tag=id_to_tag)
+    if is_distributed:
+        torch.distributed.barrier()
+    if not is_main_process:
+        _ = ConstrainedViterbiDecoder(id_to_tag=id_to_tag)
 
     if is_main_process:
         label_map_file = output_dir / "label_mapping.json"
@@ -1017,30 +1060,39 @@ def main():
     if is_main_process:
         tokenizer.save_pretrained(output_dir)
 
-    # 3. Resolve Dataset Files (Local or Hugging Face Hub)
+    # 3. Resolve Dataset Files (Local or Hugging Face Hub — Rank 0 downloads first to avoid race)
     if args.dataset_repo_id:
         from huggingface_hub import hf_hub_download
         if is_main_process:
             print(f"Downloading dataset from Hugging Face repository: '{args.dataset_repo_id}'...")
-        chunks_file = Path(hf_hub_download(
-            repo_id=args.dataset_repo_id,
-            filename="train_bio_chunks.jsonl",
-            repo_type="dataset"
-        ))
-        val_chunks_file = Path(hf_hub_download(
-            repo_id=args.dataset_repo_id,
-            filename="test_bio_chunks.jsonl",
-            repo_type="dataset"
-        ))
-        try:
-            hf_hub_download(
+            c_path_str = hf_hub_download(
                 repo_id=args.dataset_repo_id,
-                filename="dataset_manifest.json",
-                repo_type="dataset",
-                local_dir=str(chunks_file.parent)
+                filename="train_bio_chunks.jsonl",
+                repo_type="dataset"
             )
-        except Exception:
-            pass
+            v_path_str = hf_hub_download(
+                repo_id=args.dataset_repo_id,
+                filename="test_bio_chunks.jsonl",
+                repo_type="dataset"
+            )
+            try:
+                hf_hub_download(
+                    repo_id=args.dataset_repo_id,
+                    filename="dataset_manifest.json",
+                    repo_type="dataset",
+                    local_dir=str(Path(c_path_str).parent)
+                )
+            except Exception:
+                pass
+        else:
+            c_path_str = None
+            v_path_str = None
+        if is_distributed:
+            paths_list = [c_path_str, v_path_str]
+            torch.distributed.broadcast_object_list(paths_list, src=0)
+            c_path_str, v_path_str = paths_list[0], paths_list[1]
+        chunks_file = Path(c_path_str)
+        val_chunks_file = Path(v_path_str)
     else:
         chunks_path = args.data_dir or data_cfg.get("bio_chunks_file", "data/training_dataset/train_bio_chunks.jsonl")
         chunks_file = Path(chunks_path)
@@ -1091,20 +1143,39 @@ def main():
         doc_filter=lambda doc_id: not is_dev_doc(doc_id),
         **dataset_kwargs,
     )
-    # Deduplicate validation chunks: for the dev set used during training,
-    # evaluate on a single canonical window size (e.g. 1024 or the largest available)
-    # to avoid 16x redundant forward passes and skewed F1 metrics.
+
+    def _has_multiscale_duplicates(file_path: Path, probe_lines: int = 50) -> bool:
+        """Detects if JSONL contains multi-scale duplicate passes (same doc_id & start_token_idx across scales)."""
+        seen = set()
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for _ in range(probe_lines):
+                    line = f.readline()
+                    if not line:
+                        break
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    key = (item.get("doc_id"), item.get("start_token_idx"))
+                    if key[0] is not None and key[1] is not None:
+                        if key in seen:
+                            return True
+                        seen.add(key)
+        except Exception:
+            pass
+        return False
+
     def dev_record_filter(item: Dict[str, Any]) -> bool:
         w_size = item.get("window_size")
-        # If dataset has multiple window sizes, keep only 1024 (or keep all if not multi-scale)
         if w_size is not None and w_size != 1024:
             return False
         return True
 
+    train_is_multiscale = _has_multiscale_duplicates(chunks_file)
     val_dataset = MultiWindowBIODataset(
         chunks_file_path=chunks_file,
         doc_filter=is_dev_doc,
-        record_filter=dev_record_filter if not args.dry_run else None,
+        record_filter=(dev_record_filter if train_is_multiscale and not args.dry_run else None),
         **dataset_kwargs,
     )
     if len(val_dataset) == 0:
@@ -1121,9 +1192,10 @@ def main():
     if val_chunks_file and val_chunks_file.exists():
         if is_main_process:
             print(f"Loading gold benchmark chunks from '{val_chunks_file.name}' (final report only)...")
+        test_is_multiscale = _has_multiscale_duplicates(val_chunks_file)
         test_dataset = MultiWindowBIODataset(
             chunks_file_path=val_chunks_file,
-            record_filter=dev_record_filter if not args.dry_run else None,
+            record_filter=(dev_record_filter if test_is_multiscale and not args.dry_run else None),
             **dataset_kwargs,
         )
         if len(test_dataset) == 0:
@@ -1165,7 +1237,7 @@ def main():
             num_workers=0,
         )
 
-    workers = int(args.dataloader_num_workers if args.dataloader_num_workers is not None else train_cfg.get("dataloader_num_workers", 2))
+    workers = int(args.dataloader_num_workers if args.dataloader_num_workers is not None else train_cfg.get("dataloader_num_workers", 0))
     if os.name == "nt":
         workers = 0
 
@@ -1203,7 +1275,8 @@ def main():
         batch_sampler=train_batch_sampler,
         collate_fn=collate_fn,
         num_workers=workers,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(workers > 0),
     )
 
     val_loader = DataLoader(
@@ -1212,7 +1285,7 @@ def main():
         shuffle=False,
         sampler=val_sampler,
         collate_fn=collate_fn,
-        num_workers=workers
+        num_workers=0,
     )
 
     # 5. Initialize Model
