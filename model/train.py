@@ -54,6 +54,26 @@ from model.module.head import EnhancedBertForTokenClassification, FocalLoss
 from model.module.dataset import get_tag_mappings, MultiWindowBIODataset
 from model.inference.viterbi import ConstrainedViterbiDecoder
 
+_LIBC = None
+try:
+    import ctypes
+    _LIBC = ctypes.CDLL("libc.so.6")
+except Exception:
+    pass
+
+
+def cleanup_memory():
+    """Forces immediate garbage collection, releases CUDA caches, and trims OS heap fragmentation."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if _LIBC is not None and hasattr(_LIBC, "malloc_trim"):
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
 
 # ModernBERT names its normalisation layers `norm`, `attn_norm`, `mlp_norm`, `final_norm`
 NO_DECAY_KEYWORDS = ("bias", "norm", "layer_pooling")
@@ -1250,12 +1270,16 @@ def main():
         train_sampler = None
         val_sampler = None
 
+    # Pinned host memory is only beneficial with multi-worker async queues; with workers=0 it causes
+    # massive THPCachingHostAllocator RAM fragmentation across variable-length batches.
+    use_pin_memory = (workers > 0 and torch.cuda.is_available() and bool(train_cfg.get("dataloader_pin_memory", False)))
+
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_batch_sampler,
         collate_fn=collate_fn,
         num_workers=workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=use_pin_memory,
         persistent_workers=(workers > 0),
     )
 
@@ -1477,13 +1501,13 @@ def main():
             if is_main_process:
                 print(f"Notice: No model weights file found in '{resume_dir}'. Initializing from base model.")
 
-    # Wrap model with DistributedDataParallel if running multi-GPU
+    # Wrap model with DistributedDataParallel if running multi-GPU (all parameters are verified active)
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True
+            find_unused_parameters=False
         )
 
     # 6. Optimizer & Scheduler
@@ -1741,6 +1765,7 @@ def main():
             train_loss += loss.item() * grad_accum
             interval_loss_sum += loss.item() * grad_accum
             interval_batch_count += 1
+            del outputs, input_ids, attention_mask, labels, batch
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
                 if use_amp and amp_dtype == torch.float16 and scaler.is_enabled():
@@ -1828,10 +1853,16 @@ def main():
             if is_main_process and ((step + 1) % progress_interval == 0 or (step + 1) == len(train_loader)):
                 avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
                 current_lr = scheduler.get_last_lr()[0]
+                try:
+                    import psutil
+                    ram_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+                    ram_str = f" | RAM {ram_gb:.2f} GB"
+                except Exception:
+                    ram_str = ""
                 print(
                     f"[Epoch {epoch}/{epochs}] Batch {step + 1}/{len(train_loader)} "
                     f"| Step {global_step}/{total_training_steps} "
-                    f"| Loss {avg_train_loss:.4f} | LR {current_lr:.2e}"
+                    f"| Loss {avg_train_loss:.4f}{ram_str} | LR {current_lr:.2e}"
                 )
                 if mlflow_client is not None:
                     try:
@@ -1848,6 +1879,7 @@ def main():
                         mlflow_client = None
                 interval_loss_sum = 0.0
                 interval_batch_count = 0
+                cleanup_memory()
 
             if args.dry_run and global_step >= 5:
                 if is_main_process:
