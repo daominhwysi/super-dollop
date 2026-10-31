@@ -18,7 +18,7 @@ load_dotenv()
 WORKSPACE_DIR = Path(__file__).resolve().parents[2]
 
 
-def generate_hf_readme(manifest: dict) -> str:
+def generate_hf_readme(manifest: dict, repo_id: str = "daominhwysi/sequence-labelling-vi-exam-v3") -> str:
     """Generates comprehensive Markdown documentation for the v2 Hugging Face dataset."""
     train = manifest.get("train", {})
     test = manifest.get("test_validation", {})
@@ -215,8 +215,8 @@ def parse_args():
     parser.add_argument(
         "--repo-id",
         type=str,
-        default="daominhwysi/synthetic-seq-labelling-vi-exam-v2",
-        help="Hugging Face dataset repository ID (default: daominhwysi/synthetic-seq-labelling-vi-exam-v2)"
+        default="daominhwysi/sequence-labelling-vi-exam-v3",
+        help="Hugging Face dataset repository ID (default: daominhwysi/sequence-labelling-vi-exam-v3)"
     )
     parser.add_argument(
         "--data-dir",
@@ -264,7 +264,7 @@ def main():
         try:
             print(f"Generating updated README.md from '{manifest_path.name}'...")
             manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
-            readme_text = generate_hf_readme(manifest_data)
+            readme_text = generate_hf_readme(manifest_data, repo_id=args.repo_id)
             readme_file = data_dir / "README.md"
             readme_file.write_text(readme_text, encoding="utf-8")
             print(f"Saved updated README.md ({len(readme_text):,} bytes) to {readme_file}")
