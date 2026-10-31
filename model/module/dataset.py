@@ -144,8 +144,9 @@ class MultiWindowBIODataset(Dataset):
         if not self.chunks_file_path.exists():
             raise FileNotFoundError(f"Chunks file not found: {self.chunks_file_path}")
 
-        # Build binary byte offsets for zero-copy lazy loading
+        # Build binary byte offsets and cached sequence lengths for zero-copy lazy loading
         offsets = []
+        raw_lengths = []
         with open(self.chunks_file_path, "rb") as f:
             offset = f.tell()
             line = f.readline()
@@ -156,6 +157,10 @@ class MultiWindowBIODataset(Dataset):
                     rec_ok = (record_filter is None or record_filter(item))
                     if doc_ok and rec_ok:
                         offsets.append(offset)
+                        if "input_ids" in item:
+                            raw_lengths.append(len(item["input_ids"]))
+                        else:
+                            raw_lengths.append(int(len(item.get("tokens", [])) * 1.35))
                         if max_samples and len(offsets) >= max_samples:
                             break
                 offset = f.tell()
@@ -169,8 +174,13 @@ class MultiWindowBIODataset(Dataset):
 
         if tokenizer is not None and offsets and not is_pretokenized and not is_already_chunked:
             self.index = np.array(self._build_windows(offsets), dtype=np.int64).reshape(-1, 3)
+            self._seq_lengths = np.array(
+                [int((we - ws) * 1.35) if ws >= 0 and we >= ws else 0 for _, ws, we in self.index],
+                dtype=np.int32,
+            )
         else:
             self.index = np.array([(off, -1, -1) for off in offsets], dtype=np.int64).reshape(-1, 3)
+            self._seq_lengths = np.array(raw_lengths, dtype=np.int32)
         self._pid = None
         print(
             f"Indexed {len(offsets)} BIO chunks into {len(self.index)} windows (re-slicing={'DISABLED' if is_already_chunked or is_pretokenized else 'ENABLED'}) "
@@ -270,8 +280,10 @@ class MultiWindowBIODataset(Dataset):
     def get_sequence_length(self, idx: int) -> int:
         """
         Fast approximate sequence length for bucketing without full tokenization.
-        Uses word window span if available, else reads line length.
+        Uses cached sequence length computed during initial index pass.
         """
+        if hasattr(self, "_seq_lengths") and idx < len(self._seq_lengths) and self._seq_lengths[idx] > 0:
+            return int(self._seq_lengths[idx])
         _, word_start, word_end = self.index[idx]
         if word_start >= 0 and word_end >= word_start:
             # Approximate subwords ~ 1.35x words
