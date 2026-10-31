@@ -58,7 +58,7 @@ tags:
 - ocr
 size_categories:
 - 10K<n<100K
-pretty_name: Vietnamese Exam Sequence Labelling Dataset v2
+pretty_name: Vietnamese Exam Sequence Labelling Dataset v3
 configs:
   - config_name: default
     data_files:
@@ -80,23 +80,24 @@ configs:
         path: "test_generative.jsonl"
 ---
 
-# Vietnamese Exam Sequence Labelling Dataset (v2)
+# Vietnamese Exam Sequence Labelling Dataset (v3)
 
 A comprehensive, production-grade dataset for **token-level and span-level sequence labelling** of Vietnamese educational examination documents (covering grades 8–12 across Mathematics, Physics, Chemistry, Biology, History, Geography, Literature, and English).
 
 Generated and curated by the [Vietnamese Sequence Labelling v2](https://github.com/daominhwysi/vietnamese-sequence-labelling-v2) pipeline, combining real OCR-annotated examination documents (both scanned and digital PDFs) with synthetic curriculum exams and an isolated 4-tier Gold Benchmark test suite.
 
-## What's New in v2
+## What's New in v3
 
-1. **Unified Multi-Scale Sliding Windows**: Pre-chunked into multiple context window sizes (`[512, 128]`, `[768, 192]`, `[1024, 256]`, `[2048, 512]`) for transformer encoders (mmBERT, PhoBERT, XLM-RoBERTa).
-2. **Three Standard ML Formats**:
+1. **Curated Section Hierarchy**: Removed over 11,900 junk and administrative metadata tags, cleanly isolating genuine exam section headers (`PHẦN I`, `PHẦN II`, `BÀI TẬP TỰ LUẬN`).
+2. **Single-Pass Mechanical Dynamic Windowing**: Dynamically sampled context window sizes (`[768, 576]`, `[1024, 768]`, `[1536, 1152]`, `[2048, 1536]`) eliminating redundant 4-pass corpus duplication while maintaining complete token coverage.
+3. **Three Standard ML Formats**:
    - **BIO Token Chunks** (`train_bio_chunks.jsonl`, `test_bio_chunks.jsonl`) for token classification.
    - **Document Spans** (`train_spans.jsonl`, `test_spans.jsonl`) with character offsets for span-based extractors (LayoutLM, GLiNER, spaCy).
    - **Generative Pairs** (`train_generative.jsonl`, `test_generative.jsonl`) for LLM instruction fine-tuning (Qwen2.5, Llama 3).
-3. **Strictly Isolated Gold Benchmark Test Set**:
+4. **Strictly Isolated Gold Benchmark Test Set**:
    - 63 real examination documents (~455k tokens) selected via **Constrained Max-Min Facility Dispersion** on 13-D structural vectors across 4 difficulty tiers.
    - **Zero Data Leakage**: Guaranteed 0 document overlap between training and testing splits.
-4. **Pedagogical Diversity & Layout Invariants**:
+5. **Pedagogical Diversity & Layout Invariants**:
    - Full support for inline choices (`A. ... B. ... C. ... D. ...`), 2x2 grids, and multi-line options.
    - **Stemless Cloze Questions (`AGENTS.md`)**: Full architectural support for questions where `<question_label>` is followed directly by `<option_label>` without an explicit `<stem>`.
    - Markdown tables and LaTeX math formulas ($...$ and $$...$$) strictly preserved with zero character corruption.
@@ -105,10 +106,10 @@ Generated and curated by the [Vietnamese Sequence Labelling v2](https://github.c
 
 ## Dataset Splits & Statistics
 
-| Partition | Documents | Tokens | Multi-Scale BIO Chunks | Window Scales | Formats Available |
+| Partition | Documents | Tokens | BIO Chunks | Window Scales | Formats Available |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Training Set** | **{train_docs:,}**<br>({real_pristine} pristine real + {real_aug} augmented real + {synth_docs} synthetic) | **{train_tokens:,}** | **{train_chunks:,}** | `512`, `768`, `1024`, `2048` | `train_bio_chunks.jsonl`<br>`train_spans.jsonl`<br>`train_generative.jsonl` |
-| **Test / Val Set (Gold Benchmark)** | **{test_docs:,}**<br>(100% pristine real across 4 tiers) | **{test_tokens:,}** | **{test_chunks:,}** | `512`, `768`, `1024`, `2048` | `test_bio_chunks.jsonl`<br>`test_spans.jsonl`<br>`test_generative.jsonl` |
+| **Training Set** | **{train_docs:,}**<br>({real_pristine} pristine real + {real_aug} augmented real + {synth_docs} synthetic) | **{train_tokens:,}** | **{train_chunks:,}** | Dynamic (`768`-`2048`) | `train_bio_chunks.jsonl`<br>`train_spans.jsonl`<br>`train_generative.jsonl` |
+| **Test / Val Set (Gold Benchmark)** | **{test_docs:,}**<br>(100% pristine real across 4 tiers) | **{test_tokens:,}** | **{test_chunks:,}** | Dynamic (`768`-`2048`) | `test_bio_chunks.jsonl`<br>`test_spans.jsonl`<br>`test_generative.jsonl` |
 
 ---
 
@@ -315,7 +316,7 @@ def main():
                 path_in_repo=f.name,
                 repo_id=args.repo_id,
                 repo_type="dataset",
-                commit_message=f"Upload {f.name} (v2 dataset)"
+                commit_message=f"Upload {f.name} (v3 dataset)"
             )
             elapsed = time.time() - file_start
             print(f"  --> Successfully uploaded {f.name} in {elapsed:.1f}s.")
