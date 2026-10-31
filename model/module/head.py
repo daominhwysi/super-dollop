@@ -313,7 +313,8 @@ class EnhancedTokenClassificationHead(nn.Module):
             # Compute focal loss per branch BEFORE averaging to prevent ensemble smoothing
             branch_losses = [loss_fct(logits, targets) for logits in branch_logits]
             loss = torch.mean(torch.stack(branch_losses))
-            logits = torch.mean(torch.stack(branch_logits, dim=0), dim=0)
+            # Detach unused logits to prevent retaining duplicate backward graph branches
+            logits = torch.mean(torch.stack(branch_logits, dim=0), dim=0).detach()
             return logits, loss
         elif self.training and len(self.multi_sample_dropout.dropouts) > 1:
             branch_logits = self.multi_sample_dropout(features, self.classifier)
