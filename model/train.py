@@ -1144,38 +1144,19 @@ def main():
         **dataset_kwargs,
     )
 
-    def _has_multiscale_duplicates(file_path: Path, probe_lines: int = 50) -> bool:
-        """Detects if JSONL contains multi-scale duplicate passes (same doc_id & start_token_idx across scales)."""
-        seen = set()
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for _ in range(probe_lines):
-                    line = f.readline()
-                    if not line:
-                        break
-                    if not line.strip():
-                        continue
-                    item = json.loads(line)
-                    key = (item.get("doc_id"), item.get("start_token_idx"))
-                    if key[0] is not None and key[1] is not None:
-                        if key in seen:
-                            return True
-                        seen.add(key)
-        except Exception:
-            pass
-        return False
-
+    # Standardized evaluation on canonical 1024-token window:
+    # Keeps validation lightweight, prevents memory spikes mid-epoch, and ensures
+    # consistent Macro F1 metric calibration without length-mix noise.
     def dev_record_filter(item: Dict[str, Any]) -> bool:
         w_size = item.get("window_size")
         if w_size is not None and w_size != 1024:
             return False
         return True
 
-    train_is_multiscale = _has_multiscale_duplicates(chunks_file)
     val_dataset = MultiWindowBIODataset(
         chunks_file_path=chunks_file,
         doc_filter=is_dev_doc,
-        record_filter=(dev_record_filter if train_is_multiscale and not args.dry_run else None),
+        record_filter=dev_record_filter if not args.dry_run else None,
         **dataset_kwargs,
     )
     if len(val_dataset) == 0:
@@ -1192,10 +1173,9 @@ def main():
     if val_chunks_file and val_chunks_file.exists():
         if is_main_process:
             print(f"Loading gold benchmark chunks from '{val_chunks_file.name}' (final report only)...")
-        test_is_multiscale = _has_multiscale_duplicates(val_chunks_file)
         test_dataset = MultiWindowBIODataset(
             chunks_file_path=val_chunks_file,
-            record_filter=(dev_record_filter if test_is_multiscale and not args.dry_run else None),
+            record_filter=dev_record_filter if not args.dry_run else None,
             **dataset_kwargs,
         )
         if len(test_dataset) == 0:
