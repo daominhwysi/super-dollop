@@ -313,8 +313,9 @@ class EnhancedTokenClassificationHead(nn.Module):
             # Compute focal loss per branch BEFORE averaging to prevent ensemble smoothing
             branch_losses = [loss_fct(logits, targets) for logits in branch_logits]
             loss = torch.mean(torch.stack(branch_losses))
-            # Detach unused logits to prevent retaining duplicate backward graph branches
-            logits = torch.mean(torch.stack(branch_logits, dim=0), dim=0).detach()
+            # Compute averaged logits under no_grad to avoid constructing StackBackward/MeanBackward nodes
+            with torch.no_grad():
+                logits = torch.mean(torch.stack(branch_logits, dim=0), dim=0)
             return logits, loss
         elif self.training and len(self.multi_sample_dropout.dropouts) > 1:
             branch_logits = self.multi_sample_dropout(features, self.classifier)
@@ -452,6 +453,13 @@ class EnhancedBertForTokenClassification(nn.Module):
         hidden_states = getattr(outputs, "hidden_states", None)
         if hidden_states is None:
             hidden_states = outputs[0]
+        elif isinstance(hidden_states, (tuple, list)):
+            k = getattr(self.head, "num_layers_to_fuse", 4)
+            hidden_states = tuple(hidden_states[-k:])
+
+        retained_hidden_states = outputs.hidden_states if output_hidden_states else None
+        retained_attentions = outputs.attentions if output_attentions else None
+        del outputs
 
         if self.training and labels is not None and self.per_branch_focal_loss:
             head_out = self.head(
@@ -471,12 +479,13 @@ class EnhancedBertForTokenClassification(nn.Module):
             else:
                 logits = head_out
             loss = self.loss_fct(logits, labels) if labels is not None else None
+        del hidden_states
 
         return TokenClassifierOutput(
             loss=loss,
             logits=logits,
-            hidden_states=outputs.hidden_states if output_hidden_states else None,
-            attentions=outputs.attentions if output_attentions else None,
+            hidden_states=retained_hidden_states,
+            attentions=retained_attentions,
         )
 
     def save_pretrained(self, save_directory: Union[str, os.PathLike], **kwargs):
