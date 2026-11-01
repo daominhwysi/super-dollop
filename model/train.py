@@ -170,20 +170,23 @@ class DistributedLengthGroupedBatchSampler(Sampler[List[int]]):
             if len(batch) == self.batch_size or not self.drop_last:
                 batches.append(batch)
 
-        if self.shuffle:
-            rng.shuffle(batches)
-
-        # Distribute batches evenly across replicas
+        # Group contiguous length-matched batches into mega-batches of size num_replicas
+        # so that each rank processes batches with nearly identical sequence lengths at every step,
+        # eliminating straggler wait time at the DDP AllReduce barrier.
         if not self.drop_last:
             padding_size = (self.num_replicas - (len(batches) % self.num_replicas)) % self.num_replicas
             if padding_size > 0:
                 batches.extend(batches[:padding_size])
-            num_samples = len(batches) // self.num_replicas
+            mega_batches = [batches[i : i + self.num_replicas] for i in range(0, len(batches), self.num_replicas)]
         else:
             num_samples = len(batches) // self.num_replicas
             batches = batches[: num_samples * self.num_replicas]
+            mega_batches = [batches[i : i + self.num_replicas] for i in range(0, len(batches), self.num_replicas)]
 
-        batches = batches[self.rank * num_samples : (self.rank + 1) * num_samples]
+        if self.shuffle:
+            rng.shuffle(mega_batches)
+
+        batches = [mb[self.rank] for mb in mega_batches]
 
         for batch in batches:
             yield batch
