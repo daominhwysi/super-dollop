@@ -13,6 +13,7 @@ from pathlib import Path
 
 # Configure PyTorch memory allocator & thread pools to avoid fragmentation / OOM on T4 / Kaggle
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "4")
@@ -53,6 +54,26 @@ transformers_logging.disable_progress_bar()
 from model.module.head import EnhancedBertForTokenClassification, FocalLoss
 from model.module.dataset import get_tag_mappings, MultiWindowBIODataset
 from model.inference.viterbi import ConstrainedViterbiDecoder
+
+_LIBC = None
+try:
+    import ctypes
+    _LIBC = ctypes.CDLL("libc.so.6")
+except Exception:
+    pass
+
+
+def cleanup_memory(empty_cuda: bool = False):
+    """Forces immediate garbage collection, optionally releases CUDA caches, and trims OS heap fragmentation."""
+    import gc
+    gc.collect()
+    if empty_cuda and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if _LIBC is not None and hasattr(_LIBC, "malloc_trim"):
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
 
 
 # ModernBERT names its normalisation layers `norm`, `attn_norm`, `mlp_norm`, `final_norm`
@@ -880,6 +901,7 @@ def run_evaluation(
         patience_counter = int(best_tensor[1].item())
         stop_training = bool(best_tensor[2].item() == 1.0)
 
+    cleanup_memory(empty_cuda=True)
     model.train()
     return best_macro_f1, patience_counter, stop_training
 
@@ -997,8 +1019,11 @@ def main():
         torch.cuda.manual_seed_all(seed + local_rank)
 
     if is_main_process:
+        import transformers
         print(f"\n============================================================")
         print(f"Starting mmBERT Sequence Labelling Full Fine-Tuning")
+        print(f"  PyTorch Version      : {torch.__version__}")
+        print(f"  Transformers Version : {transformers.__version__}")
         print(f"  Backbone Model       : {model_name}")
         print(f"  Distributed          : {is_distributed} (World Size: {world_size}, Local Rank: {local_rank})")
         print(f"  Device               : {device}")
@@ -1196,7 +1221,10 @@ def main():
         attention_mask = [b["attention_mask"] for b in batch]
         labels = [b["labels"] for b in batch]
 
-        max_len = max(len(x) for x in input_ids)
+        raw_max_len = max(len(x) for x in input_ids)
+        # Pad to multiple of 64 (capped at max_length) so dynamic sequence lengths produce at most
+        # 32 canonical tensor shapes (64..2048), eliminating allocator & SDPA mask fragmentation.
+        max_len = min(max_length, ((raw_max_len + 63) // 64) * 64) if raw_max_len > 0 else 0
         padded_ids = torch.stack([nn.functional.pad(x, (0, max_len - len(x)), value=tokenizer.pad_token_id or 0) for x in input_ids])
         padded_mask = torch.stack([nn.functional.pad(x, (0, max_len - len(x)), value=0) for x in attention_mask])
         padded_labels = torch.stack([nn.functional.pad(x, (0, max_len - len(x)), value=-100) for x in labels])
@@ -1250,12 +1278,16 @@ def main():
         train_sampler = None
         val_sampler = None
 
+    # Pinned host memory is only beneficial with multi-worker async queues; with workers=0 it causes
+    # massive THPCachingHostAllocator RAM fragmentation across variable-length batches.
+    use_pin_memory = (workers > 0 and torch.cuda.is_available() and bool(train_cfg.get("dataloader_pin_memory", False)))
+
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_batch_sampler,
         collate_fn=collate_fn,
         num_workers=workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=use_pin_memory,
         persistent_workers=(workers > 0),
     )
 
@@ -1283,6 +1315,9 @@ def main():
     config.output_hidden_states = True
     config._attn_implementation = attn_impl
     config.torch_dtype = torch.float32
+    # Explicitly disable ModernBERT reference_compile (torch.compile) to prevent TorchDynamo/Inductor
+    # from accumulating 20-30 GB of compiled graph caches in Host RAM across dynamic sequence lengths.
+    config.reference_compile = False
 
     try:
         base_model = AutoModel.from_pretrained(
@@ -1300,7 +1335,10 @@ def main():
     base_model = base_model.to(torch.float32)
 
     orig_vocab_size = getattr(config, "vocab_size", len(tokenizer))
-    base_model.resize_token_embeddings(len(tokenizer))
+    try:
+        base_model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+    except TypeError:
+        base_model.resize_token_embeddings(len(tokenizer))
     if len(tokenizer) > orig_vocab_size or any(tokenizer.convert_tokens_to_ids(st) >= orig_vocab_size for st in special_tokens):
         embeddings = base_model.get_input_embeddings()
         with torch.no_grad():
@@ -1477,13 +1515,13 @@ def main():
             if is_main_process:
                 print(f"Notice: No model weights file found in '{resume_dir}'. Initializing from base model.")
 
-    # Wrap model with DistributedDataParallel if running multi-GPU
+    # Wrap model with DistributedDataParallel if running multi-GPU (all parameters are verified active)
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True
+            find_unused_parameters=False
         )
 
     # 6. Optimizer & Scheduler
@@ -1699,6 +1737,8 @@ def main():
 
     last_eval_step = -1
     stop_training = False
+    # Release temporary CPU initialization buffers across all ranks before entering training loop
+    cleanup_memory(empty_cuda=True)
 
     for epoch in range(start_epoch, epochs + 1):
         if hasattr(train_batch_sampler, "set_epoch"):
@@ -1732,15 +1772,20 @@ def main():
                     with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                         loss = outputs.loss / grad_accum
+                    del outputs
                     scaler.scale(loss).backward()
                 else:
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = outputs.loss / grad_accum
+                    del outputs
                     loss.backward()
 
-            train_loss += loss.item() * grad_accum
-            interval_loss_sum += loss.item() * grad_accum
+            step_loss_val = loss.detach().item() * grad_accum
+            train_loss += step_loss_val
+            interval_loss_sum += step_loss_val
             interval_batch_count += 1
+            batch_max_len = int(input_ids.shape[1]) if input_ids is not None else 0
+            del loss, input_ids, attention_mask, labels, batch
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
                 if use_amp and amp_dtype == torch.float16 and scaler.is_enabled():
@@ -1825,29 +1870,57 @@ def main():
                     if stop_training:
                         break
 
-            if is_main_process and ((step + 1) % progress_interval == 0 or (step + 1) == len(train_loader)):
-                avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
-                current_lr = scheduler.get_last_lr()[0]
-                print(
-                    f"[Epoch {epoch}/{epochs}] Batch {step + 1}/{len(train_loader)} "
-                    f"| Step {global_step}/{total_training_steps} "
-                    f"| Loss {avg_train_loss:.4f} | LR {current_lr:.2e}"
-                )
-                if mlflow_client is not None:
-                    try:
-                        mlflow_client.log_metrics(
-                            {"train/loss": avg_train_loss, "train/learning_rate": current_lr},
-                            step=global_step,
-                        )
-                    except Exception as e:
-                        print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
+            if (step + 1) % progress_interval == 0 or (step + 1) == len(train_loader):
+                # Collect Host RSS & GPU VRAM for the current rank
+                rss_gb = 0.0
+                try:
+                    import psutil
+                    rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+                except Exception:
+                    pass
+
+                gpu_alloc_gb = 0.0
+                if torch.cuda.is_available():
+                    gpu_alloc_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+
+                # In distributed mode, gather memory across all ranks so Rank 0 prints the full picture
+                if is_distributed:
+                    mem_tensor = torch.tensor([rss_gb, gpu_alloc_gb], dtype=torch.float32, device=device)
+                    gathered_mem = [torch.zeros_like(mem_tensor) for _ in range(world_size)]
+                    torch.distributed.all_gather(gathered_mem, mem_tensor)
+                    ranks_ram_str = " | ".join(f"R{r} RAM {gathered_mem[r][0].item():.2f}G/VRAM {gathered_mem[r][1].item():.2f}G" for r in range(world_size))
+                else:
+                    ranks_ram_str = f"RAM {rss_gb:.2f}G/VRAM {gpu_alloc_gb:.2f}G"
+
+                if is_main_process:
+                    avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(
+                        f"[Epoch {epoch}/{epochs}] Batch {step + 1}/{len(train_loader)} "
+                        f"| Step {global_step}/{total_training_steps} "
+                        f"| Loss {avg_train_loss:.4f} | Len {batch_max_len} | {ranks_ram_str} | LR {current_lr:.2e}"
+                    )
+                    if mlflow_client is not None:
                         try:
-                            mlflow_client.end_run(status="FAILED")
-                        except Exception:
-                            pass
-                        mlflow_client = None
+                            mlflow_client.log_metrics(
+                                {
+                                    "train/loss": avg_train_loss,
+                                    "train/learning_rate": current_lr,
+                                    "train/host_ram_gb_rank0": rss_gb,
+                                },
+                                step=global_step,
+                            )
+                        except Exception as e:
+                            print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
+                            try:
+                                mlflow_client.end_run(status="FAILED")
+                            except Exception:
+                                pass
+                            mlflow_client = None
                 interval_loss_sum = 0.0
                 interval_batch_count = 0
+                # Run GC and glibc heap trim across ALL DDP ranks (not just Rank 0)
+                cleanup_memory(empty_cuda=False)
 
             if args.dry_run and global_step >= 5:
                 if is_main_process:
