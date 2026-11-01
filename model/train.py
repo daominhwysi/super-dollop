@@ -1019,8 +1019,11 @@ def main():
         torch.cuda.manual_seed_all(seed + local_rank)
 
     if is_main_process:
+        import transformers
         print(f"\n============================================================")
         print(f"Starting mmBERT Sequence Labelling Full Fine-Tuning")
+        print(f"  PyTorch Version      : {torch.__version__}")
+        print(f"  Transformers Version : {transformers.__version__}")
         print(f"  Backbone Model       : {model_name}")
         print(f"  Distributed          : {is_distributed} (World Size: {world_size}, Local Rank: {local_rank})")
         print(f"  Device               : {device}")
@@ -1781,6 +1784,7 @@ def main():
             train_loss += step_loss_val
             interval_loss_sum += step_loss_val
             interval_batch_count += 1
+            batch_max_len = int(input_ids.shape[1]) if input_ids is not None else 0
             del loss, input_ids, attention_mask, labels, batch
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
@@ -1867,24 +1871,43 @@ def main():
                         break
 
             if (step + 1) % progress_interval == 0 or (step + 1) == len(train_loader):
+                # Collect Host RSS & GPU VRAM for the current rank
+                rss_gb = 0.0
+                try:
+                    import psutil
+                    rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+                except Exception:
+                    pass
+
+                gpu_alloc_gb = 0.0
+                if torch.cuda.is_available():
+                    gpu_alloc_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+
+                # In distributed mode, gather memory across all ranks so Rank 0 prints the full picture
+                if is_distributed:
+                    mem_tensor = torch.tensor([rss_gb, gpu_alloc_gb], dtype=torch.float32, device=device)
+                    gathered_mem = [torch.zeros_like(mem_tensor) for _ in range(world_size)]
+                    torch.distributed.all_gather(gathered_mem, mem_tensor)
+                    ranks_ram_str = " | ".join(f"R{r} RAM {gathered_mem[r][0].item():.2f}G/VRAM {gathered_mem[r][1].item():.2f}G" for r in range(world_size))
+                else:
+                    ranks_ram_str = f"RAM {rss_gb:.2f}G/VRAM {gpu_alloc_gb:.2f}G"
+
                 if is_main_process:
                     avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
                     current_lr = scheduler.get_last_lr()[0]
-                    try:
-                        import psutil
-                        ram_gb = psutil.Process().memory_info().rss / (1024 ** 3)
-                        ram_str = f" | RAM {ram_gb:.2f} GB"
-                    except Exception:
-                        ram_str = ""
                     print(
                         f"[Epoch {epoch}/{epochs}] Batch {step + 1}/{len(train_loader)} "
                         f"| Step {global_step}/{total_training_steps} "
-                        f"| Loss {avg_train_loss:.4f}{ram_str} | LR {current_lr:.2e}"
+                        f"| Loss {avg_train_loss:.4f} | Len {batch_max_len} | {ranks_ram_str} | LR {current_lr:.2e}"
                     )
                     if mlflow_client is not None:
                         try:
                             mlflow_client.log_metrics(
-                                {"train/loss": avg_train_loss, "train/learning_rate": current_lr},
+                                {
+                                    "train/loss": avg_train_loss,
+                                    "train/learning_rate": current_lr,
+                                    "train/host_ram_gb_rank0": rss_gb,
+                                },
                                 step=global_step,
                             )
                         except Exception as e:
