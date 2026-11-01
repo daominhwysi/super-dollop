@@ -309,13 +309,27 @@ class EnhancedTokenClassificationHead(nn.Module):
 
         # 4. Multi-Sample Dropout & Loss computation
         if self.training and targets is not None and loss_fct is not None:
-            branch_logits = self.multi_sample_dropout(features, self.classifier)
-            # Compute focal loss per branch BEFORE averaging to prevent ensemble smoothing
-            branch_losses = [loss_fct(logits, targets) for logits in branch_logits]
-            loss = torch.mean(torch.stack(branch_losses))
-            # Compute averaged logits under no_grad to avoid constructing StackBackward/MeanBackward nodes
+            # Fast Token-Masked Multi-Sample Dropout:
+            # Only compute 5x dropout branches and loss on non-ignored tokens (!= -100),
+            # avoiding computing 5x dropout + 5x linear projections + 5x focal loss on padding tokens.
+            flat_targets = targets.view(-1)
+            ignore_idx = getattr(loss_fct, "ignore_index", -100)
+            valid_mask = flat_targets != ignore_idx
+
+            if valid_mask.any():
+                valid_features = features.view(-1, features.size(-1))[valid_mask]
+                valid_targets = flat_targets[valid_mask]
+                # Vectorized Multi-Sample Dropout projection: shape [num_branches, N_valid, num_labels]
+                stacked_drops = torch.stack([drop(valid_features) for drop in self.multi_sample_dropout.dropouts], dim=0)
+                stacked_valid_logits = self.classifier(stacked_drops)
+                branch_losses = [loss_fct(stacked_valid_logits[i], valid_targets) for i in range(len(self.multi_sample_dropout.dropouts))]
+                loss = torch.mean(torch.stack(branch_losses))
+            else:
+                loss = torch.tensor(0.0, device=features.device, requires_grad=True)
+
+            # Compute full sequence logits under no_grad for downstream metric reporting without autograd overhead
             with torch.no_grad():
-                logits = torch.mean(torch.stack(branch_logits, dim=0), dim=0)
+                logits = self.classifier(features)
             return logits, loss
         elif self.training and len(self.multi_sample_dropout.dropouts) > 1:
             branch_logits = self.multi_sample_dropout(features, self.classifier)
