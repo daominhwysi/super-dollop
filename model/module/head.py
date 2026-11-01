@@ -397,6 +397,16 @@ class EnhancedBertForTokenClassification(nn.Module):
             label_smoothing=label_smoothing
         )
 
+        # Freeze unused backbone parameters that do not participate in loss calculation:
+        # ModernBERT's `final_norm` is bypassed when pooling intermediate hidden states (outputs.hidden_states),
+        # and standard BERT's `pooler` is not used in token classification.
+        # Freezing them removes unreduced parameter overhead in DDP without requiring find_unused_parameters=True.
+        for unused_module_name in ("final_norm", "pooler"):
+            mod = getattr(self.base_model, unused_module_name, None)
+            if mod is not None and isinstance(mod, nn.Module):
+                for p in mod.parameters():
+                    p.requires_grad = False
+
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if hasattr(self.base_model, "gradient_checkpointing_enable"):
             try:
