@@ -1518,15 +1518,16 @@ def main():
             if is_main_process:
                 print(f"Notice: No model weights file found in '{resume_dir}'. Initializing from base model.")
 
-    # Wrap model with DistributedDataParallel if running multi-GPU
-    # find_unused_parameters=True is strictly required because ModernBERT's final_norm (index 133)
-    # does not receive gradients when hidden_states are pooled from intermediate encoder layers.
+    # Wrap model with DistributedDataParallel if running multi-GPU.
+    # find_unused_parameters is safely set to False because unused backbone modules
+    # (e.g. ModernBERT final_norm, BERT pooler) are explicitly frozen with requires_grad=False
+    # in EnhancedBertForTokenClassification, eliminating DDP Autograd graph traversal overhead.
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True
+            find_unused_parameters=False
         )
 
     # 6. Optimizer & Scheduler
