@@ -13,6 +13,7 @@ from pathlib import Path
 
 # Configure PyTorch memory allocator & thread pools to avoid fragmentation / OOM on T4 / Kaggle
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "4")
@@ -62,11 +63,11 @@ except Exception:
     pass
 
 
-def cleanup_memory():
-    """Forces immediate garbage collection, releases CUDA caches, and trims OS heap fragmentation."""
+def cleanup_memory(empty_cuda: bool = False):
+    """Forces immediate garbage collection, optionally releases CUDA caches, and trims OS heap fragmentation."""
     import gc
     gc.collect()
-    if torch.cuda.is_available():
+    if empty_cuda and torch.cuda.is_available():
         torch.cuda.empty_cache()
     if _LIBC is not None and hasattr(_LIBC, "malloc_trim"):
         try:
@@ -900,6 +901,7 @@ def run_evaluation(
         patience_counter = int(best_tensor[1].item())
         stop_training = bool(best_tensor[2].item() == 1.0)
 
+    cleanup_memory(empty_cuda=True)
     model.train()
     return best_macro_f1, patience_counter, stop_training
 
@@ -1216,7 +1218,10 @@ def main():
         attention_mask = [b["attention_mask"] for b in batch]
         labels = [b["labels"] for b in batch]
 
-        max_len = max(len(x) for x in input_ids)
+        raw_max_len = max(len(x) for x in input_ids)
+        # Pad to multiple of 64 (capped at max_length) so dynamic sequence lengths produce at most
+        # 32 canonical tensor shapes (64..2048), eliminating allocator & SDPA mask fragmentation.
+        max_len = min(max_length, ((raw_max_len + 63) // 64) * 64) if raw_max_len > 0 else 0
         padded_ids = torch.stack([nn.functional.pad(x, (0, max_len - len(x)), value=tokenizer.pad_token_id or 0) for x in input_ids])
         padded_mask = torch.stack([nn.functional.pad(x, (0, max_len - len(x)), value=0) for x in attention_mask])
         padded_labels = torch.stack([nn.functional.pad(x, (0, max_len - len(x)), value=-100) for x in labels])
@@ -1307,6 +1312,9 @@ def main():
     config.output_hidden_states = True
     config._attn_implementation = attn_impl
     config.torch_dtype = torch.float32
+    # Explicitly disable ModernBERT reference_compile (torch.compile) to prevent TorchDynamo/Inductor
+    # from accumulating 20-30 GB of compiled graph caches in Host RAM across dynamic sequence lengths.
+    config.reference_compile = False
 
     try:
         base_model = AutoModel.from_pretrained(
@@ -1324,7 +1332,10 @@ def main():
     base_model = base_model.to(torch.float32)
 
     orig_vocab_size = getattr(config, "vocab_size", len(tokenizer))
-    base_model.resize_token_embeddings(len(tokenizer))
+    try:
+        base_model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+    except TypeError:
+        base_model.resize_token_embeddings(len(tokenizer))
     if len(tokenizer) > orig_vocab_size or any(tokenizer.convert_tokens_to_ids(st) >= orig_vocab_size for st in special_tokens):
         embeddings = base_model.get_input_embeddings()
         with torch.no_grad():
@@ -1723,6 +1734,8 @@ def main():
 
     last_eval_step = -1
     stop_training = False
+    # Release temporary CPU initialization buffers across all ranks before entering training loop
+    cleanup_memory(empty_cuda=True)
 
     for epoch in range(start_epoch, epochs + 1):
         if hasattr(train_batch_sampler, "set_epoch"):
@@ -1756,16 +1769,19 @@ def main():
                     with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                         loss = outputs.loss / grad_accum
+                    del outputs
                     scaler.scale(loss).backward()
                 else:
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = outputs.loss / grad_accum
+                    del outputs
                     loss.backward()
 
-            train_loss += loss.item() * grad_accum
-            interval_loss_sum += loss.item() * grad_accum
+            step_loss_val = loss.detach().item() * grad_accum
+            train_loss += step_loss_val
+            interval_loss_sum += step_loss_val
             interval_batch_count += 1
-            del outputs, input_ids, attention_mask, labels, batch
+            del loss, input_ids, attention_mask, labels, batch
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
                 if use_amp and amp_dtype == torch.float16 and scaler.is_enabled():
@@ -1850,36 +1866,38 @@ def main():
                     if stop_training:
                         break
 
-            if is_main_process and ((step + 1) % progress_interval == 0 or (step + 1) == len(train_loader)):
-                avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
-                current_lr = scheduler.get_last_lr()[0]
-                try:
-                    import psutil
-                    ram_gb = psutil.Process().memory_info().rss / (1024 ** 3)
-                    ram_str = f" | RAM {ram_gb:.2f} GB"
-                except Exception:
-                    ram_str = ""
-                print(
-                    f"[Epoch {epoch}/{epochs}] Batch {step + 1}/{len(train_loader)} "
-                    f"| Step {global_step}/{total_training_steps} "
-                    f"| Loss {avg_train_loss:.4f}{ram_str} | LR {current_lr:.2e}"
-                )
-                if mlflow_client is not None:
+            if (step + 1) % progress_interval == 0 or (step + 1) == len(train_loader):
+                if is_main_process:
+                    avg_train_loss = interval_loss_sum / max(1, interval_batch_count)
+                    current_lr = scheduler.get_last_lr()[0]
                     try:
-                        mlflow_client.log_metrics(
-                            {"train/loss": avg_train_loss, "train/learning_rate": current_lr},
-                            step=global_step,
-                        )
-                    except Exception as e:
-                        print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
+                        import psutil
+                        ram_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+                        ram_str = f" | RAM {ram_gb:.2f} GB"
+                    except Exception:
+                        ram_str = ""
+                    print(
+                        f"[Epoch {epoch}/{epochs}] Batch {step + 1}/{len(train_loader)} "
+                        f"| Step {global_step}/{total_training_steps} "
+                        f"| Loss {avg_train_loss:.4f}{ram_str} | LR {current_lr:.2e}"
+                    )
+                    if mlflow_client is not None:
                         try:
-                            mlflow_client.end_run(status="FAILED")
-                        except Exception:
-                            pass
-                        mlflow_client = None
+                            mlflow_client.log_metrics(
+                                {"train/loss": avg_train_loss, "train/learning_rate": current_lr},
+                                step=global_step,
+                            )
+                        except Exception as e:
+                            print(f"Warning: MLflow metric logging failed; disabling tracking: {e}")
+                            try:
+                                mlflow_client.end_run(status="FAILED")
+                            except Exception:
+                                pass
+                            mlflow_client = None
                 interval_loss_sum = 0.0
                 interval_batch_count = 0
-                cleanup_memory()
+                # Run GC and glibc heap trim across ALL DDP ranks (not just Rank 0)
+                cleanup_memory(empty_cuda=False)
 
             if args.dry_run and global_step >= 5:
                 if is_main_process:
