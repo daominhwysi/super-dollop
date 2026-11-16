@@ -1500,6 +1500,31 @@ def test_check_paired_stimulus_integrity():
     assert any(iss.category == "single_question_stimulus" for iss in issues_sq)
 
 
+def test_check_section_4_lock_catches_admin_bold_html_and_question_headings():
+    bad_admin = (
+        "<section><table><tr><td>**SỞ GIÁO DỤC VÀ ĐÀO TẠO**<br />**BẮC GIANG**</td></tr></table></section>\n"
+        "<section>---</section>\n"
+        "<section>8</section>\n"
+        "<section>## Câu 21.</section>\n"
+        "<question_label>Câu 1.</question_label><stem>Nội dung?</stem>"
+        "<option_label>A.</option_label><option_text>1</option_text>"
+    )
+    issues, score, _ = DeterministicAuditor.check_question_and_option_structure(bad_admin)
+    assert score < 100.0
+    msgs = "\n".join(iss.message for iss in issues)
+    assert "Lock 2" in msgs
+    assert "Lock 1" in msgs
+
+    valid_part = (
+        "<section>## PART 5 - INCOMPLETE SENTENCES</section>\n"
+        "<question_label>Câu 1.</question_label><stem>Choose the best answer.</stem>"
+        "<option_label>A.</option_label><option_text>go</option_text>"
+    )
+    ok_issues, ok_score, _ = DeterministicAuditor.check_question_and_option_structure(valid_part)
+    assert ok_score == 100.0
+    assert ok_issues == []
+
+
 
 
 

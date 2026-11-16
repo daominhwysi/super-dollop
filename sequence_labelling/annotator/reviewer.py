@@ -665,12 +665,33 @@ class DeterministicAuditor:
             )
             deductions += min(30.0, 15.0 * count)
 
-        # 2. Section on Administrative Metadata Check (Rule 18 / Lock 2)
-        admin_sec_matches = list(re.finditer(
-            r"<section>\s*(?:#+\s*)?(?:SỞ\s+GD|TRƯỜNG\s+THPT|UBND\s+TỈNH|PHÒNG\s+GD|KỲ\s+THI|BỘ\s+GIÁO\s+DỤC)",
-            xml_content,
+        # 2 & 3. Section 4-Lock Checks (Lock 1: Question headers/content in <section>; Lock 2: Admin/footer/watermark/page metadata in <section>)
+        section_matches = list(re.finditer(r"<section\b[^>]*>(.*?)</section>", xml_content, re.DOTALL))
+        admin_sec_re = re.compile(
+            r"(?:SỞ\s+(?:GD|GIÁO\s+DỤC)|TRƯỜNG\s+(?:THPT|THCS|TIỂU\s+HỌC|ĐẠI\s+HỌC)|"
+            r"UBND\s+(?:TỈNH|THÀNH\s+PHỐ|HUYỆN|THỊ\s+XÃ|QUẬN)|PHÒNG\s+(?:GD|GIÁO\s+DỤC)|"
+            r"BỘ\s+GIÁO\s+DỤC|CỤM\s+CHUYÊN\s+MÔN|KỲ\s+THI|Mã\s+đề(?:\s+thi)?\s*:|"
+            r"-{3,}\s*HẾT\s*-{3,}|\*\*HẾT\*\*|-+\s*Hết\s*-+|"
+            r"Thí\s+sinh\s+không\s+được\s+sử\s+dụng|Giám\s+thị\s+coi\s+thi|"
+            r"Họ,?\s*tên\s+thí\s+sinh|Số\s+báo\s+danh|Thời\s+gian\s+làm\s+bài|"
+            r"Đề\s+(?:thi\s+)?có\s+\d+\s+trang|ĐỀ\s+CHÍNH\s+THỨC|"
+            r"thuvienhoclieu|toanmath|tailieutoan|vietjack|loigiaihay|Moon\.vn|https?://|www\.)",
             re.IGNORECASE,
-        ))
+        )
+        divider_or_page_re = re.compile(r"^\s*(?:[-–—=*_]{2,}|(?:Trang|Page)\s+\d+(?:\s*/\s*\d+)?|\d+)\s*$", re.IGNORECASE)
+        q_head_sec_re = re.compile(r"^\s*(?:Câu|Question)\s+\d+\b", re.IGNORECASE)
+        swallow_q_sec_re = re.compile(r"(?:^|\n)\s*(?:Câu|Question)\s+\d+[:.\s]|(?:^|\n)\s*\[?[A-D]\]?[.)]\s+", re.IGNORECASE)
+
+        admin_sec_matches = []
+        q_sec_matches = []
+        for sm in section_matches:
+            plain = re.sub(r"<[^>]+>", " ", sm.group(1))
+            plain_no_md = re.sub(r"^[\s#*_=]+", "", plain, flags=re.MULTILINE).strip()
+            if admin_sec_re.search(sm.group(1)) or divider_or_page_re.match(plain.strip()):
+                admin_sec_matches.append(sm)
+            if q_head_sec_re.match(plain_no_md) or (len(plain.strip()) > 400 and swallow_q_sec_re.search(plain_no_md)):
+                q_sec_matches.append(sm)
+
         if admin_sec_matches:
             count = len(admin_sec_matches)
             first_m = admin_sec_matches[0]
@@ -681,9 +702,9 @@ class DeterministicAuditor:
                     category="mislabelled_element",
                     severity=IssueSeverity.MAJOR,
                     message=(
-                        f"Found {count} instance(s) where administrative school/exam header is illegally wrapped in <section>. "
-                        f"Per Rule 18 (Section 4-Lock Protocol: Lock 2), header metadata MUST remain untagged plain text. "
-                        f"Remove <section> and </section> tags around this header."
+                        f"Found {count} instance(s) where administrative school/exam header, footer, page number, "
+                        f"or watermark is illegally wrapped in <section>. Per Rule 18 (Section 4-Lock Protocol: Lock 2), "
+                        f"metadata MUST remain untagged plain text. Remove <section> and </section> tags around this content."
                     ),
                     line_number=line_num,
                     context_snippet=snippet,
@@ -691,12 +712,6 @@ class DeterministicAuditor:
             )
             deductions += min(25.0, 15.0 * count)
 
-        # 3. Section on Question Header Check (Rule 18 / Lock 4)
-        q_sec_matches = list(re.finditer(
-            r"<section>\s*(?:#+\s*)?(?:Câu|Question|Bài\s+\d+|Part\s+\d+)\b",
-            xml_content,
-            re.IGNORECASE,
-        ))
         if q_sec_matches:
             count = len(q_sec_matches)
             first_m = q_sec_matches[0]
@@ -707,8 +722,8 @@ class DeterministicAuditor:
                     category="mislabelled_element",
                     severity=IssueSeverity.MAJOR,
                     message=(
-                        f"Found {count} instance(s) where question header is illegally tagged as <section>. "
-                        f"Per Rule 18 (Section 4-Lock Protocol: Lock 4), individual question headers must be tagged with "
+                        f"Found {count} instance(s) where question header or question content is illegally tagged as <section>. "
+                        f"Per Rule 18 (Section 4-Lock Protocol: Lock 1), individual question headers must be tagged with "
                         f"<question_label>, NEVER <section>."
                     ),
                     line_number=line_num,
