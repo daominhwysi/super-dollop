@@ -155,7 +155,9 @@ def build_bio_transition_matrix(
     id_to_tag: Dict[int, str],
     impossible_penalty: float = -10.0,
     soft_impossible_penalty: Optional[float] = None,
-    use_soft_constraints: bool = True
+    use_soft_constraints: bool = True,
+    allow_leading_i: bool = False,
+    enforce_domain_constraints: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Constructs a BIO constraint transition matrix M [K, K] and start penalty vector [K].
@@ -163,11 +165,12 @@ def build_bio_transition_matrix(
     but can be overridden if the emission confidence difference exceeds the threshold.
     
     Invariants enforced:
-    1. An I-{label} tag is penalized at sequence start (start_trans = penalty).
+    1. An I-{label} tag is penalized at sequence start (unless allow_leading_i=True for mid-document chunks).
     2. An I-{label} tag following O is penalized.
     3. An I-{label} tag following B-{other} or I-{other} for other != label is penalized.
     4. An I-{label} tag transitions from B-{label} or I-{label} have zero penalty.
-    5. All other transitions (O -> B-*, B-* -> O, B-* -> B-*, O -> O) are structurally legal.
+    5. When enforce_domain_constraints=True, impossible domain transitions
+       (question_label -> B-stimulus, stimulus -> B-stem / B-option_*) are penalized.
     """
     if soft_impossible_penalty is not None:
         penalty = soft_impossible_penalty if use_soft_constraints else -1e6
@@ -183,19 +186,29 @@ def build_bio_transition_matrix(
         is_i_i = tag_i.startswith("I-")
         label_i = tag_i[2:] if is_i_i or tag_i.startswith("B-") else ""
 
-        # Step 0 constraint: sequence cannot start with I-
-        if is_i_i:
+        # Step 0 constraint: sequence cannot start with I- (unless evaluating a sliced mid-document chunk)
+        if is_i_i and not allow_leading_i:
             start_trans[i] = penalty
 
         for j in range(K):
             tag_j = id_to_tag[j]
             is_j_i = tag_j.startswith("I-")
-            label_j = tag_j[2:] if is_j_i or tag_j.startswith("B-") else ""
+            is_j_b = tag_j.startswith("B-")
+            label_j = tag_j[2:] if is_j_i or is_j_b else ""
 
             # Check invalid transition into I-tag
             if is_j_i:
                 # I-X can ONLY follow B-X or I-X
                 if tag_i == "O" or label_i != label_j:
+                    M[i, j] = penalty
+            elif enforce_domain_constraints and is_j_b:
+                # Domain structural invariants verified across Gold Benchmark (0 exceptions):
+                # 1. Immediately after <question_label>, text is NEVER <stimulus> (must be <stem> or <option_label>)
+                if label_i == "question_label" and label_j == "stimulus":
+                    M[i, j] = penalty
+                # 2. A <stimulus> NEVER transitions directly into <stem>, <option_label>, or <option_text>
+                #    without passing through <question_label> or <section>
+                elif label_i == "stimulus" and label_j in ("stem", "option_label", "option_text"):
                     M[i, j] = penalty
 
     return M, start_trans
@@ -205,7 +218,8 @@ class ConstrainedViterbiDecoder:
     """
     High-throughput Constrained Viterbi Decoder with C acceleration & NumPy fallback.
     Supports soft impossible transition penalty (theta = -10.0) to prevent catastrophic
-    path abandons on OCR boundary noise while preserving BIO syntax.
+    path abandons on OCR boundary noise while preserving BIO syntax, as well as strict
+    hard BIO + domain structural constraints for full-document long-context inference.
     """
     def __init__(
         self,
@@ -213,7 +227,9 @@ class ConstrainedViterbiDecoder:
         impossible_penalty: Optional[float] = None,
         bio_labels: Optional[Union[List[str], Dict[int, str]]] = None,
         soft_impossible_penalty: float = -10.0,
-        use_soft_constraints: bool = True
+        use_soft_constraints: bool = True,
+        allow_leading_i: bool = False,
+        enforce_domain_constraints: bool = False,
     ):
         if id_to_tag is None and bio_labels is not None:
             if isinstance(bio_labels, dict):
@@ -234,10 +250,14 @@ class ConstrainedViterbiDecoder:
             eff_penalty = soft_impossible_penalty if use_soft_constraints else -1e6
 
         self.penalty = eff_penalty
+        self.allow_leading_i = allow_leading_i
+        self.enforce_domain_constraints = enforce_domain_constraints
         self.transition_matrix, self.start_trans = build_bio_transition_matrix(
             id_to_tag,
             impossible_penalty=eff_penalty,
-            use_soft_constraints=use_soft_constraints
+            use_soft_constraints=use_soft_constraints,
+            allow_leading_i=allow_leading_i,
+            enforce_domain_constraints=enforce_domain_constraints,
         )
         
         # Load compiled C library

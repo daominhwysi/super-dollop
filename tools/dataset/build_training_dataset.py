@@ -251,6 +251,7 @@ def tokenize_and_align_subwords(
 
     labels = []
     bio_tags = []
+    prev_span_id = None
     for tid, (s, e) in zip(input_ids, offsets):
         if s == e:
             labels.append(-100)
@@ -258,17 +259,20 @@ def tokenize_and_align_subwords(
             continue
 
         tag = "O"
+        matched_span_id = None
         for sp in sorted_spans:
             sp_s = sp.get("start", 0)
             sp_e = sp.get("end", 0)
             if max(s, sp_s) < min(e, sp_e):
                 label_name = sp.get("label", "").upper()
-                if s <= sp_s < e or s == sp_s:
+                matched_span_id = id(sp)
+                if s <= sp_s < e or s == sp_s or prev_span_id != matched_span_id:
                     tag = f"B-{label_name}"
                 else:
                     tag = f"I-{label_name}"
                 break
 
+        prev_span_id = matched_span_id
         norm_tag = normalize_bio_tag(tag)
         labels.append(tag_to_id.get(norm_tag, tag_to_id.get(tag, 0)))
         bio_tags.append(norm_tag)
@@ -1033,9 +1037,16 @@ def main():
     )
     parser.add_argument(
         "--dynamic-chunking",
+        dest="dynamic_chunking",
         action="store_true",
-        default=False,
-        help="Enable Single-Pass Mechanical Dynamic Window Chunking for training (e.g. 768, 1024, 1536, 2048 subwords)"
+        default=True,
+        help="Enable Single-Pass Mechanical Dynamic Window Chunking for training (e.g. 768, 1024, 1536, 2048 subwords; default: enabled)"
+    )
+    parser.add_argument(
+        "--no-dynamic-chunking",
+        dest="dynamic_chunking",
+        action="store_false",
+        help="Disable dynamic chunking and generate all static multi-scale sliding windows"
     )
     parser.add_argument(
         "--dynamic-scales",

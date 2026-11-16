@@ -175,6 +175,130 @@ def generate_hann_window(chunk_len: int) -> torch.Tensor:
     return torch.clamp(window, min=0.1, max=1.0)
 
 
+def compute_entropy_confidence_weights(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Converts raw window logits [L, K] into calibrated log-probabilities [L, K]
+    and computes per-token information certainty weights c_t^2 in [0.05, 1.0]
+    from normalized negative Shannon entropy: c_t = 1 - H(p_t) / log(K).
+    Eliminates the blind-center window paradox where high-entropy mid-passage windows
+    outvote low-entropy anchor windows that see structural boundaries.
+    """
+    if logits.numel() == 0 or logits.shape[-1] <= 1:
+        return logits.to(torch.float32), torch.ones(logits.shape[0], dtype=torch.float32)
+    log_probs = torch.log_softmax(logits.to(torch.float32), dim=-1)
+    probs = torch.exp(log_probs)
+    num_classes = max(2, int(logits.shape[-1]))
+    max_entropy = float(torch.log(torch.tensor(float(num_classes))).item())
+    entropy = -torch.sum(probs * log_probs, dim=-1)
+    certainty = torch.clamp(1.0 - (entropy / max_entropy), min=0.0, max=1.0)
+    conf_weights = torch.clamp(certainty * certainty, min=0.05, max=1.0)
+    return log_probs, conf_weights
+
+
+def _unify_contiguous_discourse_spans(
+    clean_text: str,
+    segments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Topological Pre-Question Discourse Unification (Zero-Regex):
+    Resolves multi-paragraph reading passages split across `\n\n` where blind early windows
+    predict `<stem>` and anchor windows seeing downstream questions predict `<stimulus>`.
+    """
+    if len(segments) < 2:
+        return segments
+
+    def _count_following_questions(start_idx: int) -> int:
+        q_count = 0
+        for idx in range(start_idx, len(segments)):
+            lbl = segments[idx]["label"]
+            if lbl == "question_label":
+                q_count += 1
+            elif lbl == "section":
+                break
+            elif lbl == "stimulus" and q_count > 0:
+                break
+        return q_count
+
+    unified: List[Dict[str, Any]] = []
+    n = len(segments)
+    i = 0
+
+    while i < n:
+        seg = segments[i]
+        if seg["label"] not in ("stimulus", "stem"):
+            unified.append(seg)
+            i += 1
+            continue
+
+        # Collect maximal contiguous run of {stimulus, stem} separated only by whitespace
+        run_end = i
+        while (
+            run_end + 1 < n
+            and segments[run_end + 1]["label"] in ("stimulus", "stem")
+            and not clean_text[segments[run_end]["end"]:segments[run_end + 1]["start"]].strip()
+        ):
+            run_end += 1
+
+        if run_end == i:
+            unified.append(seg)
+            i += 1
+            continue
+
+        prev_seg = unified[-1] if unified else None
+        next_seg = segments[run_end + 1] if run_end + 1 < n else None
+        preceded_by_q_label = (
+            prev_seg is not None
+            and prev_seg["label"] == "question_label"
+            and not clean_text[prev_seg["end"]:seg["start"]].strip()
+        )
+
+        if preceded_by_q_label:
+            # Case A: Immediately after <question_label>
+            if next_seg is not None and next_seg["label"] == "option_label":
+                # Entire block sits between <question_label> and <option_label> -> single <stem>
+                s_pos = segments[i]["start"]
+                e_pos = segments[run_end]["end"]
+                unified.append({
+                    "label": "stem",
+                    "start": s_pos,
+                    "end": e_pos,
+                    "text": clean_text[s_pos:e_pos],
+                })
+                i = run_end + 1
+                continue
+            elif segments[i]["label"] == "stem" and any(
+                segments[k]["label"] == "stimulus" for k in range(i + 1, run_end + 1)
+            ):
+                # Optionless question (<question_label> + <stem>) followed by a new <stimulus>
+                unified.append(segments[i])
+                i += 1
+                continue
+
+        # Case B: Unanchored pre-question discourse block (or homogeneous run)
+        run_labels = [segments[k]["label"] for k in range(i, run_end + 1)]
+        has_stimulus = "stimulus" in run_labels
+        following_qs = _count_following_questions(run_end + 1)
+
+        if has_stimulus and following_qs != 1:
+            chosen_label = "stimulus"
+        elif following_qs >= 2 and not preceded_by_q_label:
+            chosen_label = "stimulus"
+        else:
+            chosen_label = "stem" if not has_stimulus else "stimulus"
+
+        s_pos = segments[i]["start"]
+        e_pos = segments[run_end]["end"]
+        unified.append({
+            "label": chosen_label,
+            "start": s_pos,
+            "end": e_pos,
+            "text": clean_text[s_pos:e_pos],
+        })
+        i = run_end + 1
+
+    return unified
+
+
 def _tokenizer_supports_typed_latex(tokenizer: Any) -> bool:
     """Checks whether the tokenizer has dedicated typed [MATH_*] special tokens."""
     try:
@@ -352,6 +476,8 @@ def predict_text(
                 logits = b_logits[chunk_offset_in_batch]
                 chunk_len = len(chunk_offsets)
                 hann_weights = generate_hann_window(chunk_len)
+                log_probs, conf_weights = compute_entropy_confidence_weights(logits[:chunk_len])
+                combined_weights = hann_weights * conf_weights
 
                 for tok_idx, (start, end) in enumerate(chunk_offsets):
                     if start == end:
@@ -361,15 +487,15 @@ def predict_text(
                     if orig_start >= orig_end:
                         continue
 
-                    # Hann window cosine taper: smooth transition at chunk boundaries
-                    weight = float(hann_weights[tok_idx].item())
+                    # Hann positional taper modulated by information certainty (1 - H(p)/log K)^2
+                    weight = float(combined_weights[tok_idx].item())
 
                     key = (orig_start, orig_end)
                     if key not in span_logits:
                         span_logits[key] = []
-                    span_logits[key].append((logits[tok_idx], weight))
+                    span_logits[key].append((log_probs[tok_idx], weight))
 
-    # Weighted average logits for overlapping subwords
+    # Weighted average log-probabilities for overlapping subwords
     sorted_spans = sorted(span_logits.keys(), key=lambda x: x[0])
     if not sorted_spans:
         return {
@@ -391,7 +517,11 @@ def predict_text(
 
     if use_viterbi:
         from model.inference.viterbi import ConstrainedViterbiDecoder
-        decoder = ConstrainedViterbiDecoder(id_to_tag)
+        decoder = ConstrainedViterbiDecoder(
+            id_to_tag,
+            use_soft_constraints=False,
+            enforce_domain_constraints=True,
+        )
         pred_ids = decoder.decode(torch.stack(stacked_logits))
     else:
         pred_ids = [int(torch.argmax(l).item()) for l in stacked_logits]
@@ -472,6 +602,9 @@ def predict_text(
 
     if current_seg:
         segments.append(current_seg)
+
+    # Unify multi-paragraph contiguous discourse blocks across sliding-window seams
+    segments = _unify_contiguous_discourse_spans(clean_text, segments)
 
     if ignore_section:
         segments = [s for s in segments if s.get("label") != "section"]

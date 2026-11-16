@@ -685,7 +685,7 @@ def evaluate_split(
     Average loss plus decoded tag sequences for `loader`. Predictions are decoded with the same
     constrained Viterbi decoder used at inference, so the metrics describe the deployed system.
     """
-    decoder = ConstrainedViterbiDecoder(id_to_tag=id_to_tag)
+    decoder = ConstrainedViterbiDecoder(id_to_tag=id_to_tag, allow_leading_i=True)
     model.eval()
     total_loss = 0.0
     all_preds: List[List[str]] = []
