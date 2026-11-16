@@ -243,11 +243,27 @@ def tokenize_and_align_subwords(
         "question_label": 4,
         "option_label": 4,
     }
-    sorted_spans = sorted(
-        spans,
-        key=lambda s: (priority.get(s.get("label", "").lower(), 1), s.get("start", 0)),
-        reverse=True
-    )
+    import bisect
+
+    valid_spans = [
+        (
+            int(s.get("start", 0)),
+            int(s.get("end", 0)),
+            priority.get(s.get("label", "").lower(), 1),
+            s.get("label", "").upper(),
+            id(s),
+        )
+        for s in spans
+        if int(s.get("end", 0)) > int(s.get("start", 0))
+    ]
+    valid_spans.sort(key=lambda x: (x[0], x[1]))
+    sp_starts = [x[0] for x in valid_spans]
+    max_prefix_end = []
+    cur_max = 0
+    for x in valid_spans:
+        if x[1] > cur_max:
+            cur_max = x[1]
+        max_prefix_end.append(cur_max)
 
     labels = []
     bio_tags = []
@@ -258,19 +274,33 @@ def tokenize_and_align_subwords(
             bio_tags.append("O")
             continue
 
+        # Strip leading/trailing whitespace inside subword token so BPE leading-space
+        # tokens (e.g. ' Cho' after 'Bài 1: ') match their content span rather than trailing space
+        sub = raw_text[s:e]
+        ls = len(sub) - len(sub.lstrip())
+        rs = len(sub) - len(sub.rstrip())
+        ns, ne = (s + ls, e - rs) if (s + ls < e - rs) else (s, e)
+
         tag = "O"
         matched_span_id = None
-        for sp in sorted_spans:
-            sp_s = sp.get("start", 0)
-            sp_e = sp.get("end", 0)
-            if max(s, sp_s) < min(e, sp_e):
-                label_name = sp.get("label", "").upper()
-                matched_span_id = id(sp)
-                if s <= sp_s < e or s == sp_s or prev_span_id != matched_span_id:
-                    tag = f"B-{label_name}"
-                else:
-                    tag = f"I-{label_name}"
-                break
+        best_match = None  # (prio, sp_s, sp_e, label_name, span_id)
+
+        hi = bisect.bisect_right(sp_starts, ne - 1) - 1
+        idx = hi
+        while idx >= 0 and max_prefix_end[idx] > ns:
+            sp_s, sp_e, prio, label_name, span_id = valid_spans[idx]
+            if sp_s < ne and sp_e > ns:
+                cand_key = (prio, sp_s)
+                if best_match is None or cand_key > (best_match[0], best_match[1]):
+                    best_match = (prio, sp_s, sp_e, label_name, span_id)
+            idx -= 1
+
+        if best_match is not None:
+            _, sp_s, sp_e, label_name, matched_span_id = best_match
+            if ns <= sp_s < ne or s <= sp_s < e or prev_span_id != matched_span_id:
+                tag = f"B-{label_name}"
+            else:
+                tag = f"I-{label_name}"
 
         prev_span_id = matched_span_id
         norm_tag = normalize_bio_tag(tag)
