@@ -29,6 +29,7 @@ from sequence_labelling.config import (
     REVIEWER_MODEL,
     REVIEWER_PROVIDER,
     REVIEWER_THINKING,
+    REVIEWER_CONCURRENCY,
     PARSER_MODEL,
     PARSER_PROVIDER,
     OCR_MODEL,
@@ -370,6 +371,8 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
             e_args.extend(["--gold-manifest", str(args.gold_manifest)])
         if args.checkpoint:
             e_args.extend(["--checkpoint", str(args.checkpoint)])
+        if getattr(args, "limit", None):
+            e_args.extend(["--limit", str(args.limit)])
         old_argv = sys.argv
         try:
             sys.argv = ["evaluate_model.py"] + e_args
@@ -649,7 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--filter-decision", type=str, default=None, help="Only re-evaluate docs matching decisions (e.g. NEEDS_REVISION)")
     p_audit.add_argument("--pattern", type=str, default=None, help="Glob/substring filter on document directories")
     p_audit.add_argument("--manifest", type=str, default=None, help="Manifest file of document folders or chunk XMLs")
-    p_audit.add_argument("--concurrency", type=int, default=4)
+    p_audit.add_argument("--concurrency", type=int, default=REVIEWER_CONCURRENCY)
     p_audit.add_argument("--no-rollup", action="store_true", default=False, help="Do not roll chunk audits up into document-level reports")
     _add_tmux_args(p_audit)
 
@@ -712,9 +715,15 @@ def build_parser() -> argparse.ArgumentParser:
     # evaluate
     p_eval = subparsers.add_parser("evaluate", help="Evaluation and benchmarking suites")
     p_eval.add_argument("eval_target", choices=["gold", "det-f1", "corpus-500"], help="Evaluation target")
-    p_eval.add_argument("--gold-manifest", type=Path, default=WORKSPACE_DIR / "data" / "gold_benchmark_63_documents.json")
+    default_manifest = (
+        WORKSPACE_DIR / "data" / "benchmark_gold_set.json"
+        if (WORKSPACE_DIR / "data" / "benchmark_gold_set.json").exists()
+        else WORKSPACE_DIR / "data" / "gold_benchmark_63_documents.json"
+    )
+    p_eval.add_argument("--gold-manifest", type=Path, default=default_manifest)
     p_eval.add_argument("--checkpoint", type=str, default=None)
     p_eval.add_argument("--dataset-dir", type=Path, default=WORKSPACE_DIR / "data" / "sequence_labelling_annotated")
+    p_eval.add_argument("--limit", type=int, default=None, help="Limit number of documents to evaluate")
     _add_tmux_args(p_eval)
 
     # tmux

@@ -1,8 +1,6 @@
 import pytest
 from sequence_labelling.parser.long_parser.anchored_xml_llm_parser import (
     STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE,
-    find_anchor_position,
-    recover_text_from_anchors,
     parse_xml_with_anchors,
     AnchoredXMLLLMExamParser,
 )
@@ -30,15 +28,17 @@ D. Automotive sales
 def test_system_prompt_defines_xml_and_tags():
     assert "<question_label>" in STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE
     assert "<section>" in STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE
-    assert "<stimulus id=" in STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE
+    assert "<stimulus>" in STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE
     assert "<stem>" in STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE
     assert "<option_label>" in STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE
 
 
-def test_anchor_resolution_in_xml():
+def test_paired_stimulus_resolution_in_xml():
     tagged_xml = """<section>PHẦN I. Câu trắc nghiệm nhiều lựa chọn. Thí sinh trả lời từ câu 1 đến câu 2.</section>
 
-<stimulus id="stim_1" start_anchor="Read the following passage" end_anchor="zero-emission future." />
+<stimulus>Read the following passage and mark the letter A, B, C, or D on your answer sheet to indicate the correct answer to each of the questions.
+Renewable energy has become a central focus of global climate policy over the past decade.
+Solar and wind power are leading the transition toward a zero-emission future.</stimulus>
 
 <question_label>Câu 1.</question_label> <stem>What is the main topic of the passage?</stem>
 - <option_label>A.</option_label> <option_text>The history of fossil fuels</option_text>
@@ -58,30 +58,16 @@ def test_anchor_resolution_in_xml():
     assert questions[0]["section"] == "PHẦN I. Câu trắc nghiệm nhiều lựa chọn. Thí sinh trả lời từ câu 1 đến câu 2."
 
 
-def test_anchored_section_tag_is_not_allowed():
-    """Verify that anchored stimulus is allowed, but anchored section is ignored/not created as a span."""
-    tagged_xml = """<section start_anchor="PHẦN I. Câu trắc nghiệm" end_anchor="câu 1 đến câu 2." />
-<stimulus id="stim_1" start_anchor="Read the following passage" end_anchor="zero-emission future." />
-<question_label>Câu 1.</question_label> <stem>What is the main topic of the passage?</stem>
-- <option_label>A.</option_label> <option_text>The history of fossil fuels</option_text>
-"""
-    spans, stimuli, questions = parse_xml_with_anchors(SAMPLE_OCR_TEXT, tagged_xml)
-    # Stimulus anchor must be resolved
-    assert "stim_1" in stimuli
-    assert "Renewable energy has become a central focus" in stimuli["stim_1"]
-    # Section anchor must NOT be resolved into spans (anchored stimulus only)
-    section_spans = [s for s in spans if s["label"] == "section"]
-    assert len(section_spans) == 0
-
-
-def test_xml_mock_completion():
+def test_paired_section_tag_and_mock_completion():
     def mock_completion(messages, model=None, provider=None, max_tokens=None, **kwargs):
         system_content = messages[0]["content"]
         assert "<question_label>" in system_content
 
         if len(messages) == 2:
             return """<section>PHẦN I. Câu trắc nghiệm nhiều lựa chọn. Thí sinh trả lời từ câu 1 đến câu 2.</section>
-<stimulus id="stim_1" start_anchor="Read the following passage" end_anchor="zero-emission future." />
+<stimulus>Read the following passage and mark the letter A, B, C, or D on your answer sheet to indicate the correct answer to each of the questions.
+Renewable energy has become a central focus of global climate policy over the past decade.
+Solar and wind power are leading the transition toward a zero-emission future.</stimulus>
 <question_label>Câu 1.</question_label> <stem>What is the main topic of the passage?</stem>
 - <option_label>A.</option_label> <option_text>The history of fossil fuels</option_text>
 - <option_label>B.</option_label> <option_text>Solar and wind power leading energy transition</option_text>

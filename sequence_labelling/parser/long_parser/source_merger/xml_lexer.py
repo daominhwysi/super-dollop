@@ -98,7 +98,11 @@ def lex_annotations(parsed_xml: str) -> Tuple[str, List[LocalSpan], Dict[str, An
     n = len(cleaned_xml)
     p_offset = 0
 
-    tag_pattern = re.compile(r"<(/?)([a-zA-Z_][a-zA-Z0-9_\-\n\r]*)(\s*[^>]*)>")
+    # Match genuine XML/HTML tags (quoted attributes may contain '<') without letting
+    # bare math inequalities (e.g. `$a<x<b$ ... </explanation>`) swallow closing tags.
+    tag_pattern = re.compile(
+        r"""<(/?)([a-zA-Z_][a-zA-Z0-9_\-\n\r]*)((?:\s+(?:[^<>"']|"[^"]*"|'[^']*')*|\s*/?\s*))>"""
+    )
 
     last_idx = 0
     for match in tag_pattern.finditer(cleaned_xml):
@@ -117,7 +121,6 @@ def lex_annotations(parsed_xml: str) -> Tuple[str, List[LocalSpan], Dict[str, An
         is_self_closing = (
             raw_tag_str.endswith("/>")
             or attrs.strip().endswith("/")
-            or (tag_name == "stimulus" and "start_anchor=" in raw_tag_str)
             or (tag_name == "figure")
         )
 

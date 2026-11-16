@@ -14,6 +14,7 @@ from sequence_labelling.config import (
     REVIEWER_MODEL,
     REVIEWER_PROVIDER,
     REVIEWER_THINKING,
+    REVIEWER_CONCURRENCY,
     REVIEWER_MIN_SCORE,
     PARSER_MODEL,
     PARSER_PROVIDER,
@@ -92,8 +93,32 @@ ALLOWED_PAIRED_TAGS = {
     "question",
 } | ALLOWED_FORMATTING_TAGS
 
-ALLOWED_SELF_CLOSING_TAGS = {"stimulus", "figure"} | HTML_VOID_TAGS
+ALLOWED_SELF_CLOSING_TAGS = {"figure"} | HTML_VOID_TAGS
 PROHIBITED_TAGS = {"pages", "page", "page_metadata", "think"}
+
+_ALL_RECOGNIZED_TAGS = SYSTEM_TAGS | ALLOWED_FORMATTING_TAGS | HTML_VOID_TAGS | PROHIBITED_TAGS
+_TAG_ALT = "|".join(sorted(_ALL_RECOGNIZED_TAGS, key=len, reverse=True))
+_ATTR_BODY_PATTERN = r'(?:[^"\'>]|"[^"]*"|\'[^\']*\')*'
+_RECOGNIZED_TAG_STRIP_RE = re.compile(
+    rf"<!--.*?-->|<(/)?({_TAG_ALT})\b(?:\s+{_ATTR_BODY_PATTERN})?(/)?>",
+    re.DOTALL | re.IGNORECASE,
+)
+_RECOGNIZED_TAG_LEX_RE = re.compile(
+    rf"<(/)?({_TAG_ALT})\b(?:\s+({_ATTR_BODY_PATTERN}))?(/)?>",
+    re.IGNORECASE,
+)
+_DIFF_CONFLICT_LINE_RE = re.compile(
+    r"^\s*(?:<{5,9}(?:\s*SEARCH\b.*)?|>{5,9}(?:\s*REPLACE\b.*)?)\s*$",
+    re.MULTILINE,
+)
+_DIFF_SEP_LINE_RE = re.compile(r"^\s*={5,9}\s*$", re.MULTILINE)
+NON_DISMISSIBLE_CRITICAL_CATEGORIES = {
+    "xml_syntax",
+    "conflict_markers",
+    "prohibited_tags",
+    "stimulus_nesting",
+    "verbatim_fidelity",
+}
 
 
 class ReviewDecision(str, Enum):
@@ -190,13 +215,7 @@ class DeterministicAuditor:
         Strips valid XML/HTML tags and comments to reconstruct pure text content,
         preserving mathematical inequality comparisons (<, >) inside math text.
         """
-        clean = re.sub(
-            r"<!--.*?-->|</?[a-zA-Z][a-zA-Z0-9_\-:]*(?:\s+[^>]*)?/?>",
-            "",
-            xml_text,
-            flags=re.DOTALL,
-        )
-        return clean
+        return _RECOGNIZED_TAG_STRIP_RE.sub("", xml_text)
 
     @staticmethod
     def check_xml_syntax(xml_content: str) -> Tuple[List[AuditIssue], float]:
@@ -234,7 +253,7 @@ class DeterministicAuditor:
         # Lex tags with line numbers (stripping designated terminal sentinels <|END|>)
         clean_xml = re.sub(r"<\s*\|\s*END\s*\|\s*>", "", xml_content)
         clean_xml = re.sub(r"<\s*\|\s*endoftext\s*\|\s*>", "", clean_xml)
-        tag_pattern = re.compile(r"<(/)?([a-zA-Z_][a-zA-Z0-9_\-]*)(?:\s+([^>]*))?(/)?>")
+        tag_pattern = _RECOGNIZED_TAG_LEX_RE
         lines = clean_xml.splitlines()
 
         tag_stack: List[Tuple[str, int, str]] = []  # (tag_name, line_num, full_tag)
@@ -320,6 +339,37 @@ class DeterministicAuditor:
         return issues, score
 
     @staticmethod
+    def check_conflict_markers(xml_content: str) -> Tuple[List[AuditIssue], float]:
+        """
+        Detects leaked Search/Replace or merge conflict markers (<<<<<<<, =======, >>>>>>>).
+        """
+        issues: List[AuditIssue] = []
+        if not xml_content:
+            return issues, 100.0
+
+        matches = list(_DIFF_CONFLICT_LINE_RE.finditer(xml_content))
+        sep_matches = list(_DIFF_SEP_LINE_RE.finditer(xml_content))
+        # Flag bare ======= lines as conflict markers when paired with diff headers/blocks
+        all_markers = matches + (sep_matches if (matches or "SEARCH" in xml_content or "REPLACE" in xml_content) else [])
+        if not all_markers:
+            return issues, 100.0
+
+        all_markers.sort(key=lambda m: m.start())
+        first_m = all_markers[0]
+        line_num = xml_content.count("\n", 0, first_m.start()) + 1
+        snippet = first_m.group(0).strip()[:100]
+        issues.append(
+            AuditIssue(
+                category="conflict_markers",
+                severity=IssueSeverity.CRITICAL,
+                message=f"Found {len(all_markers)} leaked Search/Replace or merge conflict marker(s) in XML (e.g. '{snippet}').",
+                line_number=line_num,
+                context_snippet=snippet,
+            )
+        )
+        return issues, 0.0
+
+    @staticmethod
     def check_prohibited_tags(xml_content: str) -> Tuple[List[AuditIssue], float]:
         """
         Audits presence of prohibited tags like <pages>, <page>, <page_metadata>, <think>.
@@ -361,8 +411,12 @@ class DeterministicAuditor:
         if not xml_content:
             return issues, 100.0
 
-        # 1. Check paired <stimulus ...>...</stimulus> (ensuring opening tag is not self-closing)
-        for m in re.finditer(r"<stimulus\b(?![^>]*/>)([^>]*)>(.*?)</stimulus>", xml_content, re.DOTALL | re.IGNORECASE):
+        # 1. Check paired <stimulus ...>...</stimulus> (quote-aware, ensuring opening tag is not self-closing)
+        paired_stim_re = re.compile(
+            rf"<stimulus\b({_ATTR_BODY_PATTERN})(?<!/)>(.*?)</stimulus>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        for m in paired_stim_re.finditer(xml_content):
             inner_content = m.group(2)
             start_pos = m.start()
             line_num = xml_content.count("\n", 0, start_pos) + 1
@@ -389,7 +443,7 @@ class DeterministicAuditor:
                 deductions += 100.0
 
         # 2. Check for unclosed paired <stimulus ...> tags that precede system tags without closing
-        stim_open_pattern = re.compile(r"<stimulus\b(?![^>]*/>)([^>]*)>", re.IGNORECASE)
+        stim_open_pattern = re.compile(rf"<stimulus\b({_ATTR_BODY_PATTERN})(?<!/)>", re.IGNORECASE)
         for m in stim_open_pattern.finditer(xml_content):
             start_pos = m.end()
             # check if followed by closing </stimulus> before EOF
@@ -440,9 +494,9 @@ class DeterministicAuditor:
         stems = re.findall(r"<stem>(.*?)</stem>", xml_content, re.DOTALL)
         opt_labels = re.findall(r"<option_label>(.*?)</option_label>", xml_content, re.DOTALL)
         opt_texts = re.findall(r"<option_text>(.*?)</option_text>", xml_content, re.DOTALL)
-        stimuli = re.findall(r"<stimulus\b([^>]*)/?>", xml_content, re.DOTALL)
+        stimuli = re.findall(rf"<stimulus\b({_ATTR_BODY_PATTERN})/?>", xml_content, re.DOTALL)
         sections = re.findall(r"<section>(.*?)</section>", xml_content, re.DOTALL)
-        figures = re.findall(r"<figure\b([^>]*)/?>", xml_content, re.DOTALL)
+        figures = re.findall(rf"<figure\b({_ATTR_BODY_PATTERN})/?>", xml_content, re.DOTALL)
 
         total_questions = len(q_labels)
 
@@ -862,74 +916,123 @@ class DeterministicAuditor:
         return issues, coverage_score, metrics
 
     @staticmethod
-    def check_stimulus_anchors(
-        xml_content: str, pure_text: str, raw_ocr_text: Optional[str] = None
+    def check_paired_stimulus_integrity(
+        xml_content: str, pure_text: str = "", raw_ocr_text: Optional[str] = None
     ) -> Tuple[List[AuditIssue], float]:
         """
-        Audits stimulus anchor tags (start_anchor, end_anchor) and multi-question rule.
+        Audits paired <stimulus>...</stimulus> integrity:
+        1. Flags leftover self-closing <stimulus ... /> anchor tags as MAJOR.
+        2. Flags empty, metadata-bearing, or watermark/junk-only stimuli as MAJOR.
+        3. Flags single-question stimuli when bounded by a following <section> or <stimulus>.
         """
         issues: List[AuditIssue] = []
         deductions = 0.0
 
-        stimulus_tags = re.findall(r"<stimulus\b([^>]*)/?>", xml_content)
-        if not stimulus_tags:
-            return issues, 100.0
+        stim_tag_re = re.compile(
+            rf"<stimulus\b((?:{_ATTR_BODY_PATTERN})?)>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        stim_close_re = re.compile(r"</stimulus\s*>", re.IGNORECASE)
+        boundary_re = re.compile(r"<(?:section|stimulus)\b", re.IGNORECASE)
+        q_label_re = re.compile(r"<question_label\b", re.IGNORECASE)
 
-        for stim_idx, stim_attr in enumerate(stimulus_tags):
-            start_m = re.search(r'start_anchor="([^"]*)"', stim_attr)
-            end_m = re.search(r'end_anchor="([^"]*)"', stim_attr)
-
-            if not start_m or not end_m:
+        # Track paired spans and self-closing tags
+        paired_spans: List[Tuple[int, int, str]] = []
+        pos = 0
+        for m in stim_tag_re.finditer(xml_content):
+            if m.start() < pos:
+                continue
+            attrs = m.group(1) or ""
+            if attrs.rstrip().endswith("/"):
                 issues.append(
                     AuditIssue(
                         category="stimulus",
                         severity=IssueSeverity.MAJOR,
-                        message=f"Stimulus #{stim_idx+1} missing required 'start_anchor' or 'end_anchor' attribute.",
-                        context_snippet=f"<stimulus {stim_attr} />",
+                        message="Deprecated self-closing <stimulus ... /> anchor tag found; convert to paired <stimulus>...</stimulus>.",
+                        context_snippet=m.group(0)[:120],
+                    )
+                )
+                deductions += 15.0
+                pos = m.end()
+                continue
+
+            close_m = stim_close_re.search(xml_content, m.end())
+            if not close_m:
+                pos = m.end()
+                continue
+            inner = xml_content[m.end() : close_m.start()]
+            paired_spans.append((m.start(), close_m.end(), inner))
+            pos = close_m.end()
+
+        if not paired_spans:
+            score = max(0.0, 100.0 - deductions)
+            return issues, score
+
+        for stim_idx, (s_start, s_end, inner) in enumerate(paired_spans):
+            # 1. Check prohibited page metadata inside stimulus
+            if re.search(
+                r"<page_metadata\b|<pages?\b|\{\s*\"(?:p|page_number|doc_id)\"\s*:",
+                inner,
+                re.IGNORECASE,
+            ):
+                issues.append(
+                    AuditIssue(
+                        category="stimulus",
+                        severity=IssueSeverity.MAJOR,
+                        message=f"Stimulus #{stim_idx + 1} contains page metadata instead of shared passage content.",
+                        context_snippet=inner.strip()[:120],
                     )
                 )
                 deductions += 15.0
                 continue
 
-            start_anchor = start_m.group(1).strip()
-            end_anchor = end_m.group(1).strip()
-
-            if len(start_anchor) < 3 or len(end_anchor) < 3:
+            # 2. Check empty or watermark/junk-only stimulus
+            has_media = bool(re.search(r"<(?:figure|table)\b", inner, re.IGNORECASE))
+            clean_inner = " ".join(_RECOGNIZED_TAG_STRIP_RE.sub(" ", inner).split())
+            if not clean_inner and not has_media:
                 issues.append(
                     AuditIssue(
                         category="stimulus",
-                        severity=IssueSeverity.MINOR,
-                        message=f"Stimulus #{stim_idx+1} has very short anchors ('{start_anchor}', '{end_anchor}'). Recommended 3-10 words.",
+                        severity=IssueSeverity.MAJOR,
+                        message=f"Stimulus #{stim_idx + 1} is empty.",
                     )
                 )
-                deductions += 5.0
+                deductions += 15.0
+                continue
 
-            # If raw OCR text is provided, verify anchors exist in source document
-            if raw_ocr_text:
-                clean_raw = DeterministicAuditor.clean_raw_ocr_text(raw_ocr_text)
-                norm_raw = " ".join(clean_raw.split())
-                norm_start = " ".join(start_anchor.split())
-                norm_end = " ".join(end_anchor.split())
+            junk_stripped = re.sub(
+                r"(?:https?://\S+|www\.\S+|thuvienhoclieu\.com|trang\s+\d+(?:/\d+)?)",
+                "",
+                clean_inner,
+                flags=re.IGNORECASE,
+            ).strip()
+            if (len(junk_stripped) < 15 and clean_inner) and not has_media:
+                issues.append(
+                    AuditIssue(
+                        category="stimulus",
+                        severity=IssueSeverity.MAJOR,
+                        message=f"Stimulus #{stim_idx + 1} contains only watermark/boilerplate or trivially short junk ('{clean_inner[:60]}').",
+                        context_snippet=clean_inner[:120],
+                    )
+                )
+                deductions += 15.0
+                continue
 
-                if norm_start and norm_start not in norm_raw:
+            # 3. Bounded multi-question rule when a terminating <section> or <stimulus> follows
+            next_bound = boundary_re.search(xml_content, s_end)
+            if next_bound:
+                scope_text = xml_content[s_end : next_bound.start()]
+                q_count = len(q_label_re.findall(scope_text))
+                if q_count == 1:
                     issues.append(
                         AuditIssue(
-                            category="stimulus",
+                            category="single_question_stimulus",
                             severity=IssueSeverity.MAJOR,
-                            message=f"Stimulus #{stim_idx+1} start_anchor '{start_anchor}' not found in raw source document text.",
+                            message=f"Stimulus #{stim_idx + 1} serves only 1 question before the next section/stimulus boundary.",
+                            context_snippet=clean_inner[:120],
                         )
                     )
-                    deductions += 15.0
-
-                if norm_end and norm_end not in norm_raw:
-                    issues.append(
-                        AuditIssue(
-                            category="stimulus",
-                            severity=IssueSeverity.MAJOR,
-                            message=f"Stimulus #{stim_idx+1} end_anchor '{end_anchor}' not found in raw source document text.",
-                        )
-                    )
-                    deductions += 15.0
+                    deductions += 10.0
 
         score = max(0.0, 100.0 - deductions)
         return issues, score
@@ -1152,6 +1255,12 @@ PARSER_ERROR_PENALTIES: Dict[str, Dict[IssueSeverity, float]] = {
         IssueSeverity.MINOR: 5.0,
         IssueSeverity.INFO: 0.0,
     },
+    "stimulus_invalid": {
+        IssueSeverity.CRITICAL: 30.0,
+        IssueSeverity.MAJOR: 15.0,
+        IssueSeverity.MINOR: 5.0,
+        IssueSeverity.INFO: 0.0,
+    },
     # Broken, unclosed, or mismatched SYSTEM tags
     "broken_system_tag": {
         IssueSeverity.CRITICAL: 40.0,
@@ -1244,6 +1353,12 @@ PARSER_ERROR_PENALTIES: Dict[str, Dict[IssueSeverity, float]] = {
         IssueSeverity.CRITICAL: 40.0,
         IssueSeverity.MAJOR: 15.0,
         IssueSeverity.MINOR: 5.0,
+        IssueSeverity.INFO: 0.0,
+    },
+    "conflict_markers": {
+        IssueSeverity.CRITICAL: 100.0,
+        IssueSeverity.MAJOR: 50.0,
+        IssueSeverity.MINOR: 20.0,
         IssueSeverity.INFO: 0.0,
     },
     "llm_semantic": {
@@ -1463,7 +1578,7 @@ def compute_llm_penalties(
             discard_reasons.append(f"[{cat.upper()}] {iss.message}")
 
         # Map penalty to rubric dimensions
-        if cat in ["broken_system_tag", "xml_syntax", "truncated_output"]:
+        if cat in ["broken_system_tag", "xml_syntax", "truncated_output", "conflict_markers"]:
             rubric_deductions["xml_well_formedness"] += penalty
         elif cat in ["prohibited_tags", "schema_conformance", "mislabelled_element"]:
             rubric_deductions["schema_conformance"] += penalty
@@ -1485,6 +1600,7 @@ def compute_llm_penalties(
             "stimulus_nesting",
             "single_question_stimulus",
             "stimulus_anchor_invalid",
+            "stimulus_invalid",
             "stimulus",
         ]:
             rubric_deductions["stimulus_accuracy"] += penalty
@@ -1573,7 +1689,9 @@ Môn: KHOA HỌC TỰ NHIÊN - VẬT LÍ
 
 <section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn. Thí sinh trả lời từ câu 1 đến câu 2.</section>
 
-<stimulus id="stim_1" start_anchor="Dựa vào thông tin sau đây" end_anchor="NXB Giáo dục Việt Nam)" />
+<stimulus>Dựa vào thông tin sau đây để trả lời các câu 1 và 2:
+Sóng điện từ là điện từ trường lan truyền trong không gian. Trong quá trình lan truyền sóng điện từ, tại một điểm bất kỳ trong không gian, vectơ cường độ điện trường $\\vec{E}$ và vectơ cảm ứng từ $\\vec{B}$ luôn dao động cùng pha, vuông phương với nhau và vuông góc với phương truyền sóng. Tốc độ lan truyền của sóng điện từ trong chân không bằng $c = 3 \\cdot 10^8\\text{ m/s}$.
+(Trích Sách giáo khoa Vật lí 12 - Bộ Kết nối tri thức với cuộc sống, NXB Giáo dục Việt Nam)</stimulus>
 
 <question_label>Câu 1:</question_label> <stem>Sóng điện từ</stem>
 - <option_label>A.</option_label> <option_text>là sóng dọc lan truyền trong môi trường vật chất.</option_text>
@@ -1606,11 +1724,10 @@ Câu 2: Bước sóng $\\lambda = c / f = 3 \\cdot 10^8 / 10^8 = 3\\text{ m}$. C
 ## 🏷️ System Tags Dictionary & Auditing Scope:
 ### SYSTEM XML TAGS (The ONLY tags you should audit for syntax and closure):
 1. `<section>...</section>`: Major section/part titles, exam directions, headers. Must be full paired tags containing verbatim text. Never use anchor tags for sections.
-2. `<stimulus id="stim_N" start_anchor="..." end_anchor="..." />`: Compact self-closing anchor tag for shared reading passages, tables, or datasets serving 2 OR MORE QUESTIONS.
-   - Must be self-closing (`/>`).
-   - `start_anchor`: First 3-10 verbatim words.
-   - `end_anchor`: Last 3-10 verbatim words. MUST include the citation/source attribution at the end if present!
-   - FATAL CONSTRAINT: Must NEVER wrap or enclose question elements (`<stem>`, `<question_label>`, `<option_label>`, `<option_text>`, `<explanation>`).
+2. `<stimulus>...</stimulus>`: Full paired tag wrapping shared reading passages, tables, or datasets serving 2 OR MORE QUESTIONS verbatim.
+   - Must be paired (`<stimulus>...</stimulus>`), NEVER self-closing anchor tags.
+   - MUST include the citation/source attribution at the end if present!
+   - FATAL CONSTRAINT: Must NEVER wrap or enclose question elements (`<stem>`, `<question_label>`, `<option_label>`, `<option_text>`, `<explanation>`), page metadata, or website watermarks.
    - MULTI-QUESTION CONSTRAINT: A stimulus ONLY applies if shared across 2+ questions. Single-question context belongs in `<stem>`.
 3. `<question_label>...</question_label>`: Question prefix indicator ONLY (e.g. "**101.**", "Câu 1:"). Must NEVER wrap stems or reading passages.
 4. `<stem>...</stem>`: Main text body of the question.
@@ -1624,7 +1741,7 @@ Câu 2: Bước sóng $\\lambda = c / f = 3 \\cdot 10^8 / 10^8 = 3\\text{ m}$. C
 - HTML formatting tags: `<table>`, `<tr>`, `<td>`, `<th>`, `<b>`, `<i>`, `<u>`, `<strong>`, `<em>`, `<span>`, `<div>`, `<p>`, `<ul>`, `<ol>`, `<li>`, `<br>`, etc.
 - LaTeX mathematical comparisons: `$x < y$`, `$a > b$`, `$\\alpha < \\beta$`.
 - RULE: You MUST ONLY care about SYSTEM tags if they are missing closing tags, broken, or mismatched. You MUST COMPLETELY IGNORE broken, unclosed, or mismatched NON-SYSTEM tags! Never report unclosed table or text styling tags as syntax errors.
-- VERBATIM SOURCE FIDELITY: The parser pipeline uses a source-grounded compiler that automatically enforces 100% exact verbatim preservation of original OCR characters by projecting tag offsets onto the source text. You do NOT need to check for word-level paraphrasing or text alterations; focus 100% of your audit on system XML tag placement, structure, boundaries, and coverage.
+- VERBATIM SOURCE FIDELITY: Verify that annotated text reproduces the raw OCR source faithfully with zero fabricated/altered wording and zero leaked diff/conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`). Flag any leaked conflict markers as CRITICAL under `conflict_markers` and any altered/hallucinated source text under `verbatim_fidelity`.
 
 ---
 
@@ -1636,20 +1753,20 @@ When reporting issues, you MUST categorize each error using one of the following
    - Example: "Question 'Câu 5' present in raw OCR text was omitted/unannotated by the parser."
 
 2. `stimulus_missing_citation`:
-   - A `<stimulus>` anchor tag omitted the citation, source attribution, reading passage title, or author info at the end (or beginning) of the passage.
-   - Example: "Stimulus 'stim_1' end_anchor cut off at 'trong chân không.' omitting the source citation '(Trích SGK Vật lí 12, NXB Giáo dục)'."
+   - A `<stimulus>` tag omitted the citation, source attribution, reading passage title, or author info at the end (or beginning) of the passage.
+   - Example: "Stimulus 'stim_1' closed early at 'trong chân không.' omitting the source citation '(Trích SGK Vật lí 12, NXB Giáo dục)'."
 
 3. `stimulus_nesting`:
    - [CRITICAL FATAL] A `<stimulus>` tag illegally wraps or encloses other system tags (`<stem>`, `<question_label>`, `<option_label>`, `<option_text>`, `<explanation>`).
-   - Example: "Stimulus tag <stimulus ...>...</stimulus> illegally encloses <question_label> and <stem>."
+   - Example: "Stimulus tag <stimulus>...</stimulus> illegally encloses <question_label> and <stem>."
 
 4. `single_question_stimulus`:
    - A `<stimulus>` tag was created for context, passage, or table that only serves 1 single question instead of 2 or more questions.
    - Example: "Stimulus 'stim_2' only relates to Câu 4; single-question context must be included directly inside <stem>."
 
-5. `stimulus_anchor_invalid`:
-   - The `start_anchor` or `end_anchor` text in a `<stimulus>` tag does not match the raw source text verbatim, or anchors are too short (< 3 words) or ambiguous.
-   - Example: "Stimulus 'stim_1' start_anchor 'Đọc đoạn' is too short and ambiguous."
+5. `stimulus_invalid`:
+   - A `<stimulus>` uses deprecated self-closing anchor syntax (`<stimulus ... />`), contains page metadata/watermarks/empty boilerplate instead of shared passage text, or omits passage text required verbatim.
+   - Example: "Stimulus tag wraps watermark/page metadata or uses deprecated self-closing anchor syntax."
 
 6. `broken_system_tag`:
    - A SYSTEM tag is missing a closing tag, has a mismatched closing tag, or has broken syntax (e.g. truncated mid-tag).
@@ -1827,7 +1944,7 @@ Respond ONLY with a valid JSON object with NO markdown codeblocks or extra text:
             f"### Evaluation Guidelines & Context:\n"
             f"1. No Scoring: Do NOT provide numerical scores or rubric scores. The audit algorithm assigns penalties based on the error categories you report.\n"
             f"2. System XML Tags Only: ONLY check system tags (<section>, <stimulus>, <question_label>, <stem>, <option_label>, <option_text>, <explanation>, <figure>) for missing closing tags or broken syntax. Completely IGNORE broken, unclosed, or mismatched non-system tags (<table>, <tr>, <td>, <th>, <b>, <i>, <span>, <p>, etc.) and math comparison operators (<, >).\n"
-            f"3. Parser Error Taxonomy: Categorize all issues using the standard categories: 'unannotated_question', 'stimulus_missing_citation', 'stimulus_nesting', 'single_question_stimulus', 'stimulus_anchor_invalid', 'broken_system_tag', 'missing_question_label', 'missing_stem', 'missing_options', 'absorbed_subquestions', 'mislabelled_element', 'prohibited_tags', 'truncated_output'.\n"
+            f"3. Parser Error Taxonomy: Categorize all issues using the standard categories: 'unannotated_question', 'stimulus_missing_citation', 'stimulus_nesting', 'single_question_stimulus', 'stimulus_invalid', 'conflict_markers', 'verbatim_fidelity', 'broken_system_tag', 'missing_question_label', 'missing_stem', 'missing_options', 'absorbed_subquestions', 'mislabelled_element', 'prohibited_tags', 'truncated_output'.\n"
             f"4. Acceptable Text Omission: If the annotated XML omitted long lecture notes, textbook theory, or info blurbs but annotated ALL exam questions and choices fully and accurately without affecting the end exam result, this lost text is completely ACCEPTABLE. Do NOT report as an error.\n"
             f"5. Error Rate vs Document Size: Consider error frequency relative to total questions. If a document has 30 questions and only 1 isolated mislabelled stem or minor glitch (>96% accuracy), classify it as MINOR.\n"
             f"6. Figures Out of Scope: Do NOT evaluate or penalize figure tags (<figure ... />) or figure mentions.\n"
@@ -1936,12 +2053,16 @@ class AnnotationReviewerAgent:
         syntax_issues, syntax_score = DeterministicAuditor.check_xml_syntax(xml_content)
         issues.extend(syntax_issues)
 
-        # 2. Prohibited Tags & Schema Conformance
+        # 2. Prohibited Tags, Conflict Markers & Schema Conformance
         prohibited_issues, prohibited_score = DeterministicAuditor.check_prohibited_tags(
             xml_content
         )
         issues.extend(prohibited_issues)
-        s_syntax = round(syntax_score * 0.70 + prohibited_score * 0.30, 1)
+        conflict_issues, conflict_score = DeterministicAuditor.check_conflict_markers(
+            xml_content
+        )
+        issues.extend(conflict_issues)
+        s_syntax = min(conflict_score, round(syntax_score * 0.70 + prohibited_score * 0.30, 1))
 
         # 3. Stimulus Nesting & Anchors (Architecture & Grounding)
         stim_nest_issues, stim_nest_score = (
@@ -1949,7 +2070,7 @@ class AnnotationReviewerAgent:
         )
         issues.extend(stim_nest_issues)
 
-        stim_anchor_issues, stim_anchor_score = DeterministicAuditor.check_stimulus_anchors(
+        stim_anchor_issues, stim_anchor_score = DeterministicAuditor.check_paired_stimulus_integrity(
             xml_content=xml_content,
             pure_text=DeterministicAuditor.strip_xml_tags(xml_content),
             raw_ocr_text=raw_ocr_text,
@@ -2080,17 +2201,22 @@ class AnnotationReviewerAgent:
 
                 # LLM-reported additional issues are already semantic findings
                 # and therefore enter the editor handoff as confirmed errors.
-                # Deterministic findings enter only when the LLM explicitly
-                # confirms their stable issue_id as a true positive.
+                # Deterministic findings enter when confirmed by the LLM OR when
+                # they are non-dismissible structural CRITICAL defects.
                 _assign_issue_ids(issues)
                 confirmed_ids = _confirmed_issue_keys(llm_confirmations)
                 confirmed_issues = [
                     issue
                     for issue in issues
                     if issue.issue_id in confirmed_ids
+                    or (
+                        issue.severity == IssueSeverity.CRITICAL
+                        and issue.category in NON_DISMISSIBLE_CRITICAL_CATEGORIES
+                    )
                 ]
                 for issue in llm_issues:
-                    confirmed_issues.append(issue)
+                    if issue not in confirmed_issues:
+                        confirmed_issues.append(issue)
 
                 # Algorithmic penalty assignment on all confirmed issues (confirmed deterministic + new LLM issues)
                 total_penalties, llm_discard_reasons, rubric_deductions = compute_llm_penalties(confirmed_issues)
@@ -2150,8 +2276,14 @@ class AnnotationReviewerAgent:
                                 (rubric.sequence_continuity + float(llm_rubric.get("sequence_continuity", rubric.sequence_continuity))) / 2, 1
                             )
 
-                # Discard reasons in complete confirmation mode derive from confirmed issues and LLM findings
-                discard_reasons = list(llm_discard_reasons)
+                # Discard reasons preserve non-dismissible deterministic critical defects plus confirmed LLM findings
+                locked_det_discards = [
+                    f"[{iss.category.upper()}] {iss.message}"
+                    for iss in issues
+                    if iss.severity == IssueSeverity.CRITICAL
+                    and iss.category in NON_DISMISSIBLE_CRITICAL_CATEGORIES
+                ]
+                discard_reasons = list(dict.fromkeys(locked_det_discards + list(llm_discard_reasons)))
 
                 if llm_result.get("is_malfunctioned"):
                     for d_reason in llm_result.get("discard_reasons", []):
@@ -2734,6 +2866,23 @@ class AnnotationReviewerAgent:
                 # Invariant check: remove_annotation_tags(merged_xml) == canonical_original_text
                 stripped = remove_annotation_tags(merged_xml)
                 is_fidelity_ok = (stripped == reconcile_res.get("original_text"))
+                if not is_fidelity_ok:
+                    fidelity_err = AuditIssue(
+                        category="verbatim_fidelity",
+                        severity=IssueSeverity.CRITICAL,
+                        message="Reconciled merged.xml failed exact source fidelity invariant (remove_annotation_tags != original_text).",
+                    )
+                    aggregated_issues.append(fidelity_err)
+                    aggregated_discard_reasons.append(f"[VERBATIM_FIDELITY] {fidelity_err.message}")
+                    rollup_decision = ReviewDecision.DISCARD
+
+                # Check merged_xml for conflict markers or structural XML regressions
+                merged_conflict_issues, _ = DeterministicAuditor.check_conflict_markers(merged_xml)
+                if merged_conflict_issues:
+                    aggregated_issues.extend(merged_conflict_issues)
+                    for c_iss in merged_conflict_issues:
+                        aggregated_discard_reasons.append(f"[{c_iss.category.upper()}] {c_iss.message}")
+                    rollup_decision = ReviewDecision.DISCARD
 
                 # Write reconciled merged.xml
                 reconciled_merged_xml_path.write_text(merged_xml, encoding="utf-8")
@@ -2756,11 +2905,6 @@ class AnnotationReviewerAgent:
                     encoding="utf-8",
                 )
                 total_questions = len(structured_questions)
-
-                # Deterministic continuity audit on reconciled merged.xml
-                det_issues, det_sc, det_metrics = DeterministicAuditor.check_question_and_option_structure(merged_xml)
-                if not det_metrics.get("continuity_ok", True):
-                    aggregated_issues.extend(det_issues)
             except Exception as e:
                 aggregated_issues.append(
                     AuditIssue(
@@ -2814,7 +2958,7 @@ class AnnotationReviewerAgent:
         auto_discard: bool = False,
         save_audit_json: bool = True,
         use_llm: bool = True,
-        concurrency: int = 4,
+        concurrency: int = REVIEWER_CONCURRENCY,
         granularity: str = "chunk",
         max_merged_tokens: int = 15_000,
         rollup_documents: bool = True,
@@ -3317,8 +3461,8 @@ def main():
         "--concurrency",
         "-c",
         type=int,
-        default=4,
-        help="Number of concurrent worker threads (default: 4)",
+        default=REVIEWER_CONCURRENCY,
+        help=f"Number of concurrent worker threads (default: {REVIEWER_CONCURRENCY})",
     )
     parser.add_argument(
         "--output-report",

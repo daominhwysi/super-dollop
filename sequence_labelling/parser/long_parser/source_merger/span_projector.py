@@ -1,8 +1,40 @@
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Tuple
 from sequence_labelling.parser.long_parser.source_merger.types import GlobalSpan, ChunkInput
 from sequence_labelling.parser.long_parser.source_merger.canonical_source import PiecewiseMap
 from sequence_labelling.parser.long_parser.source_merger.xml_lexer import LocalSpan
 from sequence_labelling.parser.long_parser.source_merger.source_aligner import SourceAligner
+
+_ATOMIC_HTML_TAG_RE = re.compile(
+    r"</?(?:figure|table|tr|th|td|tbody|thead|tfoot|caption|colgroup|col|"
+    r"b|i|u|s|strong|em|sub|sup|small|mark|p|br|hr|span|div|a|img|code|pre|"
+    r"ul|ol|li|center|font|del|strike|h[1-6]|blockquote)\b"
+    r"(?:\s+(?:[^<>\"']|\"[^\"]*\"|'[^']*')*|\s*/?\s*)>"
+)
+
+
+def _snap_boundaries_out_of_tags(
+    g_start: int,
+    g_end: int,
+    p_sub: str,
+    tag_intervals: List[Tuple[int, int]],
+) -> Tuple[int, int]:
+    """Never allow a projected span boundary to slice inside an atomic HTML/figure tag."""
+    p_stripped = p_sub.strip()
+    for f_start, f_end in tag_intervals:
+        if f_start < g_start < f_end:
+            if p_stripped.startswith("<") and len(p_stripped) > 1 and (p_stripped[1].isalpha() or p_stripped[1] == "/"):
+                g_start = f_start
+            else:
+                g_start = f_end
+        if f_start < g_end < f_end:
+            if not p_stripped.endswith((">", "/>")):
+                g_end = f_start
+            else:
+                g_end = f_end
+    if g_end < g_start:
+        g_end = g_start
+    return g_start, g_end
 
 
 def score_candidate(
@@ -55,6 +87,7 @@ def project_local_spans_to_global(
     Project local parsed XML spans -> original chunk text -> global canonical text coordinates.
     """
     global_spans: List[GlobalSpan] = []
+    figure_intervals = [(m.start(), m.end()) for m in _ATOMIC_HTML_TAG_RE.finditer(canonical_text)]
 
     for l_span in local_spans:
         if l_span.is_self_closing:
@@ -104,8 +137,21 @@ def project_local_spans_to_global(
 
         # Include trailing sentence punctuation inside span if parsed text ends with punctuation
         if p_sub and p_sub[-1] in ".!?:" and g_end_clamped < len(canonical_text) and canonical_text[g_end_clamped] in ".!?:":
-            if l_span.label in ("stimulus", "stem", "option_text"):
+            if l_span.label in ("stem", "option_text"):
                 g_end_clamped += 1
+
+        if figure_intervals:
+            g_start_clamped, g_end_clamped = _snap_boundaries_out_of_tags(
+                g_start_clamped, g_end_clamped, p_sub, figure_intervals
+            )
+
+        # Guard against fuzzy alignment stretching a short span over an omitted chunk gap
+        p_len = l_span.p_end - l_span.p_start
+        g_len = g_end_clamped - g_start_clamped
+        if alignment_kind == "fuzzy" and p_len > 0 and (
+            g_len > max(p_len * 3, p_len + 500) or p_len > max(g_len * 3, g_len + 500)
+        ):
+            continue
 
         # Extract authoritative text from canonical text
         span_text = canonical_text[g_start_clamped:g_end_clamped]

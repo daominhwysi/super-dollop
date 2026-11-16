@@ -51,6 +51,10 @@ def audit_spec_alignment(repo_root: Path) -> bool:
         if "<question_label>## Câu 3:</question_label> <stem>Phát biểu sau đúng hay sai?</stem>\n<table>" not in content:
             errors.append("prompt_annotator.md Example 4 missing strict closure of <stem> before <table>.")
 
+        # Invariant 5: No legacy self-closing stimulus anchor syntax
+        if re.search(r"<stimulus\b[^>]*start_anchor=", content):
+            errors.append("prompt_annotator.md still contains legacy <stimulus ... start_anchor=...> anchor syntax.")
+
         print("  [+] prompt_annotator.md audited.")
 
     # 2. Audit reviewer.py
@@ -65,6 +69,10 @@ def audit_spec_alignment(repo_root: Path) -> bool:
         if "empty_stems and not has_options_or_stimuli" not in rev_content:
             errors.append("reviewer.py deterministic precheck does not implement empty stem exemption for cloze/options.")
 
+        # Invariant 3: Reviewer system prompt must not instruct self-closing stimulus anchors
+        if '<stimulus id="stim_1" start_anchor=' in rev_content or '<stimulus id="stim_N" start_anchor=' in rev_content:
+            errors.append("reviewer.py SYSTEM_PROMPT still contains legacy <stimulus ... start_anchor=...> anchor instruction.")
+
         print("  [+] reviewer.py audited.")
 
     # 3. Audit anchored_xml_llm_parser.py
@@ -74,6 +82,8 @@ def audit_spec_alignment(repo_root: Path) -> bool:
             errors.append("anchored_xml_llm_parser.py missing TABLE BOUNDARY RULE.")
         if "CLOZE & EMBEDDED BLANKS" not in parser_content:
             errors.append("anchored_xml_llm_parser.py missing CLOZE & EMBEDDED BLANKS rule.")
+        if '<stimulus id="stim_1" start_anchor=' in parser_content:
+            errors.append("anchored_xml_llm_parser.py prompt still instructs legacy <stimulus ... start_anchor=...> anchor syntax.")
         print("  [+] anchored_xml_llm_parser.py audited.")
 
     if errors:

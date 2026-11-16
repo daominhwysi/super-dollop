@@ -24,7 +24,9 @@ from sequence_labelling.annotator.editor import (
     EditorAgent,
     EditorIssueAssessment,
     SearchReplacePatcher,
+    contains_diff_sentinel,
     parse_issue_assessments,
+    verbatim_preserved,
 )
 from sequence_labelling.annotator.reviewer import (
     AnnotationReviewerAgent,
@@ -34,7 +36,6 @@ from sequence_labelling.annotator.reviewer import (
     ReviewReport,
     PARSER_ERROR_PENALTIES,
 )
-from sequence_labelling.annotator.xml_cleaner import XMLCleaner
 from sequence_labelling.parser.long_parser.anchored_xml_llm_parser import (
     parse_xml_with_anchors,
 )
@@ -250,7 +251,7 @@ class EditorReviewerLoop:
         # Never pass the review's complete issue list to the editor.  It may
         # contain deterministic candidates that the semantic reviewer marked
         # false-positive, or findings whose truth status is still unknown.
-        current_xml = XMLCleaner.clean(annotated_xml).cleaned_xml
+        current_xml = annotated_xml
         current_issues = list(initial_report.confirmed_issues)
 
         # A reviewer run without a confirmation gate is not actionable by an
@@ -316,7 +317,21 @@ class EditorReviewerLoop:
             candidate_xml, applied, failed = SearchReplacePatcher.apply_blocks(
                 current_xml, blocks
             )
-            candidate_xml = XMLCleaner.clean(candidate_xml).cleaned_xml
+            patch_rejected = False
+            if applied > 0:
+                if contains_diff_sentinel(candidate_xml) and not contains_diff_sentinel(current_xml):
+                    failed.append(
+                        "Rejected patch batch: introduced residual diff/conflict markers."
+                    )
+                    patch_rejected = True
+                elif not verbatim_preserved(annotated_xml, candidate_xml):
+                    failed.append(
+                        "Rejected patch batch: violated 100% verbatim source fidelity."
+                    )
+                    patch_rejected = True
+            if patch_rejected:
+                candidate_xml = current_xml
+                applied = 0
             total_applied += applied
             total_failed += len(failed)
 
@@ -359,18 +374,18 @@ class EditorReviewerLoop:
                     }
                 )
 
-            if self._candidate_rank(report) > self._candidate_rank(best_report):
+            if not patch_rejected and self._candidate_rank(report) > self._candidate_rank(best_report):
                 best_xml = candidate_xml
                 best_report = report
 
-            current_xml = candidate_xml
+            current_xml = best_xml
             current_issues = [
                 issue
-                for issue in report.confirmed_issues
+                for issue in best_report.confirmed_issues
                 if self._issue_key(issue) not in false_positive_keys
             ]
 
-            if report.decision == ReviewDecision.PASS:
+            if not patch_rejected and report.decision == ReviewDecision.PASS:
                 best_xml = candidate_xml
                 best_report = report
                 break

@@ -87,7 +87,7 @@ ALLOWED_PAIRED_TAGS: Set[str] = SEQUENCE_PAIRED_TAGS | HTML_FORMATTING_TAGS
 
 # HTML void tags and sequence self-closing tags
 HTML_VOID_TAGS: Set[str] = {"br", "hr", "img", "col", "wbr", "input", "meta", "link"}
-ALLOWED_SELF_CLOSING_TAGS: Set[str] = {"stimulus", "figure"} | HTML_VOID_TAGS
+ALLOWED_SELF_CLOSING_TAGS: Set[str] = {"figure"} | HTML_VOID_TAGS
 
 # Prohibited tags that must be pruned from clean OCR annotations
 PROHIBITED_TAGS: Set[str] = {"pages", "page", "page_metadata", "think"}
@@ -255,8 +255,8 @@ class XMLChecker:
         clean_xml = re.sub(r"<\s*\|\s*END\s*\|\s*>", "", clean_xml)
         clean_xml = re.sub(r"<\s*\|\s*endoftext\s*\|\s*>", "", clean_xml)
 
-        # Regex matching tags with attribute-quote awareness (e.g. end_anchor="...</td>...")
-        tag_pattern = re.compile(r'<(/)?([a-zA-Z0-9_\-]+)(?:\s+((?:[^"\'>]|"[^"]*"|\'[^\']*\')*))?(/)?>')
+        # Regex matching tags with attribute-quote awareness (tag names start with ASCII letter; never cross '<')
+        tag_pattern = re.compile(r'<(/)?([a-zA-Z][a-zA-Z0-9_\-]*)(?:\s+((?:[^"\'<>]|"[^"]*"|\'[^\']*\')*))?(/)?>')
 
         tag_stack: List[Tuple[str, int, int, str]] = []  # (tag_name, line_num, col_num, full_tag)
 

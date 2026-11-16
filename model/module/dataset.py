@@ -51,6 +51,22 @@ def normalize_bio_tag(tag: str) -> str:
     return tag_str.lower()
 
 
+MATH_TYPED_TOKENS = [
+    "[MATH_CALC]",
+    "[MATH_VAR_SHORT]",
+    "[MATH_VAR_MED]",
+    "[MATH_EXPR_SHORT]",
+    "[MATH_EXPR_LONG]",
+]
+
+EXAM_SPECIAL_TOKENS = [
+    "<blank />",
+    "<blank/>",
+    "[BLANK]",
+    "[LATEX]",
+] + MATH_TYPED_TOKENS
+
+
 def classify_latex(formula_str: str) -> str:
     r"""
     Classify LaTeX expression into typed tokens based on structural role and length:

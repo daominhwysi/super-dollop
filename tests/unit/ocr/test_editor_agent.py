@@ -122,20 +122,73 @@ def test_patcher_failed_block_handling():
 # ---------------------------------------------------------------------------
 
 def test_editor_agent_deterministic_preclean():
-    """Verifies that pure syntax errors (unclosed stems, math inequalities) are resolved deterministically."""
+    """Verifies unclosed stems with math inequalities are repaired via diff without regex mutation."""
     raw_ocr = "Câu 1. Biểu thức x < 5 và y > 10. A. 1 B. 2"
     bad_xml = "<question_label>Câu 1.</question_label> <stem>Biểu thức x < 5 và y > 10. <option_label>A.</option_label> <option_text>1</option_text> <option_label>B.</option_label> <option_text>2</option_text>"
+
+    mock_diff = """<<<<<<< SEARCH
+<stem>Biểu thức x < 5 và y > 10. <option_label>A.</option_label>
+=======
+<stem>Biểu thức x < 5 và y > 10.</stem> <option_label>A.</option_label>
+>>>>>>> REPLACE"""
 
     editor = EditorAgent()
     res = editor.repair_document(
         annotated_xml=bad_xml,
         raw_ocr_text=raw_ocr,
         doc_id="test_det_clean",
+        completion_fn=lambda messages, **kwargs: mock_diff,
     )
     assert res.success is True
-    assert res.deterministic_only is True
     assert "</stem>" in res.repaired_xml
+    assert "x < 5 và y > 10." in res.repaired_xml
     assert res.final_decision == "PASS"
+
+
+def test_patcher_rejects_nested_conflict_markers():
+    """SearchReplacePatcher must reject diff blocks containing residual conflict markers."""
+    llm_output = """<<<<<<< SEARCH
+<stem>Old text</stem>
+=======
+<<<<<<< SEARCH
+<stem>Old text</stem>
+=======
+<stem>New text</stem>
+>>>>>>> REPLACE"""
+    blocks = SearchReplacePatcher.parse_blocks(llm_output)
+    assert blocks == []
+
+    bad_block = SearchReplaceBlock(
+        search_text="<stem>Old text</stem>",
+        replace_text="<<<<<<< SEARCH\n<stem>New text</stem>",
+    )
+    patched, applied, failed = SearchReplacePatcher.apply_blocks("<stem>Old text</stem>", [bad_block])
+    assert applied == 0
+    assert patched == "<stem>Old text</stem>"
+    assert any("conflict markers" in msg for msg in failed)
+
+
+def test_editor_agent_rejects_verbatim_corruption():
+    """EditorAgent must reject LLM diff patches that mutate source wording or numbers."""
+    raw_ocr = "Câu 1. Tính x = 10. A. 10 B. 20"
+    xml_in = "<question_label>Câu 1.</question_label> <stem>Tính x = 10. <option_label>A.</option_label> <option_text>10</option_text> <option_label>B.</option_label> <option_text>20</option_text>"
+    corrupt_diff = """<<<<<<< SEARCH
+<stem>Tính x = 10. <option_label>A.</option_label>
+=======
+<stem>Tính y = 999.</stem> <option_label>A.</option_label>
+>>>>>>> REPLACE"""
+
+    editor = EditorAgent()
+    res = editor.repair_document(
+        annotated_xml=xml_in,
+        raw_ocr_text=raw_ocr,
+        doc_id="test_verbatim_guard",
+        max_attempts=1,
+        completion_fn=lambda messages, **kwargs: corrupt_diff,
+    )
+    assert res.repaired_xml == xml_in
+    assert res.applied_patches_count == 0
+    assert any("verbatim" in r.lower() for r in res.failed_patches_reasons)
 
 
 def test_editor_agent_sub_question_segmentation_mock():
@@ -189,30 +242,32 @@ b) Hàm số có 3 điểm cực trị.</stem>
 
 
 def test_editor_agent_stimulus_anchor_repair_mock():
-    """Verifies end-to-end mock repair for broken stimulus anchors."""
+    """Verifies end-to-end mock repair for broken paired stimulus tags."""
     raw_ocr = (
         "Dựa vào thông tin sau đây để trả lời các câu từ 1 đến 2: Đoạn văn mẫu thí nghiệm hóa học.\n"
         "Câu 1. Hiện tượng là gì? A. Kết tủa B. Khí\n"
         "Câu 2. Chất sinh ra là gì? A. CO2 B. H2O"
     )
-    bad_anchor_xml = (
-        '<stimulus id="stim_1" start_anchor="Không_tồn_tại" end_anchor="Không_khớp" />\n'
+    bad_stim_xml = (
+        "<stimulus>Dựa vào thông tin sau đây để trả lời các câu từ 1 đến 2: Đoạn văn mẫu thí nghiệm hóa học.\n"
         "<question_label>Câu 1.</question_label> <stem>Hiện tượng là gì?</stem> <option_label>A.</option_label> <option_text>Kết tủa</option_text> <option_label>B.</option_label> <option_text>Khí</option_text>\n"
         "<question_label>Câu 2.</question_label> <stem>Chất sinh ra là gì?</stem> <option_label>A.</option_label> <option_text>CO2</option_text> <option_label>B.</option_label> <option_text>H2O</option_text>"
     )
 
     issues = [
         AuditIssue(
-            category="stimulus",
-            severity=IssueSeverity.MAJOR,
-            message="Stimulus #1 start_anchor not found in raw source document text.",
+            category="xml_syntax",
+            severity=IssueSeverity.CRITICAL,
+            message="Unclosed <stimulus> tag swallowing questions.",
         )
     ]
 
     mock_diff_response = """<<<<<<< SEARCH
-<stimulus id="stim_1" start_anchor="Không_tồn_tại" end_anchor="Không_khớp" />
+<stimulus>Dựa vào thông tin sau đây để trả lời các câu từ 1 đến 2: Đoạn văn mẫu thí nghiệm hóa học.
+<question_label>Câu 1.</question_label>
 =======
-<stimulus id="stim_1" start_anchor="Dựa vào thông tin sau đây" end_anchor="thí nghiệm hóa học." />
+<stimulus>Dựa vào thông tin sau đây để trả lời các câu từ 1 đến 2: Đoạn văn mẫu thí nghiệm hóa học.</stimulus>
+<question_label>Câu 1.</question_label>
 >>>>>>> REPLACE"""
 
     def mock_completion(messages: List[Any], **kwargs: Any) -> str:
@@ -220,15 +275,14 @@ def test_editor_agent_stimulus_anchor_repair_mock():
 
     editor = EditorAgent()
     res = editor.repair_document(
-        annotated_xml=bad_anchor_xml,
+        annotated_xml=bad_stim_xml,
         raw_ocr_text=raw_ocr,
         issues=issues,
         doc_id="test_stimulus_fix",
         completion_fn=mock_completion,
     )
 
-    assert 'start_anchor="Dựa vào thông tin sau đây"' in res.repaired_xml
-    assert 'end_anchor="thí nghiệm hóa học."' in res.repaired_xml
+    assert "</stimulus>\n<question_label>Câu 1.</question_label>" in res.repaired_xml
 
 
 def test_fuzzy_replace_large_doc_does_not_hang():

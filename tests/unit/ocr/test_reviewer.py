@@ -29,7 +29,7 @@ def valid_xml():
 - <option_label>C.</option_label> <option_text>$(0;2;3)$.</option_text>
 - <option_label>D.</option_label> <option_text>$(0;0;3)$.</option_text>
 
-<stimulus id="stim_1" start_anchor="Dựa vào thông tin sau" end_anchor="trả lời câu 2 và 3." />
+<stimulus>Dựa vào thông tin sau để trả lời câu 2 và 3.</stimulus>
 
 <question_label>**Câu 2.**</question_label> <stem>Tính giá trị của biểu thức $P$.</stem>
 - <option_label>A.</option_label> <option_text>10.</option_text>
@@ -653,13 +653,12 @@ def test_batch_review_filter_decision(tmp_path):
         summary2 = agent.batch_review(tmp_path, use_llm=False, overwrite=False, filter_decision="DISCARD")
         assert summary2.total_documents == 2
 
-def test_stimulus_self_closing_not_flagged_as_nested():
+def test_paired_stimulus_without_inner_system_tags_not_flagged_as_nested():
     xml = """<section># EXAM</section>
-<stimulus id="stim_1" start_anchor="Bình moka" end_anchor="trải nghiệm" />
+<stimulus>Bình moka mang đến trải nghiệm pha cà phê đậm đà.</stimulus>
 <question_label>**Câu 1.**</question_label>
 <stem>Câu hỏi 1?</stem>
 <option_label>A.</option_label> <option_text>Lựa chọn A</option_text>
-</stimulus>
 """
     issues, score = DeterministicAuditor.check_stimulus_wrapping_system_tags(xml)
     assert not any(iss.category == "stimulus_nesting" for iss in issues)
@@ -886,7 +885,8 @@ def test_reviewer_system_prompt_contains_parser_example_and_rules():
     assert "Complete Real-World Parser Example:" in prompt
     assert "Raw OCR Input Text:" in prompt
     assert "Expected Parser Output XML:" in prompt
-    assert "<stimulus id=\"stim_1\" start_anchor=" in prompt
+    assert "<stimulus>Dựa vào thông tin sau đây" in prompt
+    assert "</stimulus>" in prompt
     assert "SỞ GD&ĐT HÀ NỘI" in prompt
     assert "<section>PHẦN I." in prompt
     assert "<question_label>Câu 1:</question_label>" in prompt
@@ -940,8 +940,8 @@ def test_algorithmic_penalty_calculation_without_ai_score(mock_chat, valid_xml):
             {
                 "category": "stimulus_missing_citation",
                 "severity": "MINOR",
-                "message": "Stimulus stim_1 end anchor does not include the citation part.",
-                "context_snippet": "start_anchor=\"A\" end_anchor=\"B\""
+                "message": "Stimulus passage does not include the citation part.",
+                "context_snippet": "<stimulus>Passage body</stimulus>"
             }
         ],
         "summary": "Detected 3 parser defects."
@@ -1238,7 +1238,7 @@ def test_cloze_question_labels_without_stems_valid():
     Verifies that cloze / fill-in items where <question_label> is followed directly
     by choices (without <stem>) are 100% valid sequence labeling outputs.
     """
-    cloze_xml = """<stimulus id="stim_1" start_anchor="Read the following" end_anchor="fill in the blanks" />
+    cloze_xml = """<stimulus>Read the following passage carefully and fill in the blanks using the choices below.</stimulus>
 <section># READING CLOZE TEST</section>
 <question_label>Câu 631.</question_label>
 <option_label>A.</option_label> <option_text>This chance did not happen</option_text>
@@ -1427,6 +1427,79 @@ def test_non_exam_chunk_zero_questions_false_positive_recalculation():
     assert report.deterministic_score >= 90.0
     assert report.rubric_scores.det_question_coverage == 100.0
     assert report.rubric_scores.question_option_completeness == 100.0
+
+
+def test_deterministic_auditor_detects_conflict_markers_and_locks_critical():
+    """Leaked diff conflict markers must be CRITICAL and cannot be dismissed by LLM confirmation."""
+    raw = "Câu 1. Chọn đáp án đúng. A. 1 B. 2"
+    corrupt_xml = (
+        "<question_label>Câu 1.</question_label> "
+        "<<<<<<< SEARCH\n"
+        "<stem>Chọn đáp án đúng.</stem>\n"
+        "=======\n"
+        "<stem>Chọn đáp án đúng.</stem>\n"
+        ">>>>>>> REPLACE\n"
+        "<option_label>A.</option_label> <option_text>1</option_text> "
+        "<option_label>B.</option_label> <option_text>2</option_text>"
+    )
+    agent = AnnotationReviewerAgent(min_score=75)
+    mock_llm_result = {
+        "parser_error_confirmations": [
+            {"issue_id": 1, "is_true_positive": False, "reason": "Try to dismiss."}
+        ],
+        "issues": [],
+        "summary": "Looks fine.",
+    }
+    report = agent.review_document(
+        xml_content=corrupt_xml,
+        raw_ocr_text=raw,
+        doc_id="conflict_test",
+        use_llm=True,
+        cached_llm_result=mock_llm_result,
+    )
+    assert report.decision == ReviewDecision.DISCARD
+    assert report.is_malfunctioned is True
+    assert any(iss.category == "conflict_markers" for iss in report.confirmed_issues)
+
+
+def test_strip_xml_tags_preserves_math_inequalities():
+    """Quote-aware strip_xml_tags must preserve math '<' ... '>' expressions."""
+    xml = '<question_label>Câu 1.</question_label> <stem>Biết $a < x + 1 > b$ và <figure id="fig_1" description="$x > 0$" bbox="0,0,10,10" />.</stem>'
+    stripped = DeterministicAuditor.strip_xml_tags(xml)
+    assert "$a < x + 1 > b$" in stripped
+    assert "<figure" not in stripped
+    assert "<stem>" not in stripped
+
+
+def test_check_paired_stimulus_integrity():
+    clean = (
+        "<stimulus>Đọc đoạn văn sau và trả lời các câu 1 và 2: Nội dung rất chi tiết và đầy đủ.</stimulus>\n"
+        "<question_label>Câu 1.</question_label> <stem>Ý chính?</stem>\n"
+        "<question_label>Câu 2.</question_label> <stem>Chi tiết?</stem>"
+    )
+    issues_ok, score_ok = DeterministicAuditor.check_paired_stimulus_integrity(clean)
+    assert score_ok == 100.0
+    assert issues_ok == []
+
+    legacy_sc = '<stimulus id="stim_1" />'
+    issues_sc, score_sc = DeterministicAuditor.check_paired_stimulus_integrity(legacy_sc)
+    assert score_sc < 100.0
+    assert any(iss.severity == IssueSeverity.MAJOR for iss in issues_sc)
+
+    junk = "<stimulus>www.thuvienhoclieu.com Trang 4</stimulus>"
+    issues_junk, score_junk = DeterministicAuditor.check_paired_stimulus_integrity(junk)
+    assert score_junk < 100.0
+    assert any(iss.category == "stimulus" for iss in issues_junk)
+
+    single_q = (
+        "<stimulus>Đây là một đoạn thông tin khá dài dùng cho phần tiếp theo trong đề thi.</stimulus>\n"
+        "<question_label>Câu 1.</question_label> <stem>Hỏi gì?</stem>\n"
+        "<section>PHẦN II</section>"
+    )
+    issues_sq, score_sq = DeterministicAuditor.check_paired_stimulus_integrity(single_q)
+    assert any(iss.category == "single_question_stimulus" for iss in issues_sq)
+
+
 
 
 

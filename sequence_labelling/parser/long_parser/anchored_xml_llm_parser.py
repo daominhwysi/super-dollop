@@ -29,9 +29,9 @@ Annotate the raw OCR text with inline XML sequence tags and compact stimulus anc
 ## 🏷️ Complete Tag Dictionary:
 
 1. <section>...</section>: Wrap major section/part titles, headers, directions, and subject block titles (e.g. "<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn...</section>", "<section>## PART 5</section>", "<section>## Chủ đề Lịch sử có 17 câu hỏi từ 1 đến 17</section>"). Output full paired tags <section>...</section> containing verbatim text. Do NOT use anchor tags for section titles. CRITICAL RULE: NEVER tag individual question headers (e.g. '## Câu 1.', '## Câu 2:', '## Bài 1.') as <section>! Markdown question headings belong exclusively inside <question_label>.
-2. <stimulus id="stim_1" start_anchor="..." end_anchor="..." />: For shared reading passages, emails, articles, tables, figures, multi-passage sets, and explicit context prompts (e.g. "Dựa vào thông tin sau đây để giải quyết bài 4, 5...", "Dựa vào thông tin dưới đây để trả lời các câu từ 515-517...").
+2. <stimulus>...</stimulus>: For shared reading passages, emails, articles, tables, figures, multi-passage sets, and explicit context prompts (e.g. "Dựa vào thông tin sau đây để giải quyết bài 4, 5...", "Dựa vào thông tin dưới đây để trả lời các câu từ 515-517...").
    CRITICAL DEFINITION & MULTI-QUESTION RULE: A stimulus ONLY applies if it is intimately related to 2 OR MORE QUESTIONS (shared reading passage, dataset, table, or multi-question context). If a context or text block is only related to 1 single standalone question, do NOT tag it as a stimulus—include it inside that question's <stem> instead!
-   CRITICAL ARCHITECTURAL CONSTRAINT: <stimulus> MUST NEVER wrap or enclose other system tags (<stem>, <question_label>, <option_label>, <option_text>, <explanation>). Output self-closing anchor tag with id, start_anchor (first 3-10 verbatim words), and end_anchor (last 3-10 verbatim words).
+   CRITICAL ARCHITECTURAL CONSTRAINT: <stimulus> MUST NEVER wrap or enclose other system tags (<stem>, <question_label>, <option_label>, <option_text>, <explanation>), page metadata, or website watermarks. Output full paired <stimulus>...</stimulus> tags containing verbatim shared passage text.
 3. <question_label>...</question_label>: Wrap question prefix indicators ONLY (e.g. "**101.**", "**131.**", "101.", "Câu 1.", "Câu 1:", "## Câu 1.", "## Bài 1:"). CRITICAL RULE: <question_label> must ONLY contain the short question number/label itself. When raw text contains markdown headers for questions (e.g. '## Câu 1.', '## Câu 2:'), enclose the entire header inside <question_label>: e.g. <question_label>## Câu 1.</question_label>. NEVER split into <section>## Câu 1.</section><question_label>Câu 1.</question_label>! NEVER wrap reading passage text, shared contexts, or multi-question instructions inside <question_label>!
 4. <stem>...</stem>: Wrap the main text body of a question following the question label.
 5. <option_label>...</option_label>: Wrap choice letters/prefixes (A., B., (A)) AND sub-item/sub-question indicators (a), b), c), d)) in essay, constructed-response, or True/False questions. VIETNAM GDPT 2018 TRUE/FALSE RULE: In Phần II (Trắc nghiệm đúng/sai) and structured questions, sub-item propositions 'a)', 'b)', 'c)', 'd)' MUST ALWAYS be tagged as <option_label>a)</option_label> <option_text>...</option_text>. NEVER absorb 'a)', 'b)', 'c)', 'd)' into <stem>! SENTENCE ARRANGEMENT EXCEPTION: In sentence/text arrangement questions where sentences are labeled a., b., c., d., e. and choices A., B., C., D. are sequences (e.g. 'A. d-a-c-e-b'), sentences a., b., c., d., e. are part of the prompt and MUST be kept inside <stem>...</stem>, NOT tagged as option_label!
@@ -43,7 +43,7 @@ Annotate the raw OCR text with inline XML sequence tags and compact stimulus anc
 ## ⛔ Strict Ground-Truth Annotation Rules:
 
 1. VERBATIM QUESTION & SECTION TEXT (100% RETENTION): Do NOT alter, correct, spell-check, or omit any character, typo, LaTeX expression ($...$, $$...$$), standard math abbreviation ('VT', 'VP', 'đpcm'), or page marker inside question elements (<question_label>, <stem>, <option_label>, <option_text>, <explanation>) or section elements (<section>).
-2. ANCHOR TAG EXCEPTION (COMPACT STIMULUS SHORTCUT): Self-closing <stimulus id="..." start_anchor="..." end_anchor="..." /> tags are intentionally compact references ONLY for reading passages, shared texts, tables, and context prompts. For stimuli, output ONLY the self-closing anchor tag with start_anchor (first 3-10 verbatim words) and end_anchor (last 3-10 verbatim words). Do NOT wrap questions or other system tags inside stimulus tags, and do NOT absorb reading passage text into <question_label>!
+2. PAIRED STIMULUS & SECTION TAGS (NO ANCHOR SHORTCUTS): Output full paired <stimulus>...</stimulus> tags containing verbatim text for shared reading passages, tables, and context prompts. NEVER emit self-closing anchor tags for stimuli, NEVER wrap questions or other system tags inside <stimulus>, and NEVER absorb reading passage text into <question_label>!
 3. FULL ANNOTATION COVERAGE: All question labels, stems, option labels, option texts, explanations, and section headers in the provided chunk MUST be annotated completely from start to finish. You have a 128k token output window—do NOT truncate or emit conversational refusal text!
 4. NO MARKDOWN CODEBLOCKS: Output ONLY the annotated text directly. Do not wrap the output in ```xml codeblocks.
 5. END DELIMITER: Append <|END|> at the very end of your output to indicate the annotation is complete.
@@ -51,100 +51,13 @@ Annotate the raw OCR text with inline XML sequence tags and compact stimulus anc
 7. STIMULUS DISCRIMINATION & MULTI-QUESTION RULE: A <stimulus> tag MUST ONLY be created if the passage/context/data block intimately relates to 2 OR MORE QUESTIONS. If text or a table is associated with only 1 single question, include it directly inside that question's <stem>...</stem>.
 8. TABULAR & UNLABELED TRUE/FALSE SUB-QUESTIONS: When sub-questions or True/False statements are presented inside HTML tables (<table>...</table>), Markdown tables, or lists without explicit option labels (such as a), b) or A.), each statement cell or item text to be evaluated MUST still be tagged as <option_text>...</option_text> (e.g., <td><option_text>Statement text...</option_text></td>). Table formatting tags (<table>, <tr>, <th>, <td>), header titles ("Phát biểu", "Đúng", "Sai"), and choice indicators (○, ✓, [ ]) remain un-tagged structure.
 9. NO QUESTION_LABEL EXPANSION: <question_label> must start and close strictly around the question indicator (e.g. `<question_label>**Câu 1.**</question_label>`). Never extend <question_label> to encompass reading passages or stems.
-10. XML TAG MATCHING & INTEGRITY: Every opened tag (<section>, <question_label>, <stem>, <option_label>, <option_text>, <explanation>) MUST have its exact matching closing tag. NEVER produce mismatched closing tags (e.g. <stem>...</option_text>) or leave tags unclosed. Compact stimulus anchor tags <stimulus ... /> MUST be self-closing.
+10. XML TAG MATCHING & INTEGRITY: Every opened tag (<section>, <stimulus>, <question_label>, <stem>, <option_label>, <option_text>, <explanation>) MUST have its exact matching closing tag. NEVER produce mismatched closing tags (e.g. <stem>...</option_text>) or leave tags unclosed. Only vision figures <figure ... /> remain self-closing.
 11. ACCEPTABLE TEXT OMISSION: If extraneous non-question lecture notes or book study guides are omitted while all exam questions, stems, choices, and solutions are fully annotated, this is valid and acceptable.
 12. LATEX DELIMITER INTEGRITY: Ensure <option_text> cleanly wraps math formulas: e.g. <option_label>A.</option_label> <option_text>$3x - 1 = 0$</option_text>. NEVER place tags inside LaTeX delimiters like $<option_text>...$.
 13. TABLE BOUNDARY RULE: In questions containing tables (<table> or Markdown tables), <stem> MUST close immediately BEFORE the table opens (<question_label>Câu 1.</question_label> <stem>...</stem><table>...). NEVER wrap a <table> inside <stem>.
 14. CLOZE & EMBEDDED BLANKS (EMPTY STEM VALIDITY): In cloze tests and fill-in passages where question items refer directly to numbered blanks inside a reading passage, emit <question_label> directly followed by <option_label>, or with <stem></stem>. Both forms are 100% valid sequence labeling outputs.
 15. SECTION 4-LOCK PROTOCOL: Markdown question headings (## Câu 1.) belong in <question_label>, NEVER <section>. Administrative metadata (school name, exam code, footer '--- HẾT ---') MUST remain completely UNTAGGED plain text. Major section headers (PHẦN I, PART 5) and answer key titles (### BẢNG ĐÁP ÁN) are tagged <section>. Rubric and answer tables below answer key headers are wrapped in <explanation>.
 """
-
-
-def _normalize_text_for_matching(text: str) -> Tuple[str, List[int]]:
-    norm_chars = []
-    index_map = []
-    in_space = False
-
-    for orig_idx, ch in enumerate(text):
-        if ch.isspace():
-            if not in_space:
-                norm_chars.append(" ")
-                index_map.append(orig_idx)
-                in_space = True
-        else:
-            norm_chars.append(ch)
-            index_map.append(orig_idx)
-            in_space = False
-
-    norm_text = "".join(norm_chars)
-    return norm_text, index_map
-
-
-def find_anchor_position(
-    raw_text: str, anchor: str, cursor: int = 0
-) -> Tuple[int, int]:
-    if not anchor or not raw_text:
-        return -1, -1
-
-    anchor_str = anchor.strip()
-    if not anchor_str:
-        return -1, -1
-
-    pos = raw_text.find(anchor_str, max(0, cursor))
-    if pos != -1:
-        return pos, pos + len(anchor_str)
-
-    pos = raw_text.find(anchor_str, 0)
-    if pos != -1:
-        return pos, pos + len(anchor_str)
-
-    norm_text, index_map = _normalize_text_for_matching(raw_text)
-    norm_anchor, _ = _normalize_text_for_matching(anchor_str)
-    norm_anchor = norm_anchor.strip()
-
-    if not norm_anchor:
-        return -1, -1
-
-    norm_pos = norm_text.find(norm_anchor)
-    if norm_pos != -1:
-        orig_start = index_map[norm_pos]
-        norm_end_idx = norm_pos + len(norm_anchor) - 1
-        orig_end = index_map[min(norm_end_idx, len(index_map) - 1)] + 1
-        return orig_start, orig_end
-
-    if len(anchor_str) > 12:
-        short_anchor = anchor_str[:12]
-        pos = raw_text.find(short_anchor, max(0, cursor))
-        if pos != -1:
-            return pos, pos + len(short_anchor)
-        pos = raw_text.find(short_anchor, 0)
-        if pos != -1:
-            return pos, pos + len(short_anchor)
-
-    return -1, -1
-
-
-def recover_text_from_anchors(
-    raw_text: str,
-    start_anchor: Optional[str] = None,
-    end_anchor: Optional[str] = None,
-    cursor: int = 0,
-) -> Tuple[str, int, int]:
-    if not start_anchor:
-        return "", cursor, cursor
-
-    s_str = start_anchor.strip()
-    start_pos, start_end = find_anchor_position(raw_text, s_str, cursor)
-    if start_pos == -1:
-        return s_str, cursor, cursor
-
-    if end_anchor and isinstance(end_anchor, str) and end_anchor.strip():
-        e_str = end_anchor.strip()
-        end_pos, end_len_pos = find_anchor_position(raw_text, e_str, start_pos)
-        if end_pos != -1 and end_len_pos > start_pos:
-            return raw_text[start_pos:end_len_pos], start_pos, end_len_pos
-
-    return raw_text[start_pos:start_end], start_pos, start_end
 
 
 def clean_llm_response(text: str) -> str:
@@ -166,13 +79,11 @@ def parse_xml_with_anchors(
     raw_ocr_text: str, tagged_xml: str
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str], List[Dict[str, Any]]]:
     """
-    Parses tagged XML string including self-closing attribute anchor tags
-    (<stimulus id="..." start_anchor="..." end_anchor="..."/>).
+    Parses tagged XML string using paired <tag>...</tag> annotations.
     Returns (spans, stimuli, questions).
     """
     spans: List[Dict[str, Any]] = []
     stimuli: Dict[str, str] = {}
-    current_text_pos = 0
 
     # Clean XML output
     cleaned_xml = clean_llm_response(tagged_xml).replace("<|END|>", "").strip()
@@ -221,30 +132,7 @@ def parse_xml_with_anchors(
             for k, v1, v2, v3 in attr_matches:
                 params[k] = v1 or v2 or v3
 
-        # Anchored stimulus tags only: <stimulus id="..." start_anchor="..." end_anchor="..." />
-        if tag_name == "stimulus" and (is_self_closing or "start_anchor" in params):
-            start_anchor = params.get("start_anchor")
-            end_anchor = params.get("end_anchor")
-            recovered_text, s_pos, e_pos = recover_text_from_anchors(
-                raw_ocr_text, start_anchor, end_anchor, cursor=current_text_pos
-            )
-            current_text_pos = max(current_text_pos, e_pos)
-
-            stim_id = params.get("id") or f"stim_{len(stimuli) + 1}"
-            stimuli[stim_id] = recovered_text
-            spans.append(
-                {
-                    "start": s_pos,
-                    "end": e_pos,
-                    "label": "stimulus",
-                    "text": recovered_text,
-                    "params": {"id": stim_id},
-                }
-            )
-            pos = end
-            continue
-
-        # Non-stimulus tags must not be self-closing/anchored (anchored stimulus only)
+        # Paired system tags only; self-closing tags are skipped
         if is_self_closing:
             pos = end
             continue

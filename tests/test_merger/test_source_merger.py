@@ -202,7 +202,7 @@ def test_literal_split_tag_is_replaced_by_valid_overlap_candidate():
     assert "<option_la\n" not in result.merged_xml
 
 
-def test_self_closing_stimulus_anchor_tag_merging():
+def test_paired_stimulus_tag_merging():
     raw = (
         "Dựa vào thông tin sau đây để trả lời câu hỏi 1 và 2:\n"
         "Đoạn văn đọc hiểu chung.\n\n"
@@ -212,9 +212,8 @@ def test_self_closing_stimulus_anchor_tag_merging():
         "A. Lựa chọn B"
     )
     parsed = (
-        '<stimulus id="stim_1" start_anchor="Dựa vào thông tin" end_anchor="đọc hiểu chung." />\n'
-        "Dựa vào thông tin sau đây để trả lời câu hỏi 1 và 2:\n"
-        "Đoạn văn đọc hiểu chung.\n\n"
+        "<stimulus>Dựa vào thông tin sau đây để trả lời câu hỏi 1 và 2:\n"
+        "Đoạn văn đọc hiểu chung.</stimulus>\n\n"
         "<question_label>**1.**</question_label> <stem>Câu hỏi 1?</stem>\n"
         "<option_label>A.</option_label> <option_text>Lựa chọn A</option_text>\n\n"
         "<question_label>**2.**</question_label> <stem>Câu hỏi 2?</stem>\n"
@@ -226,12 +225,11 @@ def test_self_closing_stimulus_anchor_tag_merging():
     ])
 
     assert remove_annotation_tags(result.merged_xml) == raw
-    assert '<stimulus id="stim_1" start_anchor="Dựa vào thông tin" end_anchor="đọc hiểu chung." />' in result.merged_xml
-    assert "</stimulus>" not in result.merged_xml
+    assert "<stimulus>Dựa vào thông tin sau đây để trả lời câu hỏi 1 và 2:\nĐoạn văn đọc hiểu chung.</stimulus>" in result.merged_xml
     assert len(result.structured_questions) == 2
-    assert result.structured_questions[0]["stimulus_id"] == "stim_1"
+    assert result.structured_questions[0]["stimulus_id"] is not None
     assert "Đoạn văn đọc hiểu chung." in result.structured_questions[0]["stimulus_text"]
-    assert result.structured_questions[1]["stimulus_id"] == "stim_1"
+    assert result.structured_questions[1]["stimulus_id"] == result.structured_questions[0]["stimulus_id"]
 
 
 def test_passthrough_tags_and_figures_not_flagged_as_malformed():
@@ -264,5 +262,66 @@ def test_passthrough_tags_and_figures_not_flagged_as_malformed():
 
     # The actual malformed split tag <option_la\nbel> MUST be flagged
     assert any("option_la" in err for err in errors)
+
+
+def test_math_inequalities_do_not_swallow_closing_tags_in_lexer():
+    from sequence_labelling.parser.long_parser.source_merger.xml_lexer import lex_annotations
+
+    xml = (
+        "<question_label>Bài 11:</question_label> <stem>Cho $2\\le x<5$.</stem>\n"
+        "<explanation>Ta có $(2;5)=\\{x\\in\\mathbb{R}\\mid 2<x<5\\}$ và $[2;5)=\\{x\\mid 2\\le x<5\\}$.</explanation>\n"
+        "<question_label>Bài 12:</question_label> <stem>Hỏi $x$?</stem>"
+    )
+    _, spans, report = lex_annotations(xml)
+    assert report["errors"] == []
+    expl = [s for s in spans if s.label == "explanation"]
+    assert len(expl) == 1
+    assert expl[0].is_valid is True
+    assert "Bài 12:" not in expl[0].text
+
+
+def test_snap_boundaries_protects_html_markup_and_rejects_huge_fuzzy_stretch():
+    raw = "<table><tr><td>**3.1**</td><td>Bạn An có một tấm tôn đều.</td></tr></table>\n" + ("Câu hỏi khác.\n" * 80) + "Đoạn cuối."
+    parsed = (
+        "<table><tr><td><explanation>**3.1**</explanation></td>"
+        "<td><explanation>> Bạn An có một tấm tôn đều.</explanation></td></tr></table>\n"
+        "<stem>Câu hỏi khác.</stem>"
+    )
+    res = merge_chunks([ChunkInput(index=0, original_text=raw, parsed_xml=parsed)])
+    assert remove_annotation_tags(res.merged_xml) == raw
+    assert "<td<" not in res.merged_xml
+    assert "</ce<" not in res.merged_xml
+
+
+def test_reconciler_prevents_explanation_overlap_and_nesting():
+    raw = (
+        "<question_label>Câu 1.</question_label> <stem>Đề 1.</stem>\n"
+        "Lời giải câu 1.\n"
+        "Câu 2. Đề 2.\n"
+        "Lời giải câu 2."
+    )
+    raw_plain = remove_annotation_tags(raw)
+    c0 = (
+        "<question_label>Câu 1.</question_label> <stem>Đề 1.</stem>\n"
+        "<explanation>Lời giải câu 1.\n"
+        "Câu 2. Đề 2.\n"
+        "Lời giải câu 2."  # intentionally unclosed
+    )
+    c1 = (
+        "<question_label>Câu 1.</question_label> <stem>Đề 1.</stem>\n"
+        "<explanation>Lời giải câu 1.</explanation>\n"
+        "<question_label>Câu 2.</question_label> <stem>Đề 2.</stem>\n"
+        "<explanation>Lời giải câu 2.</explanation>"
+    )
+    res = merge_chunks([
+        ChunkInput(index=0, original_text=raw_plain, parsed_xml=c0),
+        ChunkInput(index=1, original_text=raw_plain, parsed_xml=c1),
+    ])
+    assert remove_annotation_tags(res.merged_xml) == raw_plain
+    assert res.merged_xml.count("<explanation>") == 2
+    assert res.merged_xml.count("</explanation>") == 2
+    assert "<explanation>Lời giải câu 1.</explanation>" in res.merged_xml
+    assert "<question_label>Câu 2.</question_label>" in res.merged_xml
+
 
 
