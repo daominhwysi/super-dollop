@@ -97,9 +97,10 @@ def reconcile_candidates(
         if not label_spans:
             continue
 
-        if label in ("section", "stimulus"):
+        if label in ("section", "stimulus", "explanation"):
             label_spans.sort(
                 key=lambda s: (
+                    -s.structural_quality if label == "explanation" else 0.0,
                     -s.confidence,
                     -s.structural_quality,
                     s.start,
@@ -108,7 +109,79 @@ def reconcile_candidates(
             )
 
             accepted_label_spans: List[GlobalSpan] = []
+            blocking_spans = (
+                accepted_atomic_spans
+                if label in ("section", "stimulus")
+                else ([s for s in selected if not s.is_self_closing] if label == "explanation" else [])
+            )
             for candidate in label_spans:
+                if blocking_spans and not candidate.is_self_closing:
+                    swallows_other = False
+                    for other in blocking_spans:
+                        if not candidate.overlaps_with(other):
+                            continue
+                        ov_start = max(candidate.start, other.start)
+                        ov_end = min(candidate.end, other.end)
+                        ov_len = ov_end - ov_start
+                        # Trim tiny boundary punctuation/whitespace spillover against blocking element
+                        if ov_len <= 3 and candidate.start < other.start and candidate.end <= other.end:
+                            new_end = other.start
+                            while new_end > candidate.start and canonical_text[new_end - 1].isspace():
+                                new_end -= 1
+                            if new_end > candidate.start:
+                                candidate = replace(
+                                    candidate,
+                                    end=new_end,
+                                    text=canonical_text[candidate.start:new_end],
+                                )
+                                continue
+                        if ov_len <= 3 and other.start <= candidate.start and other.end < candidate.end:
+                            new_start = other.end
+                            while new_start < candidate.end and canonical_text[new_start].isspace():
+                                new_start += 1
+                            if new_start < candidate.end:
+                                candidate = replace(
+                                    candidate,
+                                    start=new_start,
+                                    text=canonical_text[new_start:candidate.end],
+                                )
+                                continue
+                        if label == "explanation" and candidate.start < other.start:
+                            # Clip trailing unclosed/overrunning explanation cleanly at next element
+                            new_end = other.start
+                            while new_end > candidate.start and canonical_text[new_end - 1].isspace():
+                                new_end -= 1
+                            conflict_reports.append({
+                                "type": "EXPLANATION_OVERLAP_CLIPPED",
+                                "label": label,
+                                "rejected": candidate,
+                                "accepted": other,
+                                "reason": f"Explanation clipped at {other.label} start ({other.start})",
+                            })
+                            if new_end > candidate.start:
+                                candidate = replace(
+                                    candidate,
+                                    end=new_end,
+                                    text=canonical_text[candidate.start:new_end],
+                                )
+                                continue
+                        swallows_other = True
+                        conflict_type = (
+                            "STIMULUS_ATOMIC_OVERLAP_CONFLICT"
+                            if label == "stimulus"
+                            else f"{label.upper()}_OVERLAP_CONFLICT"
+                        )
+                        conflict_reports.append({
+                            "type": conflict_type,
+                            "label": label,
+                            "rejected": candidate,
+                            "accepted": other,
+                            "reason": f"{label.capitalize()} overlaps {other.label} by {ov_len} chars",
+                        })
+                        break
+                    if swallows_other or candidate.end <= candidate.start:
+                        continue
+
                 overlaps = False
                 for accepted in accepted_label_spans:
                     if candidate.overlaps_with(accepted):

@@ -34,6 +34,106 @@ from model.inference.predict import (
 from model.module.head import EnhancedBertForTokenClassification
 
 
+def get_normalized_span_bounds(text: str, start: int, end: int) -> Tuple[int, int, str]:
+    """Returns character bounds stripped of leading and trailing whitespace."""
+    start = max(0, min(start, len(text)))
+    end = max(start, min(end, len(text)))
+    sub = text[start:end]
+    l_strip = len(sub) - len(sub.lstrip())
+    r_strip = len(sub) - len(sub.rstrip())
+    norm_start = start + l_strip
+    norm_end = end - r_strip
+    return norm_start, norm_end, sub.strip()
+
+
+def evaluate_normalized_exact_matching(
+    gold_spans: List[Dict[str, Any]],
+    pred_spans: List[Dict[str, Any]],
+    label: str,
+    raw_text: str
+) -> Tuple[int, int, int, int, int]:
+    """
+    Computes TP, FP, FN with whitespace-normalized exact character matching.
+    Both predicted and gold spans have leading/trailing whitespace stripped.
+    Requires exact norm_start == norm_start and norm_end == norm_end.
+    """
+    gold = [s for s in gold_spans if s.get("label") == label]
+    pred = [s for s in pred_spans if s.get("label") == label]
+
+    norm_gold = []
+    for g in gold:
+        ns, ne, nt = get_normalized_span_bounds(raw_text, g.get("start", 0), g.get("end", 0))
+        if nt:
+            norm_gold.append((ns, ne))
+
+    norm_pred = []
+    for p in pred:
+        ns, ne, nt = get_normalized_span_bounds(raw_text, p.get("start", 0), p.get("end", 0))
+        if nt:
+            norm_pred.append((ns, ne))
+
+    tp = 0
+    fp = 0
+    matched_gold = set()
+
+    for p_ns, p_ne in norm_pred:
+        matched_idx = None
+        for g_idx, (g_ns, g_ne) in enumerate(norm_gold):
+            if g_idx not in matched_gold:
+                if p_ns == g_ns and p_ne == g_ne:
+                    matched_idx = g_idx
+                    break
+        if matched_idx is not None:
+            tp += 1
+            matched_gold.add(matched_idx)
+        else:
+            fp += 1
+
+    fn = len(norm_gold) - tp
+    return tp, fp, fn, len(norm_gold), len(norm_pred)
+
+
+def evaluate_char_mask_metrics(
+    gold_spans: List[Dict[str, Any]],
+    pred_spans: List[Dict[str, Any]],
+    label: str,
+    text_len: int
+) -> Tuple[int, int, int, float, float, float, float]:
+    """
+    Computes character-level mask intersection, union, precision, recall, F1, and IoU.
+    Returns: (intersection, pred_chars, gold_chars, prec, rec, f1, iou)
+    """
+    gold = [s for s in gold_spans if s.get("label") == label]
+    pred = [s for s in pred_spans if s.get("label") == label]
+
+    gold_set = set()
+    for g in gold:
+        s = max(0, min(g.get("start", 0), text_len))
+        e = max(s, min(g.get("end", 0), text_len))
+        gold_set.update(range(s, e))
+
+    pred_set = set()
+    for p in pred:
+        s = max(0, min(p.get("start", 0), text_len))
+        e = max(s, min(p.get("end", 0), text_len))
+        pred_set.update(range(s, e))
+
+    inter = len(gold_set & pred_set)
+    union = len(gold_set | pred_set)
+    pred_len = len(pred_set)
+    gold_len = len(gold_set)
+
+    if pred_len == 0 and gold_len == 0:
+        return 0, 0, 0, 1.0, 1.0, 1.0, 1.0
+
+    prec = inter / pred_len if pred_len > 0 else 0.0
+    rec = inter / gold_len if gold_len > 0 else 0.0
+    f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    iou = inter / union if union > 0 else 0.0
+
+    return inter, pred_len, gold_len, prec, rec, f1, iou
+
+
 def evaluate_span_matching(
     gold_spans: List[Dict[str, Any]],
     pred_spans: List[Dict[str, Any]],
@@ -79,7 +179,7 @@ def calc_f1(tp: int, fp: int, fn: int) -> Tuple[float, float, float]:
 def check_zero_corruption(raw_text: str, xml_text: str) -> bool:
     """Invariant: strip_tags(xml_text) == raw_text exactly without single-char deviation."""
     tag_pattern = re.compile(
-        r"</?(?:question|question_label|stem|option_label|option_text|stimulus|section|explanation)(?:\s+[^>]*)?>"
+        r"</?(?:question|question_label|stem|option_label|option_text|stimulus|section|explanation)(?:\s+(?:[^>\"']|\"[^\"]*\"|'[^']*')*)?/?>"
     )
     stripped = tag_pattern.sub("", xml_text)
     return stripped == raw_text
@@ -96,14 +196,36 @@ def check_cloze_stemless_validity(xml_text: str) -> Tuple[bool, int]:
     return (not has_empty_stem), stemless_matches
 
 
+def _resolve_hf_cached_snapshot(model_dir: Optional[Path]) -> Optional[Path]:
+    """Resolves a Hugging Face cached model snapshot preferring refs/main."""
+    if model_dir and model_dir.exists() and (model_dir / "config.json").exists():
+        return model_dir
+    hf_repo = Path.home() / ".cache/huggingface/hub/models--daominhwysi--sealior-modernbert-vi-exam-seq-labeling"
+    snapshots_dir = hf_repo / "snapshots"
+    ref_main = hf_repo / "refs/main"
+    if ref_main.exists():
+        rev = ref_main.read_text(encoding="utf-8").strip()
+        cand = snapshots_dir / rev
+        if (cand / "config.json").exists():
+            return cand
+    if snapshots_dir.exists():
+        for cand in sorted(snapshots_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if (cand / "config.json").exists() and ((cand / "model.safetensors").exists() or (cand / "pytorch_model.bin").exists()):
+                return cand
+    return model_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Sequence Labelling Model against Gold Benchmark.")
     parser.add_argument("--config", type=str, default="configs/train_config.yaml", help="Path to config YAML")
-    parser.add_argument("--gold_set", type=str, default="data/benchmark_gold_set.json", help="Path to gold set JSON")
-    parser.add_argument("--model_path", type=str, default="results/sanity_check", help="Path to model checkpoint")
+    parser.add_argument("--gold_set", "--gold-set", "--gold-manifest", type=str, default="data/benchmark_gold_set.json", help="Path to gold set JSON")
+    parser.add_argument("--model_path", "--model-path", "--checkpoint", type=str, default="results/sanity_check", help="Path to model checkpoint")
     parser.add_argument("--device", type=str, default=None, help="Device (cpu or cuda)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of documents to evaluate")
     parser.add_argument("--use_det", action="store_true", help="Use deterministic parser directly")
+    parser.add_argument("--max-length", type=int, default=1024, help="Sliding window token length")
+    parser.add_argument("--stride", type=int, default=256, help="Sliding window stride")
+    parser.add_argument("--mask-latex", action="store_true", default=False, help="Mask LaTeX expressions before tokenization")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,6 +242,7 @@ def main():
     print("=" * 80)
     print(f"Gold Benchmark Set  : {gold_path}")
     print(f"Target Device       : {device}")
+    print(f"Inference Mode      : {'Deterministic' if args.use_det else f'Single-Pass Sliding Window (max_length={args.max_length}, stride={args.stride}, mask_latex={args.mask_latex})'}")
 
     # Load Gold Set
     gold_data = json.loads(gold_path.read_text(encoding="utf-8"))
@@ -130,6 +253,8 @@ def main():
 
     # Try loading model if checkpoint exists
     model_dir = Path(args.model_path) if args.model_path else None
+    model_dir = _resolve_hf_cached_snapshot(model_dir)
+
     model = None
     tokenizer = None
     id_to_tag = None
@@ -160,8 +285,14 @@ def main():
         ("section", 20),
         ("explanation", 20),
     ]
-    aggregate_counts = {lbl: {"tp": 0, "fp": 0, "fn": 0, "gold_cnt": 0, "pred_cnt": 0} for lbl, _ in labels_to_eval}
-    
+
+    # -------------------------------------------------------------------------
+    # SINGLE-PASS EVALUATION
+    # -------------------------------------------------------------------------
+    norm_counts = {lbl: {"tp": 0, "fp": 0, "fn": 0, "gold_cnt": 0, "pred_cnt": 0} for lbl, _ in labels_to_eval}
+    char_mask_counts = {lbl: {"inter": 0, "pred_chars": 0, "gold_chars": 0} for lbl, _ in labels_to_eval}
+    tolerant_counts = {lbl: {"tp": 0, "fp": 0, "fn": 0, "gold_cnt": 0, "pred_cnt": 0} for lbl, _ in labels_to_eval}
+
     zero_corruption_passes = 0
     cloze_valid_passes = 0
     total_stemless_cloze_items = 0
@@ -198,9 +329,9 @@ def main():
                 tokenizer=tokenizer,
                 id_to_tag=id_to_tag,
                 device=device,
-                max_length=1024,
-                stride=256,
-                mask_latex=True,
+                max_length=args.max_length,
+                stride=args.stride,
+                mask_latex=args.mask_latex,
                 use_viterbi=True
             )
             lat_ms = (time.perf_counter() - t0) * 1000
@@ -231,36 +362,108 @@ def main():
                 cloze_valid_passes += 1
             print(f"Done in {lat_ms:.1f}ms | ZC: {'PASS' if pred_zc and gold_zc else 'FAIL'} | Cloze: {'VALID' if pred_cloze_ok and gold_cloze_ok else 'FAIL'}")
 
-        # 3. Span matching evaluation
+        text_len = len(raw_text)
+
+        # 3. Multi-Metric Evaluation across all categories
         for lbl, tol in labels_to_eval:
-            tp, fp, fn, g_cnt, p_cnt = evaluate_span_matching(gold_spans, pred_spans, lbl, tolerance=tol)
-            aggregate_counts[lbl]["tp"] += tp
-            aggregate_counts[lbl]["fp"] += fp
-            aggregate_counts[lbl]["fn"] += fn
-            aggregate_counts[lbl]["gold_cnt"] += g_cnt
-            aggregate_counts[lbl]["pred_cnt"] += p_cnt
+            # 3A. Whitespace-Normalized Exact Matching
+            tp, fp, fn, g_cnt, p_cnt = evaluate_normalized_exact_matching(gold_spans, pred_spans, lbl, raw_text)
+            norm_counts[lbl]["tp"] += tp
+            norm_counts[lbl]["fp"] += fp
+            norm_counts[lbl]["fn"] += fn
+            norm_counts[lbl]["gold_cnt"] += g_cnt
+            norm_counts[lbl]["pred_cnt"] += p_cnt
+
+            # 3B. Character-Level Mask IoU & F1
+            inter, p_chars, g_chars, _, _, _, _ = evaluate_char_mask_metrics(gold_spans, pred_spans, lbl, text_len)
+            char_mask_counts[lbl]["inter"] += inter
+            char_mask_counts[lbl]["pred_chars"] += p_chars
+            char_mask_counts[lbl]["gold_chars"] += g_chars
+
+            # 3C. Boundary-Tolerant Matching (Legacy)
+            tp_tol, fp_tol, fn_tol, g_tol, p_tol = evaluate_span_matching(gold_spans, pred_spans, lbl, tolerance=tol)
+            tolerant_counts[lbl]["tp"] += tp_tol
+            tolerant_counts[lbl]["fp"] += fp_tol
+            tolerant_counts[lbl]["fn"] += fn_tol
+            tolerant_counts[lbl]["gold_cnt"] += g_tol
+            tolerant_counts[lbl]["pred_cnt"] += p_tol
 
     total_docs = len(latency_records)
     zc_rate = (zero_corruption_passes / max(1, total_docs)) * 100.0
     cloze_rate = (cloze_valid_passes / max(1, total_docs)) * 100.0
     avg_latency = float(np.mean(latency_records)) if latency_records else 0.0
 
-    print("=" * 80)
-    print("SPAN-LEVEL CLASSIFICATION PERFORMANCE RESULTS")
+    print("\n" + "=" * 80)
+    print("1. WHITESPACE-NORMALIZED EXACT MATCH (STRICT ZERO-TOLERANCE CONTENT MATCH)")
     print("=" * 80)
     print(f"{'Entity Label':<20} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10} | {'Support':<8}")
     print("-" * 80)
 
-    f1_list = []
+    norm_f1_list = []
     for lbl, _ in labels_to_eval:
-        data = aggregate_counts[lbl]
+        data = norm_counts[lbl]
         p, r, f1 = calc_f1(data["tp"], data["fp"], data["fn"])
-        f1_list.append(f1)
-        print(f"{lbl:<20} | {p*100:8.2f}% | {r*100:8.2f}% | {f1*100:8.2f}% | {data['gold_cnt']:<8}")
+        if data["gold_cnt"] > 0:
+            norm_f1_list.append(f1)
+            print(f"{lbl:<20} | {p*100:8.2f}% | {r*100:8.2f}% | {f1*100:8.2f}% | {data['gold_cnt']:<8}")
+        elif data["pred_cnt"] == 0:
+            print(f"{lbl:<20} | {'-':<10} | {'-':<10} | {'-':<10} | {data['gold_cnt']:<8}")
+        else:
+            norm_f1_list.append(0.0)
+            print(f"{lbl:<20} | {p*100:8.2f}% | {r*100:8.2f}% | {f1*100:8.2f}% | {data['gold_cnt']:<8}")
 
-    macro_f1 = float(np.mean(f1_list)) if f1_list else 0.0
+    norm_macro_f1 = float(np.mean(norm_f1_list)) if norm_f1_list else 0.0
     print("-" * 80)
-    print(f"{'Macro Average F1':<20} | {'-':<10} | {'-':<10} | {macro_f1*100:8.2f}% | {'-':<8}\n")
+    print(f"{'Macro Average F1':<20} | {'-':<10} | {'-':<10} | {norm_macro_f1*100:8.2f}% | {'-':<8}\n")
+
+    print("=" * 80)
+    print("2. CHARACTER-LEVEL MASK COVERAGE & IoU (CONTINUOUS TEXT BLOCKS)")
+    print("=" * 80)
+    print(f"{'Entity Label':<20} | {'Char-Prec':<10} | {'Char-Rec':<10} | {'Char-F1':<10} | {'Char-IoU':<10} | {'Gold Chars':<10}")
+    print("-" * 80)
+
+    for lbl, _ in labels_to_eval:
+        cdata = char_mask_counts[lbl]
+        inter = cdata["inter"]
+        p_len = cdata["pred_chars"]
+        g_len = cdata["gold_chars"]
+        union = p_len + g_len - inter
+
+        if g_len == 0 and p_len == 0:
+            print(f"{lbl:<20} | {'-':<10} | {'-':<10} | {'-':<10} | {'-':<10} | {g_len:<10}")
+            continue
+
+        cp = inter / p_len if p_len > 0 else 0.0
+        cr = inter / g_len if g_len > 0 else 0.0
+        cf1 = (2 * cp * cr / (cp + cr)) if (cp + cr) > 0 else 0.0
+        ciou = inter / union if union > 0 else 0.0
+
+        print(f"{lbl:<20} | {cp*100:8.2f}% | {cr*100:8.2f}% | {cf1*100:8.2f}% | {ciou*100:8.2f}% | {g_len:<10}")
+
+    print("-" * 80 + "\n")
+
+    print("=" * 80)
+    print("3. BOUNDARY-TOLERANT SPAN F1 (LEGACY WINDOW TOLERANCE)")
+    print("=" * 80)
+    print(f"{'Entity Label':<20} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10} | {'Tol (chars)':<12}")
+    print("-" * 80)
+
+    tol_f1_list = []
+    for lbl, tol in labels_to_eval:
+        data = tolerant_counts[lbl]
+        p, r, f1 = calc_f1(data["tp"], data["fp"], data["fn"])
+        if data["gold_cnt"] > 0:
+            tol_f1_list.append(f1)
+            print(f"{lbl:<20} | {p*100:8.2f}% | {r*100:8.2f}% | {f1*100:8.2f}% | ±{tol:<10}")
+        elif data["pred_cnt"] == 0:
+            print(f"{lbl:<20} | {'-':<10} | {'-':<10} | {'-':<10} | ±{tol:<10}")
+        else:
+            tol_f1_list.append(0.0)
+            print(f"{lbl:<20} | {p*100:8.2f}% | {r*100:8.2f}% | {f1*100:8.2f}% | ±{tol:<10}")
+
+    tol_macro_f1 = float(np.mean(tol_f1_list)) if tol_f1_list else 0.0
+    print("-" * 80)
+    print(f"{'Macro Average F1':<20} | {'-':<10} | {'-':<10} | {tol_macro_f1*100:8.2f}% | {'-':<12}\n")
 
     print("=" * 80)
     print("ARCHITECTURAL INVARIANT COMPLIANCE AUDIT")

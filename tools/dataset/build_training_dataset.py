@@ -29,8 +29,7 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_DIR))
 
 from sequence_labelling.annotator.annotate_ocr import parse_xml_annotations
-from sequence_labelling.annotator.anchor_helper import AnchorHelper
-from model.module.dataset import get_tag_mappings, normalize_bio_tag
+from model.module.dataset import get_tag_mappings, normalize_bio_tag, EXAM_SPECIAL_TOKENS, classify_latex
 from synthetic_exam_generator.reconstructor import (
     reconstruct_exam,
     spans_to_xml,
@@ -68,14 +67,6 @@ def load_gold_set_exclusion(gold_path: Path) -> set:
     except Exception as e:
         print(f"Error loading gold set exclusion: {e}")
         return set()
-
-
-def expand_stimulus_anchors(xml_content: str) -> str:
-    """
-    Expands compact self-closing stimulus anchors into full paired XML tags
-    using the canonical AnchorHelper implementation.
-    """
-    return AnchorHelper.expand_stimulus_anchors(xml_content)
 
 
 # Atomic token pattern protecting special tokens, math types, words, and symbols
@@ -400,7 +391,8 @@ def augment_real_document(
     latex_vary_delimiters_prob: float = 0.10,
     flatten_newlines_prob: float = 0.20,
     newline_to_space_prob: float = 0.20,
-    tab_to_space: bool = True
+    tab_to_space: bool = True,
+    use_typed_latex: bool = False,
 ) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
     """
     Safely applies whitespace compression/jitter, tab normalization to space,
@@ -449,7 +441,10 @@ def augment_real_document(
         if i in latex_lookup:
             start_m, end_m, formula = latex_lookup[i]
             if latex_mask_prob > 0.0 and rng.random() < latex_mask_prob:
-                replacement = latex_placeholder
+                if use_typed_latex and rng.random() < 0.80:
+                    replacement = classify_latex(formula)
+                else:
+                    replacement = latex_placeholder
             elif latex_vary_delimiters_prob > 0.0 and rng.random() < latex_vary_delimiters_prob:
                 inner = formula[1:-1].strip()
                 replacement = f"\\( {inner} \\)"
@@ -635,7 +630,6 @@ def process_real_annotated_documents(
 
                 try:
                     xml_content = c_xml_path.read_text(encoding="utf-8")
-                    xml_content = expand_stimulus_anchors(xml_content)
                     raw_text, spans = parse_xml_annotations(xml_content)
                     if not raw_text.strip() or not spans:
                         continue
@@ -659,7 +653,8 @@ def process_real_annotated_documents(
                             latex_mask_prob=latex_mask_prob,
                             flatten_newlines_prob=flatten_newlines_prob,
                             newline_to_space_prob=0.20,
-                            tab_to_space=True
+                            tab_to_space=True,
+                            use_typed_latex=True,
                         )
                         if aug_res is not None:
                             aug_text, aug_spans = aug_res
@@ -691,7 +686,6 @@ def process_real_annotated_documents(
                     continue
 
                 xml_content = xml_file.read_text(encoding="utf-8")
-                xml_content = expand_stimulus_anchors(xml_content)
                 raw_text, spans = parse_xml_annotations(xml_content)
                 if not raw_text.strip() or not spans:
                     continue
@@ -714,7 +708,8 @@ def process_real_annotated_documents(
                         latex_mask_prob=latex_mask_prob,
                         flatten_newlines_prob=flatten_newlines_prob,
                         newline_to_space_prob=0.20,
-                        tab_to_space=True
+                        tab_to_space=True,
+                        use_typed_latex=True,
                     )
                     if aug_res is not None:
                         aug_text, aug_spans = aug_res
@@ -836,7 +831,6 @@ def process_gold_benchmark_documents(
             continue
         try:
             xml_content = xml_file.read_text(encoding="utf-8")
-            xml_content = expand_stimulus_anchors(xml_content)
             raw_text, spans = parse_xml_annotations(xml_content)
             if not raw_text.strip() or not spans:
                 continue
@@ -1020,9 +1014,16 @@ def main():
     )
     parser.add_argument(
         "--pretokenize",
+        dest="pretokenize",
         action="store_true",
-        default=False,
-        help="Pre-tokenize chunks using SEA-LION-ModernBERT tokenizer into input_ids, attention_mask, and labels for zero CPU training latency"
+        default=True,
+        help="Pre-tokenize chunks using SEA-LION-ModernBERT tokenizer into input_ids, attention_mask, and labels for zero CPU training latency (default: enabled)"
+    )
+    parser.add_argument(
+        "--no-pretokenize",
+        dest="pretokenize",
+        action="store_false",
+        help="Disable pre-tokenization and export raw text/spans only"
     )
     parser.add_argument(
         "--tokenizer-name",
@@ -1236,7 +1237,7 @@ def main():
         from transformers import AutoTokenizer
         print(f"\nInitializing tokenizer '{args.tokenizer_name}' for pre-tokenization...")
         hf_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
-        special_tokens = ["<blank />", "<blank/>", "[BLANK]", "[LATEX]"]
+        special_tokens = list(EXAM_SPECIAL_TOKENS)
         hf_tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
 
     tag_priority = {

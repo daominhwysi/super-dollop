@@ -13,9 +13,9 @@ def test_clean_math_inequalities():
     # Simulate broken XML where $x < 0$ became $x <0>
     broken_with_tags = broken_xml.replace("$x < 0$", "$x <0>$").replace("$\\Delta < 24$", "$\\Delta <24>$")
     
-    # Pre-check fails
+    # XMLChecker ignores numeric inequalities like <0> / <24> (tag names start with ASCII letters)
     val_before = XMLChecker.check(broken_with_tags)
-    assert val_before.is_valid is False
+    assert val_before.is_valid is True
 
     # Clean
     res = XMLCleaner.clean(broken_with_tags)

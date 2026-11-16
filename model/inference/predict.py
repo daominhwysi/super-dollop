@@ -100,6 +100,10 @@ def build_tagged_xml(raw_text: str, segments: List[Dict[str, Any]]) -> str:
             if start > cursor:
                 result.append(raw_text[cursor:start])
             sub_text = raw_text[start:end]
+            if not sub_text.strip():
+                result.append(sub_text)
+                cursor = end
+                continue
             result.append(f"<{label}>{sub_text}</{label}>")
             cursor = end
         else:
@@ -171,6 +175,58 @@ def generate_hann_window(chunk_len: int) -> torch.Tensor:
     return torch.clamp(window, min=0.1, max=1.0)
 
 
+def _tokenizer_supports_typed_latex(tokenizer: Any) -> bool:
+    """Checks whether the tokenizer has dedicated typed [MATH_*] special tokens."""
+    try:
+        vocab = tokenizer.get_vocab() if callable(getattr(tokenizer, "get_vocab", None)) else {}
+        return isinstance(vocab, dict) and "[MATH_CALC]" in vocab
+    except Exception:
+        return False
+
+
+def _protect_figure_tokens(clean_text: str, token_predictions: List[Dict[str, Any]]) -> None:
+    """
+    Ensures self-closing <figure .../> tags are treated as atomic units so BIO
+    tag transitions can never open or close an XML annotation inside a figure tag.
+    """
+    if not token_predictions:
+        return
+    figure_pattern = re.compile(r"<figure\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*/>")
+    for match in figure_pattern.finditer(clean_text):
+        fig_start, fig_end = match.span()
+        fig_idxs = [
+            idx for idx, tok in enumerate(token_predictions)
+            if tok["end"] > fig_start and tok["start"] < fig_end
+        ]
+        if not fig_idxs:
+            continue
+
+        prev_tag = token_predictions[fig_idxs[0] - 1]["tag"] if fig_idxs[0] > 0 else "O"
+        prev_lbl = prev_tag[2:] if prev_tag.startswith(("B-", "I-")) else "O"
+        next_tag = token_predictions[fig_idxs[-1] + 1]["tag"] if fig_idxs[-1] + 1 < len(token_predictions) else "O"
+        next_lbl = next_tag[2:] if next_tag.startswith(("B-", "I-")) else "O"
+
+        if prev_lbl != "O" and prev_lbl == next_lbl:
+            chosen_lbl = prev_lbl
+        else:
+            char_votes: Dict[str, int] = {}
+            for idx in fig_idxs:
+                tok = token_predictions[idx]
+                t = tok["tag"]
+                lbl = t[2:] if t.startswith(("B-", "I-")) else "O"
+                overlap = min(tok["end"], fig_end) - max(tok["start"], fig_start)
+                char_votes[lbl] = char_votes.get(lbl, 0) + max(1, overlap)
+            chosen_lbl = max(char_votes.items(), key=lambda kv: kv[1])[0]
+
+        for offset_i, idx in enumerate(fig_idxs):
+            if chosen_lbl == "O":
+                token_predictions[idx]["tag"] = "O"
+            elif offset_i == 0 and prev_lbl != chosen_lbl:
+                token_predictions[idx]["tag"] = f"B-{chosen_lbl}"
+            else:
+                token_predictions[idx]["tag"] = f"I-{chosen_lbl}"
+
+
 def predict_text(
     text: str,
     model: Any,
@@ -182,7 +238,7 @@ def predict_text(
     batch_size: int = 8,
     mask_latex: bool = False,
     use_viterbi: bool = True,
-    use_typed_latex: bool = True,
+    use_typed_latex: Optional[bool] = None,
     ignore_section: bool = False
 ) -> Dict[str, Any]:
     """
@@ -192,6 +248,9 @@ def predict_text(
     device = torch.device(device)
     model.eval()
     clean_text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    if use_typed_latex is None:
+        use_typed_latex = _tokenizer_supports_typed_latex(tokenizer)
     
     if mask_latex:
         from model.module.dataset import classify_latex
@@ -365,6 +424,9 @@ def predict_text(
                 else:
                     curr_tok["tag"] = "O"
 
+    # Protect <figure .../> elements as atomic spans (no XML boundary splits inside <figure .../>)
+    _protect_figure_tokens(clean_text, token_predictions)
+
     # Group BIO tokens into entity segments
     segments = []
     current_seg: Optional[Dict[str, Any]] = None
@@ -485,13 +547,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for sliding window chunks")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-viterbi", action="store_true", default=False, help="Disable Constrained Viterbi decoding and use naive argmax")
+    parser.add_argument("--mask-latex", action="store_true", default=False, help="Mask LaTeX expressions before tokenization")
     args = parser.parse_args()
 
     input_text = args.text
     if not input_text and args.file:
         input_text = Path(args.file).read_text(encoding="utf-8")
     if not input_text:
-        input_text = "Câu 1: Cho hàm số $y = f(x)$. Giá trị nhỏ nhất là?\nA. 1\nB. 2\nC. 3\nD. 4"
+        input_text = "Câu 1: Cho hàm số $y = f(x)$. Giá trị nhỏ nhất là?\\nA. 1\\nB. 2\\nC. 3\\nD. 4"
 
     print(f"Loading model and tokenizer from '{args.model_dir}'...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
@@ -514,6 +577,7 @@ def main():
         max_length=args.max_length,
         stride=args.stride,
         batch_size=args.batch_size,
+        mask_latex=args.mask_latex,
         use_viterbi=not args.no_viterbi
     )
 

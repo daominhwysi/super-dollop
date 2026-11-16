@@ -32,7 +32,6 @@ from sequence_labelling.config import (
     get_provider_api_key,
 )
 from sequence_labelling.parser.long_parser.parser_agent_worker import ParserAgentWorker
-from sequence_labelling.annotator.xml_cleaner import XMLCleaner
 from sequence_labelling.annotator.reviewer import AnnotationReviewerAgent
 from tools.review.edit_review_set import reconcile_repaired_exam
 
@@ -254,8 +253,7 @@ def main() -> None:
             if not raw_xml.strip():
                 raise ValueError("Parser returned empty raw_xml output")
 
-            clean_res = XMLCleaner.clean(raw_xml)
-            cleaned_xml = clean_res.cleaned_xml
+            cleaned_xml = raw_xml
 
             # Write updated XML
             xml_path.write_text(cleaned_xml, encoding="utf-8")

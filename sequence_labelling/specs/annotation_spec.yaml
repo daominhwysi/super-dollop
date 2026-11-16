@@ -19,17 +19,15 @@ tags:
       - "NEVER wrap administrative metadata (SỞ GD&ĐT, TRƯỜNG THPT, MÃ ĐỀ: 101, --- HẾT ---) -> plain text"
 
   stimulus:
-    type: self_closing_anchor
-    format: '<stimulus id="{id}" start_anchor="{start_anchor}" end_anchor="{end_anchor}" />'
+    type: paired
+    format: '<stimulus>...</stimulus>'
     description: "Shared reading passages, datasets, or context prompts serving 2 OR MORE questions"
-    attributes:
-      id: "stim_N"
-      start_anchor: "first 3-10 verbatim words"
-      end_anchor: "last 3-10 verbatim words, including citation if present"
     rules:
+      - "MUST be paired <stimulus>...</stimulus> wrapping verbatim shared passage text"
       - "Applies ONLY if shared by 2 OR MORE questions"
       - "Single-question context belongs directly inside that question's <stem>"
       - "NEVER wrap other system tags (stem, question_label, option_label, option_text, explanation)"
+      - "NEVER wrap page metadata, watermarks, website URLs, or empty boilerplate"
       - "Sentence arrangement questions (Dear Minh, a. b. c.) must stay in <stem>, NEVER <stimulus>"
 
   question_label:

@@ -48,14 +48,14 @@ def test_editor_keeps_history_and_reviewer_is_stateless() -> None:
     responses = iter(
         [
             """<<<<<<< SEARCH
-<stem>Bad</stem>
+<section>Sample text</section>
 =======
-<stem>Better</stem>
+Sample text
 >>>>>>> REPLACE""",
             """<<<<<<< SEARCH
-<stem>Better</stem>
+Sample text
 =======
-<stem>Correct</stem>
+<stem>Sample text</stem>
 >>>>>>> REPLACE""",
         ]
     )
@@ -75,15 +75,15 @@ def test_editor_keeps_history_and_reviewer_is_stateless() -> None:
         editor=EditorAgent(), reviewer=reviewer, max_rounds=3
     )
     result = loop.run(
-        annotated_xml="<stem>Bad</stem>",
-        raw_ocr_text="Correct",
+        annotated_xml="<section>Sample text</section>",
+        raw_ocr_text="Sample text",
         doc_id="exam_1",
         editor_completion_fn=complete,
     )
 
     assert result.success is True
     assert result.rounds_completed == 2
-    assert result.repaired_xml == "<stem>Correct</stem>"
+    assert result.repaired_xml == "<stem>Sample text</stem>"
     assert len(editor_calls[0]) == 2
     assert len(editor_calls[1]) == 4
     assert "Still incorrect" in editor_calls[1][-1]["content"]
@@ -97,21 +97,21 @@ def test_editor_keeps_history_and_reviewer_is_stateless() -> None:
             "doc_id",
             "use_llm",
         }
-        assert call.kwargs["raw_ocr_text"] == "Correct"
+        assert call.kwargs["raw_ocr_text"] == "Sample text"
 
 
 def test_loop_returns_highest_scoring_version_at_round_limit() -> None:
     responses = iter(
         [
             """<<<<<<< SEARCH
-<stem>Bad</stem>
+<section>Sample text</section>
 =======
-<stem>Best</stem>
+<stem>Sample text</stem>
 >>>>>>> REPLACE""",
             """<<<<<<< SEARCH
-<stem>Best</stem>
+<stem>Sample text</stem>
 =======
-<stem>Worse</stem>
+<option_text>Sample text</option_text>
 >>>>>>> REPLACE""",
         ]
     )
@@ -127,14 +127,14 @@ def test_loop_returns_highest_scoring_version_at_round_limit() -> None:
     )
 
     result = loop.run(
-        annotated_xml="<stem>Bad</stem>",
-        raw_ocr_text="Best",
+        annotated_xml="<section>Sample text</section>",
+        raw_ocr_text="Sample text",
         editor_completion_fn=lambda **_: next(responses),
     )
 
     assert result.success is False
     assert result.final_score == 82
-    assert result.repaired_xml == "<stem>Best</stem>"
+    assert result.repaired_xml == "<stem>Sample text</stem>"
     assert result.rounds_completed == 2
 
 
@@ -142,14 +142,14 @@ def test_loop_prefers_valid_candidate_over_high_score_discard() -> None:
     responses = iter(
         [
             """<<<<<<< SEARCH
-<stem>Bad</stem>
+<section>Sample text</section>
 =======
-<stem>Critical Broken</stem>
+<option_text>Sample text</option_text>
 >>>>>>> REPLACE""",
             """<<<<<<< SEARCH
-<stem>Critical Broken</stem>
+<section>Sample text</section>
 =======
-<stem>Fixed Quality</stem>
+<stem>Sample text</stem>
 >>>>>>> REPLACE""",
         ]
     )
@@ -167,15 +167,15 @@ def test_loop_prefers_valid_candidate_over_high_score_discard() -> None:
     )
 
     result = loop.run(
-        annotated_xml="<stem>Bad</stem>",
-        raw_ocr_text="Fixed Quality",
+        annotated_xml="<section>Sample text</section>",
+        raw_ocr_text="Sample text",
         editor_completion_fn=lambda **_: next(responses),
     )
 
     # Must prefer Round 2 (NEEDS_REVISION at 80.0) over Round 1 (DISCARD at 87.0)
     assert result.final_decision == ReviewDecision.NEEDS_REVISION.value
     assert result.final_score == 80
-    assert result.repaired_xml == "<stem>Fixed Quality</stem>"
+    assert result.repaired_xml == "<stem>Sample text</stem>"
 
 
 def test_loop_does_not_send_unconfirmed_findings_to_editor() -> None:
@@ -234,9 +234,9 @@ def test_loop_directly_consumes_prerun_initial_report() -> None:
     prerun_report = _report(65, ReviewDecision.NEEDS_REVISION, "Prerun error finding", confirmed=True)
 
     patch_response = """<<<<<<< SEARCH
-<stem>Original</stem>
+<section>Original</section>
 =======
-<stem>Repaired</stem>
+<stem>Original</stem>
 >>>>>>> REPLACE"""
 
     reviewer = Mock(spec=AnnotationReviewerAgent)
@@ -253,7 +253,7 @@ def test_loop_directly_consumes_prerun_initial_report() -> None:
 
     loop = EditorReviewerLoop(editor=EditorAgent(), reviewer=reviewer, max_rounds=2)
     result = loop.run(
-        annotated_xml="<stem>Original</stem>",
+        annotated_xml="<section>Original</section>",
         raw_ocr_text="Original",
         doc_id="exam_prerun",
         editor_completion_fn=complete,
@@ -263,14 +263,14 @@ def test_loop_directly_consumes_prerun_initial_report() -> None:
     # Reviewer must only be called for Round 1 candidate check, NOT Round 0
     assert reviewer.review_document.call_count == 1
     call_args = reviewer.review_document.call_args
-    assert call_args.kwargs.get("xml_content") == "<stem>Repaired</stem>"
+    assert call_args.kwargs.get("xml_content") == "<stem>Original</stem>"
 
     # Editor must have received the prerun error finding
     assert any("Prerun error finding" in p for p in editor_prompts)
     assert result.success is True
     assert result.initial_score == 65.0
     assert result.final_score == 95.0
-    assert result.repaired_xml == "<stem>Repaired</stem>"
+    assert result.repaired_xml == "<stem>Original</stem>"
 
 
 def test_loop_initial_report_already_pass_skips_all_calls() -> None:
@@ -307,14 +307,14 @@ def test_loop_consumes_cached_llm_result_on_round_0() -> None:
     ]
 
     patch_response = """<<<<<<< SEARCH
-<stem>Original</stem>
+<section>Original</section>
 =======
-<stem>Fixed</stem>
+<stem>Original</stem>
 >>>>>>> REPLACE"""
 
     loop = EditorReviewerLoop(editor=EditorAgent(), reviewer=reviewer, max_rounds=2)
     result = loop.run(
-        annotated_xml="<stem>Original</stem>",
+        annotated_xml="<section>Original</section>",
         raw_ocr_text="Original",
         editor_completion_fn=lambda **_: patch_response,
         cached_llm_result=cached_llm,
@@ -340,14 +340,14 @@ def test_loop_emits_initial_and_round_checkpoints() -> None:
         _report(95, ReviewDecision.PASS),
     ]
     patch_response = """<<<<<<< SEARCH
-<stem>Original</stem>
+<section>Original</section>
 =======
-<stem>Fixed</stem>
+<stem>Original</stem>
 >>>>>>> REPLACE"""
 
     loop = EditorReviewerLoop(editor=EditorAgent(), reviewer=reviewer, max_rounds=1)
     result = loop.run(
-        annotated_xml="<stem>Original</stem>",
+        annotated_xml="<section>Original</section>",
         raw_ocr_text="Original",
         doc_id="exam_checkpoint",
         editor_completion_fn=lambda **_: patch_response,
@@ -356,7 +356,7 @@ def test_loop_emits_initial_and_round_checkpoints() -> None:
 
     assert result.success is True
     assert [item["stage"] for item in checkpoints] == ["initial_review", "round"]
-    assert checkpoints[0]["candidate_xml"] == "<stem>Original</stem>"
-    assert checkpoints[1]["candidate_xml"] == "<stem>Fixed</stem>"
+    assert checkpoints[0]["candidate_xml"] == "<section>Original</section>"
+    assert checkpoints[1]["candidate_xml"] == "<stem>Original</stem>"
     assert checkpoints[1]["round_number"] == 1
     assert checkpoints[1]["review"]["decision"] == "PASS"

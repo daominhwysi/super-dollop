@@ -18,7 +18,7 @@ def valid_exam_xml():
 - <option_label>D.</option_label> <option_text>$(0;0;3)$.</option_text>
 <explanation>Tọa độ hình chiếu của điểm $A$ lên mặt phẳng $(Oxy)$ là $(1;2;0)$.</explanation>
 
-<stimulus id="stim_1" start_anchor="Dựa vào đoạn tư liệu sau" end_anchor="trả lời các câu hỏi 2 và 3." />
+<stimulus>Dựa vào đoạn tư liệu sau để trả lời các câu hỏi 2 và 3.</stimulus>
 
 <question_label>**Câu 2.**</question_label> <stem>Dựa vào bảng số liệu sau:
 <table>
@@ -213,4 +213,17 @@ def test_xml_checker_strictly_enforces_system_tags():
     assert res.is_valid is False
     assert res.has_unclosed_tags is True
     assert any(i.tag_name == "stem" and i.issue_type == "unclosed_tag" for i in res.issues)
+
+
+def test_xml_checker_math_inequalities_not_swallowing_closing_tags():
+    xml = (
+        '<option_label>A.</option_label> <option_text>$f(x)<0 \\text{ } \\forall x \\in(0 ;+\\infty)$.</option_text> '
+        '<option_label>B.</option_label> <option_text>$\\begin{cases} x+3y-1>0 \\\\ 5x-2y^3+4<0 \\end{cases}$</option_text>'
+    )
+    res = XMLChecker.check(xml)
+    assert res.is_valid is True
+    assert res.has_unclosed_tags is False
+    assert res.has_mismatched_tags is False
+    assert res.has_unknown_tags is False
+    assert len(res.issues) == 0
 

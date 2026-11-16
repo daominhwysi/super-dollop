@@ -40,12 +40,42 @@ from sequence_labelling.annotator.reviewer import (
     ReviewDecision,
     ReviewReport,
 )
-from sequence_labelling.annotator.xml_cleaner import XMLCleaner
+from sequence_labelling.annotator.ocr_document import strip_page_markup
 from sequence_labelling.parser.long_parser.anchored_xml_llm_parser import (
     STABLE_XML_PARSER_SYSTEM_PROMPT_TEMPLATE,
 )
+from sequence_labelling.parser.long_parser.source_merger.serializer_validator import (
+    remove_annotation_tags,
+)
 
 logger = logging.getLogger(__name__)
+
+DIFF_SENTINEL_LINE_RE = re.compile(
+    r"^\s*(?:<{5,9}(?:\s*SEARCH\b.*)?|={5,9}|>{5,9}(?:\s*REPLACE\b.*)?)\s*$",
+    re.MULTILINE,
+)
+
+
+def contains_diff_sentinel(text: str) -> bool:
+    """Returns True if text contains Search/Replace or merge conflict marker lines."""
+    if not text:
+        return False
+    return bool(DIFF_SENTINEL_LINE_RE.search(text))
+
+
+def _strip_all_markup_for_verbatim(xml_text: str) -> str:
+    """Strips annotation, prohibited page, think, and sentinel markup for verbatim parity."""
+    text = re.sub(r"<page_metadata>[\s\S]*?</page_metadata>", "", xml_text, flags=re.IGNORECASE)
+    text = re.sub(r"</?(?:pages?|page_metadata|think)(?:\s+[^>]*)?>", "", text, flags=re.IGNORECASE)
+    text = text.replace("<|END|>", "")
+    text = remove_annotation_tags(text)
+    text = strip_page_markup(text)
+    return "".join(text.split())
+
+
+def verbatim_preserved(before_xml: str, after_xml: str) -> bool:
+    """Verifies that patching altered only XML tags/whitespace without mutating source characters."""
+    return _strip_all_markup_for_verbatim(before_xml) == _strip_all_markup_for_verbatim(after_xml)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +122,12 @@ class SearchReplacePatcher:
             search_content = search_content.replace("<|END|>", "").rstrip("\r\n")
             replace_content = replace_content.replace("<|END|>", "").rstrip("\r\n")
 
+            if contains_diff_sentinel(search_content) or contains_diff_sentinel(replace_content):
+                logger.warning(
+                    "[SearchReplacePatcher] Rejected malformed diff block containing nested conflict/sentinel markers."
+                )
+                continue
+
             if search_content.strip():
                 blocks.append(
                     SearchReplaceBlock(
@@ -131,45 +167,6 @@ class SearchReplacePatcher:
         return None
 
     @classmethod
-    def _apply_head_tail_anchor_replace(
-        cls, doc_text: str, search_str: str, replace_str: str
-    ) -> Optional[str]:
-        """
-        For multi-line search blocks (>= 3 lines), anchors on the first line and
-        last line to identify the replacement span, verifying high sequence similarity
-        (>= 70%) to avoid false replacements.
-        """
-        lines = [l.strip() for l in search_str.splitlines() if l.strip()]
-        if len(lines) < 3:
-            return None
-
-        head = lines[0]
-        tail = lines[-1]
-
-        if len(head) < 8 or len(tail) < 8:
-            return None
-
-        head_idx = -1
-        while True:
-            head_idx = doc_text.find(head, head_idx + 1)
-            if head_idx == -1:
-                break
-
-            tail_search_start = head_idx + len(head)
-            tail_search_end = min(len(doc_text), head_idx + len(search_str) + 800)
-            tail_idx = doc_text.find(tail, tail_search_start, tail_search_end)
-
-            if tail_idx != -1:
-                end_pos = tail_idx + len(tail)
-                candidate_span = doc_text[head_idx:end_pos]
-
-                ratio = difflib.SequenceMatcher(None, candidate_span, search_str).ratio()
-                if ratio >= 0.70:
-                    return doc_text[:head_idx] + replace_str + doc_text[end_pos:]
-
-        return None
-
-    @classmethod
     def apply_blocks(
         cls, original_text: str, blocks: List[SearchReplaceBlock]
     ) -> Tuple[str, int, List[str]]:
@@ -188,6 +185,15 @@ class SearchReplacePatcher:
         current_text = original_text
         applied_count = 0
         failed_reasons: List[str] = []
+
+        # Reject blocks carrying residual conflict/diff markers upfront
+        for idx, block in enumerate(blocks, start=1):
+            if contains_diff_sentinel(block.search_text) or contains_diff_sentinel(block.replace_text):
+                failed_reasons.append(
+                    f"Block #{idx} rejected: contains residual diff/conflict markers."
+                )
+        if failed_reasons:
+            return original_text, 0, failed_reasons
 
         # Strategy 1: Attempt bottom-up non-overlapping application
         located_spans: List[Tuple[int, int, int, SearchReplaceBlock]] = []
@@ -237,58 +243,44 @@ class SearchReplacePatcher:
                 applied_count += 1
                 continue
 
-            # Level 2: Line-trimmed normalized match (strip trailing spaces per line)
+            # Level 2: Line-trimmed normalized match (must be unambiguous)
             search_lines = [line.rstrip() for line in search_str.splitlines()]
-            normalized_search = "\n".join(search_lines)
-
             doc_lines = [line.rstrip() for line in current_text.splitlines()]
-            normalized_doc = "\n".join(doc_lines)
+            line_matches = [
+                i
+                for i in range(len(doc_lines) - len(search_lines) + 1)
+                if doc_lines[i : i + len(search_lines)] == search_lines
+            ]
+            if len(line_matches) > 1:
+                snippet = search_str[:80].replace("\n", " ")
+                failed_reasons.append(
+                    f"Block #{idx} line-trimmed SEARCH block is ambiguous ({len(line_matches)} matches): '{snippet}...'"
+                )
+                continue
+            if len(line_matches) == 1:
+                start_line_idx = line_matches[0]
+                orig_raw_lines = current_text.splitlines(keepends=True)
+                end_line_idx = start_line_idx + len(search_lines)
 
-            if normalized_search in normalized_doc:
-                start_line_idx = -1
-                for i in range(len(doc_lines) - len(search_lines) + 1):
-                    if doc_lines[i : i + len(search_lines)] == search_lines:
-                        start_line_idx = i
-                        break
+                rep_lines = [line + "\n" for line in replace_str.splitlines()]
+                if rep_lines and not replace_str.endswith("\n"):
+                    rep_lines[-1] = rep_lines[-1].rstrip("\n")
 
-                if start_line_idx != -1:
-                    orig_raw_lines = current_text.splitlines(keepends=True)
-                    end_line_idx = start_line_idx + len(search_lines)
+                patched_lines = (
+                    orig_raw_lines[:start_line_idx]
+                    + rep_lines
+                    + orig_raw_lines[end_line_idx:]
+                )
+                current_text = "".join(patched_lines)
+                applied_count += 1
+                continue
 
-                    rep_lines = [line + "\n" for line in replace_str.splitlines()]
-                    if rep_lines and not replace_str.endswith("\n"):
-                        rep_lines[-1] = rep_lines[-1].rstrip("\n")
-
-                    patched_lines = (
-                        orig_raw_lines[:start_line_idx]
-                        + rep_lines
-                        + orig_raw_lines[end_line_idx:]
-                    )
-                    current_text = "".join(patched_lines)
-                    applied_count += 1
-                    continue
-
-            # Level 3: Fuzzy character-mapped normalized whitespace match
+            # Level 3: Fuzzy character-mapped normalized whitespace match (unique match only)
             fuzzy_patched = cls._apply_fuzzy_whitespace_replace(
                 current_text, search_str, replace_str
             )
             if fuzzy_patched is not None:
                 current_text = fuzzy_patched
-                applied_count += 1
-                continue
-
-            # Level 4: Head & Tail anchor match for multi-line blocks
-            head_tail_patched = cls._apply_head_tail_anchor_replace(
-                current_text, search_str, replace_str
-            )
-            if head_tail_patched is not None:
-                current_text = head_tail_patched
-                applied_count += 1
-                continue
-
-            # Level 5: Redundancy guard: check if replace_str is already present
-            clean_rep = replace_str.strip()
-            if clean_rep and clean_rep in current_text:
                 applied_count += 1
                 continue
 
@@ -324,8 +316,9 @@ class SearchReplacePatcher:
         pattern = re.sub(r"(\\s[*+])+", r"\\s*", pattern)
 
         try:
-            match = re.search(pattern, doc_text)
-            if match:
+            matches = list(re.finditer(pattern, doc_text))
+            if len(matches) == 1:
+                match = matches[0]
                 return doc_text[: match.start()] + replace_str + doc_text[match.end() :]
         except Exception:
             pass
@@ -443,7 +436,7 @@ You must NOT output the entire file. You MUST ONLY output one or more Search/Rep
 ## ⛔ Surgical Editing Invariants:
 1. MINIMAL SURGICAL EDITS: Only output SEARCH/REPLACE blocks for the specific defective questions, stimuli, or options identified in <<<CONFIRMED_REVIEWER_ERRORS>>>. Do NOT touch correctly annotated sections.
 2. SUB-QUESTION & STATEMENT SEGMENTATION: In essay, constructed-response, or True/False questions where statements (a, b, c, d) were absorbed into <stem>, replace them with structured <option_label>a)</option_label> <option_text>Statement text...</option_text>.
-3. STIMULUS ANCHOR ALIGNMENT: Ensure all <stimulus id="..." start_anchor="..." end_anchor="..." /> tags are self-closing with start_anchor and end_anchor matching exact words from <<<RAW_SOURCE_TEXT>>>. A <stimulus> MUST NEVER wrap subsequent questions.
+3. PAIRED STIMULUS INTEGRITY: Shared passages serving 2+ questions MUST use paired <stimulus>...</stimulus> tags wrapping verbatim text from <<<RAW_SOURCE_TEXT>>> (never self-closing anchor tags). A <stimulus> MUST NEVER wrap <question_label>, <stem>, <option_label>, <option_text>, <explanation>, page metadata, or website watermarks.
 4. QUESTION STRUCTURE & NUMBERING: Wrap unannotated questions in <question_label> and <stem>. Never duplicate question labels.
 5. 100% VERBATIM FIDELITY: Ensure replacement text matches the raw OCR source text verbatim with no rewriting.
 6. EXACT SEARCH MATCHING: The text inside <<<<<<< SEARCH must match lines in CURRENT_ANNOTATED_XML character-for-character.
@@ -493,17 +486,8 @@ class EditorAgent:
         self.provider = provider.strip() if provider else EDITOR_PROVIDER
         self.thinking = thinking or EDITOR_THINKING or "low"
 
-        # Load exact parser prompt + few-shot examples (100% byte-for-byte exact copy)
-        examples_dir = (
-            WORKSPACE_DIR
-            / "backend"
-            / "app"
-            / "domains"
-            / "ocr"
-            / "annotator"
-            / "examples"
-            / "annotator"
-        )
+        # Load exact parser prompt + few-shot examples if directory exists locally
+        examples_dir = Path(__file__).resolve().parent / "examples" / "annotator"
         few_shot_xml = (
             load_few_shot_examples_xml(examples_dir) if examples_dir.exists() else ""
         )
@@ -588,16 +572,14 @@ class EditorAgent:
 
         initial_issues_count = len(issues)
 
-        # --- Stage 1: Deterministic Pre-Clean ---
-        clean_res = XMLCleaner.clean(annotated_xml)
-        current_xml = clean_res.cleaned_xml
+        # --- Stage 1: Validation Gate (No post-hoc regex XMLCleaner mutation per AGENTS.md §1.5) ---
+        current_xml = annotated_xml
 
-        # Check if deterministic clean was sufficient to resolve all major/critical issues
-        det_issues_after_clean, _ = DeterministicAuditor.check_xml_syntax(current_xml)
+        det_issues_before_edit, _ = DeterministicAuditor.check_xml_syntax(current_xml)
         has_critical_or_major_syntax = any(
             (iss.severity.value if hasattr(iss.severity, "value") else str(iss.severity))
             in ["CRITICAL", "MAJOR"]
-            for iss in det_issues_after_clean
+            for iss in det_issues_before_edit
         )
 
         semantic_issue_categories = {
@@ -611,6 +593,7 @@ class EditorAgent:
             "stimulus_nesting",
             "single_question_stimulus",
             "stimulus_anchor_invalid",
+            "stimulus_invalid",
             "missing_question_label",
             "missing_stem",
             "missing_options",
@@ -627,31 +610,29 @@ class EditorAgent:
         total_applied_patches = 0
         all_failed_reasons: List[str] = []
 
-        # If clean_res changed anything and no semantic issues exist, evaluate if pure deterministic fix suffices
-        if not has_semantic_issues and not has_critical_or_major_syntax:
-            post_det_report = self.reviewer.review_document(
-                xml_content=current_xml,
-                raw_ocr_text=raw_ocr_text,
+        # Early exit if document already passes deterministic & semantic checks
+        if (
+            not has_semantic_issues
+            and not has_critical_or_major_syntax
+            and initial_score >= 80.0
+            and initial_decision == ReviewDecision.PASS.value
+        ):
+            return EditorResult(
                 doc_id=doc_id,
-                use_llm=False,
+                success=True,
+                initial_score=initial_score,
+                final_score=initial_score,
+                initial_decision=initial_decision,
+                final_decision="PASS",
+                deterministic_only=True,
+                applied_patches_count=0,
+                failed_patches_count=0,
+                initial_issues_count=initial_issues_count,
+                remaining_issues_count=initial_issues_count,
+                repaired_xml=current_xml,
+                diff_summary="No repairs required; initial XML passed validation.",
+                duration_seconds=time.time() - start_time,
             )
-            if post_det_report.overall_score >= 80.0 and post_det_report.decision == ReviewDecision.PASS:
-                return EditorResult(
-                    doc_id=doc_id,
-                    success=True,
-                    initial_score=initial_score,
-                    final_score=post_det_report.overall_score,
-                    initial_decision=initial_decision,
-                    final_decision="PASS",
-                    deterministic_only=True,
-                    applied_patches_count=len(clean_res.fixes_applied),
-                    failed_patches_count=0,
-                    initial_issues_count=initial_issues_count,
-                    remaining_issues_count=len(post_det_report.issues),
-                    repaired_xml=current_xml,
-                    diff_summary="; ".join(clean_res.fixes_applied) or "Deterministic XMLCleaner normalization applied.",
-                    duration_seconds=time.time() - start_time,
-                )
 
         # --- Stage 2 & 3: Iterative Search/Replace Diff-Block LLM Repair ---
         current_issues = issues
@@ -715,12 +696,23 @@ class EditorAgent:
             patched_xml, applied_count, failed_reasons = SearchReplacePatcher.apply_blocks(
                 current_xml, diff_blocks
             )
+            if applied_count > 0:
+                if contains_diff_sentinel(patched_xml) and not contains_diff_sentinel(current_xml):
+                    failed_reasons.append(
+                        "Rejected patch batch: introduced residual diff/conflict markers."
+                    )
+                    patched_xml = current_xml
+                    applied_count = 0
+                elif not verbatim_preserved(annotated_xml, patched_xml):
+                    failed_reasons.append(
+                        "Rejected patch batch: violated 100% verbatim source fidelity."
+                    )
+                    patched_xml = current_xml
+                    applied_count = 0
+
             total_applied_patches += applied_count
             all_failed_reasons.extend(failed_reasons)
-
-            # Post-clean and rebalance tags
-            post_clean = XMLCleaner.clean(patched_xml)
-            current_xml = post_clean.cleaned_xml
+            current_xml = patched_xml
 
             # Re-evaluate with DocumentReviewer
             eval_report = self.reviewer.review_document(

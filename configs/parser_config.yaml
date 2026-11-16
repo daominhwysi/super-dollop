@@ -66,9 +66,10 @@ models:
     description: "Cartography-locked greedy chunker token budget (7k target, 10k ceiling, 1-page/750-tok overlap)"
 
   reviewer:
-    model_name: "gemini-3.8-flash"
-    provider: "agy"
+    model_name: "gpt-6-luna"
+    provider: "aixingialaire"
     thinking: low
+    concurrency: 2
     min_score_threshold: 75
     description: "Reviewer agent for rating sequence labelling XML quality and discarding malfunctioned documents"
 

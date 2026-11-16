@@ -1068,11 +1068,13 @@ def main():
         with open(label_map_file, "w", encoding="utf-8") as f:
             json.dump({"tag_to_id": tag_to_id, "id_to_tag": id_to_tag}, f, indent=2)
 
+    from model.module.dataset import EXAM_SPECIAL_TOKENS
+
     if is_main_process:
         print(f"Loading tokenizer '{model_name}'...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     latex_placeholder = model_cfg.get("latex_placeholder", "[LATEX]")
-    special_tokens = ["<blank />", "<blank/>", "[BLANK]"]
+    special_tokens = list(EXAM_SPECIAL_TOKENS)
     if latex_placeholder and latex_placeholder not in special_tokens:
         special_tokens.append(latex_placeholder)
 

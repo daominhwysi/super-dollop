@@ -142,38 +142,11 @@ def build_structured_stimuli(
         key=lambda item: (item.start, item.end),
     ):
         stimulus_id = f"stim_{span.start}_{span.end}"
-        if span.is_self_closing and span.raw_tag:
-            start_m = re.search(r'start_anchor="([^"]*)"', span.raw_tag)
-            end_m = re.search(r'end_anchor="([^"]*)"', span.raw_tag)
-            id_m = re.search(r'id="([^"]*)"', span.raw_tag)
-            if id_m:
-                stimulus_id = id_m.group(1)
-
-            stim_text = ""
-            s_range = {"start": span.start, "end": span.end}
-            if start_m and end_m:
-                s_anc = start_m.group(1).strip()
-                e_anc = end_m.group(1).strip()
-                s_idx = canonical_text.find(s_anc, max(0, span.start - 500))
-                if s_idx != -1:
-                    e_idx = canonical_text.find(e_anc, s_idx)
-                    if e_idx != -1:
-                        end_pos = e_idx + len(e_anc)
-                        stim_text = canonical_text[s_idx:end_pos].strip()
-                        s_range = {"start": s_idx, "end": end_pos}
-
-            stimuli[stimulus_id] = {
-                "text": stim_text or span.raw_tag,
-                "source_range": s_range,
-                "provenance_chunk_indices": [span.chunk_index],
-                "raw_tag": span.raw_tag,
-            }
-        else:
-            stimuli[stimulus_id] = {
-                "text": canonical_text[span.start:span.end].strip(),
-                "source_range": {"start": span.start, "end": span.end},
-                "provenance_chunk_indices": [span.chunk_index],
-            }
+        stimuli[stimulus_id] = {
+            "text": canonical_text[span.start:span.end].strip(),
+            "source_range": {"start": span.start, "end": span.end},
+            "provenance_chunk_indices": [span.chunk_index],
+        }
     return stimuli
 
 

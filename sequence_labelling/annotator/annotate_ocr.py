@@ -72,7 +72,7 @@ Your task is to annotate raw OCR text of exam papers by wrapping specific compon
 ## 🏷️ Tag Dictionary:
 
 1. <section>...</section>: Wrap major section/part titles, headers, directions, and subject block titles (e.g. "<section>PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn...</section>", "<section>## PART 5</section>", "<section>## Chủ đề Địa lí có 17 câu hỏi từ 501 đến 517</section>"). Output full paired tags <section>...</section> containing verbatim text. Do NOT use anchor tags for section titles. CRITICAL RULE: NEVER tag individual question headers (e.g. '## Câu 1.', '## Câu 2:', '## Bài 1.') as <section>! Markdown question headings belong exclusively inside <question_label>.
-2. <stimulus id="stim_1" start_anchor="..." end_anchor="..." />: For shared reading passages, emails, articles, tables, figures, multi-passage sets, and explicit context prompts (e.g. "Dựa vào thông tin sau đây để giải quyết bài 4, 5...", "Dựa vào thông tin dưới đây để trả lời các câu từ 515-517..."). CRITICAL DEFINITION & MULTI-QUESTION RULE: A stimulus ONLY applies if it is intimately related to 2 OR MORE QUESTIONS (shared reading passage, dataset, table, or multi-question context). If a context or text block is only related to 1 single standalone question, do NOT tag it as a stimulus—include it inside that question's <stem> instead! A stimulus is a CRUCIAL, essential shared content block without which those 2+ questions CANNOT be answered. Output self-closing anchor tag with id, start_anchor (first 3-10 verbatim words), and end_anchor (last 3-10 verbatim words).
+2. <stimulus>...</stimulus>: Wrap shared reading passages, emails, articles, tables, figures, multi-passage sets, and explicit context prompts (e.g. "Dựa vào thông tin sau đây để giải quyết bài 4, 5...", "Dựa vào thông tin dưới đây để trả lời các câu từ 515-517...") using full paired tags containing verbatim text. CRITICAL DEFINITION & MULTI-QUESTION RULE: A stimulus ONLY applies if it is intimately related to 2 OR MORE QUESTIONS (shared reading passage, dataset, table, or multi-question context). If a context or text block is only related to 1 single standalone question, do NOT tag it as a stimulus—include it inside that question's <stem> instead! A stimulus is a CRUCIAL, essential shared content block without which those 2+ questions CANNOT be answered. NEVER wrap page metadata, website watermarks, or other system tags inside <stimulus>.
 3. <question_label>...</question_label>: Wrap question prefix indicators (e.g. "**101.**", "**131.**", "101.", "Câu 1.", "Câu 1:", "## Câu 1.", "## Bài 1:"). CRITICAL RULE: <question_label> must ONLY contain the short question number/label itself. When raw text contains markdown headers for questions (e.g. '## Câu 1.', '## Câu 2:'), enclose the entire header inside <question_label>: e.g. <question_label>## Câu 1.</question_label>. NEVER split into <section>## Câu 1.</section><question_label>Câu 1.</question_label>!
 4. <stem>...</stem>: Wrap the main text body of a question following the question label.
 5. <option_label>...</option_label>: Wrap choice letters/prefixes and sub-item/sub-question indicators (e.g. "(A)", "(B)", "(C)", "(D)", "A.", "B.", "a)", "b)", "c)", "d)", "a.", "b."). ESSAY & SUB-QUESTION RULE: In essay, long-answer, constructed-response, or multi-part questions where sub-items like "a)", "b)", "c)", "d)" appear without multiple-choice options to select, wrap the sub-item labels "a)", "b)" in <option_label>...</option_label> and their corresponding body text in <option_text>...</option_text>. VIETNAM GDPT 2018 TRUE/FALSE RULE: In Phần II (Trắc nghiệm đúng/sai) and structured questions, sub-item propositions 'a)', 'b)', 'c)', 'd)' MUST ALWAYS be tagged as <option_label>a)</option_label> <option_text>...</option_text>. Never absorb sub-item labels "a)", "b)" into <stem>! SENTENCE ARRANGEMENT EXCEPTION: In sentence/text arrangement questions where sentences are labeled a., b., c., d., e. and choices A., B., C., D. are sequences (e.g. 'A. d-a-c-e-b'), sentences a., b., c., d., e. are part of the prompt and MUST be kept inside <stem>...</stem>, NOT tagged as option_label!
@@ -85,7 +85,7 @@ Your task is to annotate raw OCR text of exam papers by wrapping specific compon
 ## ⛔ Strict Rules:
 
 1. **VERBATIM QUESTION & SECTION TEXT (NO TEXT MODIFICATION):** Do NOT alter, correct, spell-check, or omit any character, typo, LaTeX expression ($...$ or $$...$$), or page marker (`<|page|>Page X`) inside question elements (<question_label>, <stem>, <option_label>, <option_text>, <explanation>) or section elements (<section>). Preserve 100% verbatim input text layout.
-2. **ANCHOR TAG EXCEPTION (COMPACT STIMULUS SHORTCUT):** Self-closing `<stimulus id="..." start_anchor="..." end_anchor="..." />` tags are intentionally compact references ONLY for reading passages, shared texts, tables, and context prompts. For stimuli, output ONLY the self-closing anchor tag with `start_anchor` (first 3-10 verbatim words) and `end_anchor` (last 3-10 verbatim words). Do NOT use anchor tags for `<section>`; section headers MUST always be wrapped in full paired `<section>...</section>` tags.
+2. **PAIRED STIMULUS & SECTION TAGS (NO ANCHOR SHORTCUTS):** Use full paired `<stimulus>...</stimulus>` tags wrapping the verbatim shared passage text (never self-closing anchor tags). Do NOT wrap other system tags (`<question_label>`, `<stem>`, `<option_label>`, `<option_text>`, `<explanation>`) inside `<stimulus>`. Similarly, `<section>` headers MUST always be wrapped in full paired `<section>...</section>` tags.
 3. **FULL ANNOTATION COVERAGE:** Output the ENTIRE input text from start to end. ALL components in the input text MUST be annotated using their appropriate XML tags from the Tag Dictionary (<section>, <stimulus>, <question_label>, <stem>, <option_label>, <option_text>, <explanation>). You MUST annotate every question, stem, option label, and option text without exception—do NOT skip annotating questions or options when a stimulus is present, and do NOT leave text untagged!
 4. **NO MARKDOWN CODEBLOCKS:** Output ONLY the annotated text directly. Do not wrap the output in ```xml codeblocks.
 5. **CONCISE THINKING TRACE:** Use `<think>` block for concise reasoning (< 300 words) highlighting layout, edge cases, and verification.
@@ -98,7 +98,7 @@ Your task is to annotate raw OCR text of exam papers by wrapping specific compon
 12. **STIMULUS DISCRIMINATION & MULTI-QUESTION RULE:** A `<stimulus>` tag MUST ONLY be created if the passage/context/data block intimately relates to 2 OR MORE QUESTIONS (e.g. reading passage for questions 6-10, dataset for questions 515-517, or prompt "Dựa vào thông tin sau đây để giải quyết bài 4, 5..."). If a piece of text or table is associated with only 1 single question, include it directly inside that question's <stem>...</stem> rather than tagging it as a <stimulus>. Never tag generic section headers, subject titles, exam metadata, or question range announcements (e.g. "## Chủ đề Địa lí có 17 câu hỏi từ 501 đến 517", "PHẦN I. TRẮC NGHIỆM", "Môn: Toán") as `<stimulus>`!
 13. **TABULAR & UNLABELED TRUE/FALSE SUB-QUESTIONS:** When sub-questions or True/False statements are presented inside HTML tables (`<table>...</table>`), Markdown tables, or lists without explicit option labels (such as `a)`, `b)` or `A.`), each statement cell or item text to be evaluated MUST still be tagged as `<option_text>...</option_text>` (e.g., `<td><option_text>Statement text...</option_text></td>`). Table formatting tags (`<table>`, `<tr>`, `<th>`, `<td>`), header titles ("Phát biểu", "Đúng", "Sai"), and choice indicators (`○`, `✓`, `[ ]`) remain un-tagged structure.
 14. **PAGE TAGS & METADATA PRUNING:** Prune and omit `<pages>`, `</pages>`, `<page>`, `</page>`, and `<page_metadata>...</page_metadata>` from the XML output. Do not retain page boundary tags or metadata blocks in the annotated XML. Maintain continuous elements (<stem>, <option_text>, <explanation>, <section>) seamlessly across page breaks without splitting them.
-15. **XML TAG MATCHING & INTEGRITY (NO MISMATCHED/UNCLOSED TAGS):** Every opened tag (`<section>`, `<question_label>`, `<stem>`, `<option_label>`, `<option_text>`, `<explanation>`) MUST have its exact matching closing tag (`</section>`, `</question_label>`, `</stem>`, `</option_label>`, `</option_text>`, `</explanation>`). NEVER produce mismatched closing tags (e.g. `<stem>...</option_text>`) or leave opening tags unclosed. Compact stimulus anchor tags `<stimulus ... />` and vision figures `<figure ... />` MUST always be formatted as self-closing tags with `/>`.
+15. **XML TAG MATCHING & INTEGRITY (NO MISMATCHED/UNCLOSED TAGS):** Every opened tag (`<section>`, `<stimulus>`, `<question_label>`, `<stem>`, `<option_label>`, `<option_text>`, `<explanation>`) MUST have its exact matching closing tag (`</section>`, `</stimulus>`, `</question_label>`, `</stem>`, `</option_label>`, `</option_text>`, `</explanation>`). NEVER produce mismatched closing tags (e.g. `<stem>...</option_text>`) or leave opening tags unclosed. Only vision figures `<figure ... />` remain self-closing tags with `/>`.
 16. **LATEX DELIMITER INTEGRITY:** Ensure <option_text> cleanly wraps math formulas: e.g. <option_label>A.</option_label> <option_text>$3x - 1 = 0$</option_text>. NEVER place tags inside LaTeX delimiters like $<option_text>...$.
 """
 
@@ -221,22 +221,21 @@ def _extract_usage_tokens(usage: Any) -> Dict[str, Optional[int]]:
     }
 
 
-def parse_xml_annotations(tagged_text: str, expand_anchors: bool = True) -> Tuple[str, List[Dict[str, Any]]]:
+def parse_xml_annotations(tagged_text: str) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Parses tagged XML string to produce clean raw text and character offset spans.
     Supports XML tags with parameters/attributes (e.g. <question stimulus_id="stim_1">).
     Preserves raw text exact alignment.
-    Automatically expands compact stimulus anchors to full stimulus spans.
     """
-    if expand_anchors and "<stimulus" in tagged_text and "/>" in tagged_text:
-        from sequence_labelling.annotator.anchor_helper import AnchorHelper
-        tagged_text = AnchorHelper.expand_stimulus_anchors(tagged_text)
 
     allowed_tags = set(BASE_TAGS)
     raw_chars = []
     spans = []
 
-    tag_pattern = re.compile(r"<(/)?([a-zA-Z_][a-zA-Z0-9_\-]*)(?:\s+([^>]*))?>")
+    allowed_alt = "|".join(sorted((re.escape(t) for t in allowed_tags), key=len, reverse=True))
+    tag_pattern = re.compile(
+        rf"<(/)?({allowed_alt})(?:\s+((?:[^>\"']|\"[^\"]*\"|'[^']*')*))?>"
+    )
     pos = 0
     tag_stack = []
 

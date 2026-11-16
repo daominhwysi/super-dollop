@@ -75,12 +75,12 @@ def remerge_exam_dir(exam_dir: Path, raw_base_dir: Optional[Path] = None) -> Dic
         for c_json in chunk_json_files:
             try:
                 data = json.loads(c_json.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "chunk_index" in data:
+                if isinstance(data, dict) and "chunk_index" in data and "raw_chunk_text" in data:
                     chunk_results.append(data)
             except Exception:
                 pass
 
-    if chunk_results:
+    if chunk_results and (not chunk_xml_files or len(chunk_results) == len(chunk_xml_files)):
         try:
             merge_result = reconcile_parser_chunk_results(chunk_results)
             merged_xml = sanitize_prohibited_tags(merge_result["merged_xml"])

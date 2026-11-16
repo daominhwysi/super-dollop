@@ -253,7 +253,8 @@ class TestCurriculum(unittest.TestCase):
                 {"role": "system", "content": "You are a helpful assistant"},
                 {"role": "user", "content": "prompt"}
             ],
-            stream=False
+            stream=False,
+            extra_body={"caller": "synthetic_exam_generator", "provider": "deepseek", "thinking": "low"},
         )
         
         mock_create.reset_mock()
@@ -265,7 +266,7 @@ class TestCurriculum(unittest.TestCase):
                 {"role": "user", "content": "prompt"}
             ],
             stream=False,
-            reasoning_effort="high"
+            extra_body={"caller": "synthetic_exam_generator", "provider": "deepseek", "thinking": True},
         )
         
         mock_create.reset_mock()
@@ -277,7 +278,7 @@ class TestCurriculum(unittest.TestCase):
                 {"role": "user", "content": "prompt"}
             ],
             stream=False,
-            reasoning_effort="max"
+            extra_body={"caller": "synthetic_exam_generator", "provider": "deepseek", "thinking": "max"},
         )
         
         mock_create.reset_mock()
@@ -288,7 +289,8 @@ class TestCurriculum(unittest.TestCase):
                 {"role": "system", "content": "You are a helpful assistant"},
                 {"role": "user", "content": "prompt"}
             ],
-            stream=False
+            stream=False,
+            extra_body={"caller": "synthetic_exam_generator", "provider": "deepseek", "thinking": "none"},
         )
 
 if __name__ == '__main__':

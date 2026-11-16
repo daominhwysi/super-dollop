@@ -1,114 +1,66 @@
+from unittest.mock import MagicMock, patch
 import pytest
-from unittest.mock import patch, MagicMock
 
-openai_codex = pytest.importorskip("openai_codex")
-from openai_codex.api import ReasoningEffort
 from sequence_labelling.llm.deepseek_client import chat
 
 
-def test_codex_thinking_effort_mapping():
-    """Verify that all thinking parameter variations map properly to valid ReasoningEffort values without AttributeError."""
-    test_cases = [
-        ("max", ReasoningEffort.xhigh),
-        ("xhigh", ReasoningEffort.xhigh),
-        ("high", ReasoningEffort.high),
-        ("medium", ReasoningEffort.medium),
-        ("low", ReasoningEffort.low),
-        ("minimal", ReasoningEffort.minimal),
-        ("none", ReasoningEffort.none),
-        ("disabled", ReasoningEffort.none),
-        (True, ReasoningEffort.high),
-        (False, ReasoningEffort.none),
-        (ReasoningEffort.medium, ReasoningEffort.medium),
-    ]
+def test_chat_proxy_forwards_provider_and_thinking():
+    """Verify chat() forwards model, messages, provider, and thinking via proxy extra_body."""
+    mock_msg = MagicMock()
+    mock_msg.content = "mock response"
+    mock_choice = MagicMock()
+    mock_choice.message = mock_msg
+    mock_resp = MagicMock(choices=[mock_choice])
 
-    for thinking_input, expected_effort in test_cases:
-        mock_result = MagicMock()
-        mock_result.error = None
-        mock_result.final_response = "mock response"
-
-        mock_thread = MagicMock()
-        mock_thread.run.return_value = mock_result
-
-        mock_session = MagicMock()
-        mock_session.thread_start.return_value = mock_thread
-        mock_session.__enter__.return_value = mock_session
-        mock_session.__exit__.return_value = None
-
-        with patch("sequence_labelling.llm.deepseek_client.Codex", return_value=mock_session), \
-             patch("sequence_labelling.llm.deepseek_client.get_provider_api_key", return_value="dummy_key"), \
-             patch("sequence_labelling.llm.llm_logger.log_llm_call"):
-
-            resp = chat(
-                prompt="test prompt",
-                provider="codex",
-                thinking=thinking_input,
-            )
-            assert resp == "mock response"
-            mock_thread.run.assert_called_once()
-            _, kwargs = mock_thread.run.call_args
-            assert kwargs.get("effort") == expected_effort, f"Failed for thinking input: {thinking_input}"
+    with patch("sequence_labelling.llm.deepseek_client.client.chat.completions.create", return_value=mock_resp) as mock_create:
+        resp = chat(
+            prompt="test prompt",
+            provider="codex",
+            model="gpt-6-luna",
+            thinking="high",
+            max_tokens=512,
+        )
+        assert resp == "mock response"
+        mock_create.assert_called_once_with(
+            model="gpt-6-luna",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant"},
+                {"role": "user", "content": "test prompt"},
+            ],
+            stream=False,
+            max_tokens=512,
+            extra_body={"provider": "codex", "thinking": "high"},
+        )
 
 
-def test_codex_multi_turn_messages_formatting():
-    """Verify that multi-turn messages (system, user, assistant, user) format correctly for Codex thread."""
-    mock_result = MagicMock()
-    mock_result.error = None
-    mock_result.final_response = "APPROVED"
-
-    mock_thread = MagicMock()
-    mock_thread.run.return_value = mock_result
-
-    mock_session = MagicMock()
-    mock_session.thread_start.return_value = mock_thread
-    mock_session.__enter__.return_value = mock_session
-    mock_session.__exit__.return_value = None
+def test_chat_proxy_multi_turn_messages():
+    """Verify multi-turn messages pass through verbatim to the proxy client."""
+    mock_msg = MagicMock()
+    mock_msg.content = "APPROVED"
+    mock_choice = MagicMock()
+    mock_choice.message = mock_msg
+    mock_resp = MagicMock(choices=[mock_choice])
 
     messages = [
         {"role": "system", "content": "You are a sequence annotator."},
         {"role": "user", "content": "Annotate: Câu 1. Math question."},
         {"role": "assistant", "content": "<question_label>Câu 1.</question_label> <stem>Math question.</stem>"},
-        {"role": "user", "content": "Audit Role A output above."},
+        {"role": "user", "content": "Audit output above."},
     ]
 
-    with patch("sequence_labelling.llm.deepseek_client.Codex", return_value=mock_session), \
-         patch("sequence_labelling.llm.deepseek_client.get_provider_api_key", return_value="dummy_key"), \
-         patch("sequence_labelling.llm.llm_logger.log_llm_call"):
-
-        resp = chat(
-            messages=messages,
-            provider="codex",
-            thinking="high",
-        )
+    with patch("sequence_labelling.llm.deepseek_client.client.chat.completions.create", return_value=mock_resp) as mock_create:
+        resp = chat(messages=messages, provider="codex", model="gpt-6-luna", thinking="medium")
         assert resp == "APPROVED"
-        mock_session.thread_start.assert_called_once()
-        _, start_kwargs = mock_session.thread_start.call_args
-        assert start_kwargs.get("developer_instructions") == "You are a sequence annotator."
-
-        mock_thread.run.assert_called_once()
-        user_prompt_arg, _ = mock_thread.run.call_args
-        assert "Annotate: Câu 1. Math question." in user_prompt_arg[0]
-        assert "### Assistant Response:" in user_prompt_arg[0]
-        assert "<question_label>Câu 1.</question_label>" in user_prompt_arg[0]
-        assert "Audit Role A output above." in user_prompt_arg[0]
+        call_kwargs = mock_create.call_args.kwargs
+        assert call_kwargs["messages"] == messages
+        assert call_kwargs["extra_body"] == {"provider": "codex", "thinking": "medium"}
 
 
-def test_codex_error_handling():
-    """Verify RuntimeError is raised if Codex turn returns an error."""
-    mock_result = MagicMock()
-    mock_result.error = "Codex RPC failure"
-    mock_result.final_response = None
-
-    mock_thread = MagicMock()
-    mock_thread.run.return_value = mock_result
-
-    mock_session = MagicMock()
-    mock_session.thread_start.return_value = mock_thread
-    mock_session.__enter__.return_value = mock_session
-    mock_session.__exit__.return_value = None
-
-    with patch("sequence_labelling.llm.deepseek_client.Codex", return_value=mock_session), \
-         patch("sequence_labelling.llm.deepseek_client.get_provider_api_key", return_value="dummy_key"):
-
-        with pytest.raises(RuntimeError, match="Codex turn error: Codex RPC failure"):
+def test_chat_proxy_propagates_client_error():
+    """Verify proxy client exceptions propagate without silent swallowing."""
+    with patch(
+        "sequence_labelling.llm.deepseek_client.client.chat.completions.create",
+        side_effect=RuntimeError("Proxy connection error"),
+    ):
+        with pytest.raises(RuntimeError, match="Proxy connection error"):
             chat(prompt="Test prompt", provider="codex")
