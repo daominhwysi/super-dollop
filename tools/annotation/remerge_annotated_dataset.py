@@ -80,51 +80,124 @@ def remerge_exam_dir(exam_dir: Path, raw_base_dir: Optional[Path] = None) -> Dic
             except Exception:
                 pass
 
+    # Prefer chunk_*.xml on disk as the canonical XML source (repaired chunks edit chunk_*.xml,
+    # while chunk_*.json may retain pre-repair raw_xml / raw_chunk_text).
+    xml_by_index: Dict[int, str] = {}
+    if chunk_xml_files:
+        for idx, c_xml_path in enumerate(chunk_xml_files):
+            m = re.search(r"chunk_(\d+)", c_xml_path.name)
+            c_idx = int(m.group(1)) if m else idx
+            xml_by_index[c_idx] = sanitize_prohibited_tags(c_xml_path.read_text(encoding="utf-8"))
+
+    def _persist_merge_result(merge_result: Dict[str, Any], status_name: str, n_chunks: int) -> Dict[str, Any]:
+        merged_xml = sanitize_prohibited_tags(merge_result["merged_xml"])
+        questions = merge_result["structured_questions"]
+        stimuli = merge_result["structured_stimuli"]
+        diag = merge_result["diagnostics"]
+
+        (exam_dir / "merged.xml").write_text(merged_xml, encoding="utf-8")
+
+        merged_json_path = exam_dir / "merged.json"
+        merged_json_data = {}
+        if merged_json_path.exists():
+            try:
+                merged_json_data = json.loads(merged_json_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        merged_json_data.update({
+            "remerge_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "merge_status": "success",
+            "questions_count": len(questions),
+            "stimuli_count": len(stimuli),
+            "questions": questions,
+            "stimuli": stimuli,
+            "diagnostics": diag,
+            "merge_diagnostics": diag,
+            "source_fidelity_ok": diag.get("validation", {}).get("source_fidelity_ok", True),
+        })
+        merged_json_path.write_text(
+            json.dumps(merged_json_data, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        return {
+            "doc_id": exam_dir.name,
+            "status": status_name,
+            "chunks_count": n_chunks,
+            "questions_count": len(questions),
+            "stimuli_count": len(stimuli),
+            "source_fidelity_ok": diag.get("validation", {}).get("source_fidelity_ok", True),
+        }
+
+    if len(chunk_xml_files) == 1:
+        only_xml = next(iter(xml_by_index.values()))
+        detagged_only = remove_annotation_tags(only_xml)
+        raw_matches = (
+            len(chunk_results) == 1
+            and detagged_only.strip() == chunk_results[0].get("raw_chunk_text", "").strip()
+        )
+        if not chunk_json_files or not raw_matches:
+            try:
+                res = merge_chunk_xmls([only_xml], raw_chunk_inputs=[detagged_only])
+                return _persist_merge_result(res, "remerged_single_chunk_xml", 1)
+            except Exception as err:
+                return {
+                    "doc_id": exam_dir.name,
+                    "status": "error",
+                    "error": str(err),
+                    "chunks_count": 1,
+                }
+
     if chunk_results and (not chunk_xml_files or len(chunk_results) == len(chunk_xml_files)):
         try:
-            merge_result = reconcile_parser_chunk_results(chunk_results)
-            merged_xml = sanitize_prohibited_tags(merge_result["merged_xml"])
-            questions = merge_result["structured_questions"]
-            stimuli = merge_result["structured_stimuli"]
-            diag = merge_result["diagnostics"]
+            synced_results = []
+            text_drifted = False
+            for item in chunk_results:
+                c_idx = int(item["chunk_index"])
+                item_copy = dict(item)
+                if c_idx in xml_by_index:
+                    disk_xml = xml_by_index[c_idx]
+                    item_copy["raw_xml"] = disk_xml
+                    if remove_annotation_tags(disk_xml).strip() != item.get("raw_chunk_text", "").strip():
+                        text_drifted = True
+                synced_results.append(item_copy)
 
-            # Save updated merged.xml
-            (exam_dir / "merged.xml").write_text(merged_xml, encoding="utf-8")
+            merge_result = reconcile_parser_chunk_results(synced_results)
 
-            # Update merged.json if exists
-            merged_json_path = exam_dir / "merged.json"
-            merged_json_data = {}
-            if merged_json_path.exists():
+            # When repaired chunk XML text diverges from cached raw_chunk_text (e.g. HTML table/bold edits),
+            # also evaluate source-grounded parser-text merging and keep whichever drops fewer spans.
+            if text_drifted and chunk_xml_files:
                 try:
-                    merged_json_data = json.loads(merged_json_path.read_text(encoding="utf-8"))
+                    ordered_xmls = [
+                        xml_by_index[k] for k in sorted(xml_by_index.keys())
+                    ]
+                    alt_result = merge_chunk_xmls(ordered_xmls, allow_parser_text_as_source=True)
+                    orig_proj = sum(
+                        p.get("spans_projected", 0)
+                        for p in merge_result.get("diagnostics", {}).get("parses", [])
+                    )
+                    alt_proj = sum(
+                        p.get("spans_projected", 0)
+                        for p in alt_result.get("diagnostics", {}).get("parses", [])
+                    )
+                    orig_rej = sum(
+                        p.get("spans_rejected", 0)
+                        for p in merge_result.get("diagnostics", {}).get("parses", [])
+                    )
+                    alt_rej = sum(
+                        p.get("spans_rejected", 0)
+                        for p in alt_result.get("diagnostics", {}).get("parses", [])
+                    )
+                    if (
+                        alt_result.get("diagnostics", {}).get("validation", {}).get("source_fidelity_ok", False)
+                        and (alt_rej < orig_rej or (alt_rej == orig_rej and alt_proj > orig_proj))
+                        and len(alt_result.get("annotations", [])) >= len(merge_result.get("annotations", []))
+                    ):
+                        merge_result = alt_result
                 except Exception:
                     pass
 
-            merged_json_data.update({
-                "remerge_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "merge_status": "success",
-                "questions_count": len(questions),
-                "stimuli_count": len(stimuli),
-                "questions": questions,
-                "stimuli": stimuli,
-                "diagnostics": diag,
-                "merge_diagnostics": diag,
-                "source_fidelity_ok": diag.get("validation", {}).get("source_fidelity_ok", True),
-            })
-
-            merged_json_path.write_text(
-                json.dumps(merged_json_data, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-
-            return {
-                "doc_id": exam_dir.name,
-                "status": "remerged_success",
-                "chunks_count": len(chunk_results),
-                "questions_count": len(questions),
-                "stimuli_count": len(stimuli),
-                "source_fidelity_ok": diag.get("validation", {}).get("source_fidelity_ok", True),
-            }
+            return _persist_merge_result(merge_result, "remerged_success", len(chunk_results))
         except Exception as err:
             return {
                 "doc_id": exam_dir.name,
