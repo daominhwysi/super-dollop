@@ -324,4 +324,37 @@ def test_reconciler_prevents_explanation_overlap_and_nesting():
     assert "<question_label>Câu 2.</question_label>" in res.merged_xml
 
 
+def test_remerge_exam_dir_prefers_repaired_chunk_xml_over_stale_json(tmp_path):
+    import json
+    from tools.annotation.remerge_annotated_dataset import remerge_exam_dir
+
+    exam_dir = tmp_path / "exam_repaired"
+    chunks_dir = exam_dir / "chunks"
+    chunks_dir.mkdir(parents=True)
+
+    # Stale chunk_0.json still holds pre-repair text & missing option_label tags
+    stale_raw = "Câu 1. Đề bài\n**A.** 1\n**B.** 2\n"
+    stale_xml = "<question_label>Câu 1.</question_label> <stem>Đề bài</stem>\n**A.** <option_text>1</option_text>\n**B.** <option_text>2</option_text>\n"
+    (chunks_dir / "chunk_0.json").write_text(json.dumps({
+        "chunk_index": 0,
+        "raw_chunk_text": stale_raw,
+        "raw_xml": stale_xml,
+    }, ensure_ascii=False), encoding="utf-8")
+
+    # Repaired chunk_0.xml normalized **A.** -> <strong>A.</strong> and tagged option_label
+    repaired_xml = (
+        "<question_label>Câu 1.</question_label> <stem>Đề bài</stem>\n"
+        "<option_label><strong>A.</strong></option_label> <option_text>1</option_text>\n"
+        "<option_label><strong>B.</strong></option_label> <option_text>2</option_text>\n"
+    )
+    (chunks_dir / "chunk_0.xml").write_text(repaired_xml, encoding="utf-8")
+
+    res = remerge_exam_dir(exam_dir)
+    assert res["source_fidelity_ok"] is True
+    merged_xml = (exam_dir / "merged.xml").read_text(encoding="utf-8")
+    assert merged_xml.count("<option_label>") == 2
+    assert "<strong>A.</strong>" in merged_xml
+    assert remove_annotation_tags(merged_xml) == remove_annotation_tags(repaired_xml).rstrip()
+
+
 
