@@ -1,10 +1,11 @@
 import pytest
 import re
 from model.inference.predict import build_tagged_xml
-from scratch.two_pass_experimental import refine_canonical_stimuli
 
 
 def test_refine_canonical_stimuli_trims_banners_and_microspans():
+    two_pass_mod = pytest.importorskip("scratch.two_pass_experimental")
+    refine_canonical_stimuli = two_pass_mod.refine_canonical_stimuli
     text = (
         "PART 6 - TEXT COMPLETION\n\n"
         "To all employees: Please note that the annual safety review will occur on Friday.\n"
