@@ -105,12 +105,25 @@ class EditorReviewerLoop:
         current_xml: str,
         issues: List[AuditIssue],
         round_number: int,
+        previous_patch_failures: Optional[List[str]] = None,
     ) -> str:
         diagnostics = self.editor._format_diagnostics_block(issues)
+        failure_feedback = ""
+        if previous_patch_failures:
+            joined = "\n".join(f"- {reason}" for reason in previous_patch_failures[:10])
+            failure_feedback = (
+                "<<<PREVIOUS_ROUND_PATCH_FAILURES>>>\n"
+                "Some patches from the previous round failed to apply. Fix them in this round "
+                "(include more surrounding lines in SEARCH if ambiguous, copy exact lines from "
+                "CURRENT_ANNOTATED_XML if not found, and never delete raw watermark/source text):\n"
+                f"{joined}\n"
+                "<<<END_PREVIOUS_ROUND_PATCH_FAILURES>>>\n\n"
+            )
         return (
             f"### EDIT ROUND {round_number}\n"
             "Repair the current XML using only the reviewer-confirmed errors. The XML "
             "below is the only version to patch in this round.\n\n"
+            f"{failure_feedback}"
             "<<<CONFIRMED_REVIEWER_ERRORS>>>\n"
             f"{diagnostics}\n"
             "<<<END_CONFIRMED_REVIEWER_ERRORS>>>\n\n"
@@ -279,6 +292,7 @@ class EditorReviewerLoop:
         total_failed = 0
         false_positive_keys: set[tuple[str, str, str]] = set()
         false_positive_assessments: List[EditorIssueAssessment] = []
+        last_patch_failures: List[str] = []
 
         for round_number in range(1, self.max_rounds + 1):
             prompt = self._editor_prompt(
@@ -286,6 +300,7 @@ class EditorReviewerLoop:
                 current_xml=current_xml,
                 issues=current_issues,
                 round_number=round_number,
+                previous_patch_failures=last_patch_failures,
             )
             editor_messages.append({"role": "user", "content": prompt})
             editor_output = complete(
@@ -314,24 +329,16 @@ class EditorReviewerLoop:
                     false_positive_assessments.append(assessment)
 
             blocks = SearchReplacePatcher.parse_blocks(editor_output)
-            candidate_xml, applied, failed = SearchReplacePatcher.apply_blocks(
-                current_xml, blocks
+            candidate_xml, applied, failed = (
+                SearchReplacePatcher.apply_blocks_with_verbatim_guard(
+                    current_xml=current_xml,
+                    baseline_xml=annotated_xml,
+                    blocks=blocks,
+                    raw_ocr_text=raw_ocr_text,
+                )
             )
-            patch_rejected = False
-            if applied > 0:
-                if contains_diff_sentinel(candidate_xml) and not contains_diff_sentinel(current_xml):
-                    failed.append(
-                        "Rejected patch batch: introduced residual diff/conflict markers."
-                    )
-                    patch_rejected = True
-                elif not verbatim_preserved(annotated_xml, candidate_xml):
-                    failed.append(
-                        "Rejected patch batch: violated 100% verbatim source fidelity."
-                    )
-                    patch_rejected = True
-            if patch_rejected:
-                candidate_xml = current_xml
-                applied = 0
+            patch_rejected = bool(blocks and applied == 0)
+            last_patch_failures = list(failed)
             total_applied += applied
             total_failed += len(failed)
 
@@ -390,9 +397,9 @@ class EditorReviewerLoop:
                 best_report = report
                 break
 
-            # No parseable/applicable patch means another identical request is
-            # unlikely to improve the document, even with retained context.
-            if not blocks or applied == 0:
+            # If the editor produced zero parseable blocks (e.g. pure ISSUE_ASSESSMENTS), stop;
+            # if blocks failed to apply/validate, allow the next round to retry with failure feedback.
+            if not blocks and not failed:
                 break
 
             # There is no actionable reviewer-confirmed finding left.  Keep
@@ -644,7 +651,15 @@ def load_revision_targets(
             cand_chunk = annotated_dir / exam_folder / "chunks" / f"{chunk_stem}.xml"
             xml_path = cand_chunk if cand_chunk.exists() else Path(xml_p) if xml_p else None
             cand_json = xml_path.with_suffix(".json") if xml_path else None
-            raw_path = cand_json if (cand_json and cand_json.exists()) else Path(raw_p) if raw_p else None
+            cand_md = raw_dir / f"{exam_folder}.md"
+            if cand_json and cand_json.exists():
+                raw_path = cand_json
+            elif raw_p and Path(raw_p).exists():
+                raw_path = Path(raw_p)
+            elif cand_md.exists():
+                raw_path = cand_md
+            else:
+                raw_path = None
         else:
             cand_annot = None
             for cand in [
@@ -700,7 +715,12 @@ def load_revision_targets(
                 pass
 
             cached_llm = None
-            if r.get("llm_score") is not None or r.get("llm_confirmations") or r.get("issues"):
+            has_llm_audit = (
+                r.get("confirmation_status") == "complete"
+                or r.get("llm_score") is not None
+                or bool(r.get("llm_confirmations"))
+            )
+            if has_llm_audit:
                 cached_llm = {
                     "score": r.get("llm_score"),
                     "rubric_scores": r.get("rubric_scores"),
@@ -726,7 +746,7 @@ def load_revision_targets(
                     ],
                 }
 
-            if prerun_report is None or not cached_llm:
+            if prerun_report is None:
                 audit_file = (
                     xml_path.parent / "audit_report.json"
                     if xml_path.name in ["merged.xml", "merged.json"]
@@ -971,7 +991,12 @@ def process_single_revision(
         branch_xml_path.write_text(event["candidate_xml"], encoding="utf-8")
         round_number = int(event.get("round_number", 0))
         event_name = "initial_review.json" if event.get("stage") == "initial_review" else f"round_{round_number:03d}.json"
-        event_path = branch_xml_path.parent / "revisions" / event_name
+        event_dir = (
+            branch_xml_path.parent / f"{branch_xml_path.stem}_revisions"
+            if xml_path.name.startswith("chunk_")
+            else branch_xml_path.parent / "revisions"
+        )
+        event_path = event_dir / event_name
         event_path.parent.mkdir(parents=True, exist_ok=True)
         event_path.write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
         state["latest_round"] = round_number

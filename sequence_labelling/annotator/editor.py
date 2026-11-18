@@ -73,9 +73,126 @@ def _strip_all_markup_for_verbatim(xml_text: str) -> str:
     return "".join(text.split())
 
 
-def verbatim_preserved(before_xml: str, after_xml: str) -> bool:
-    """Verifies that patching altered only XML tags/whitespace without mutating source characters."""
-    return _strip_all_markup_for_verbatim(before_xml) == _strip_all_markup_for_verbatim(after_xml)
+def validate_single_block_verbatim(
+    search_text: str,
+    replace_text: str,
+    raw_stripped: str = "",
+    min_similarity: float = 0.80,
+) -> Tuple[bool, str]:
+    """Validate that a single Search/Replace block preserves source content via fuzzy alignment.
+
+    Allows:
+    - 100% pure XML tag / whitespace edits (fast path).
+    - Restoring omitted source text that exists verbatim in ``raw_stripped``.
+    - Deleting parser hallucinations / refusal text absent from ``raw_stripped``.
+    - Minor formatting / HTML / whitespace drift above ``min_similarity`` (default 0.80).
+    """
+    b_s = _strip_all_markup_for_verbatim(search_text)
+    r_s = _strip_all_markup_for_verbatim(replace_text)
+    if b_s == r_s:
+        return True, ""
+
+    if raw_stripped:
+        # Allow restoring missing raw source text or replacing hallucinated text with raw source.
+        if r_s and r_s in raw_stripped and (not b_s or b_s not in raw_stripped or len(r_s) >= len(b_s)):
+            return True, ""
+        # Allow removing hallucinated text / refusal messages not present in raw source.
+        if b_s and b_s not in raw_stripped and (not r_s or r_s in raw_stripped):
+            return True, ""
+
+    if not r_s and b_s:
+        return False, "Block deleted non-markup source text without raw source justification."
+    if not b_s and r_s:
+        return False, "Block inserted non-markup text not found in raw source."
+
+    # Allow slightly higher relative char churn on very short blocks (< 80 non-space chars)
+    # where fixing a few punctuation/formatting characters shifts the ratio disproportionately.
+    effective_min_sim = min(min_similarity, 0.70) if max(len(b_s), len(r_s)) < 80 else min_similarity
+
+    # Guard against excessive text drop inside a single block.
+    if len(r_s) < len(b_s) * effective_min_sim:
+        drop_pct = (1.0 - len(r_s) / max(1, len(b_s))) * 100.0
+        return False, f"Block dropped {drop_pct:.1f}% of non-markup text."
+
+    matcher = difflib.SequenceMatcher(None, b_s, r_s)
+    sim = matcher.quick_ratio() if max(len(b_s), len(r_s)) > 6000 else matcher.ratio()
+    if sim < effective_min_sim:
+        return False, f"Block fuzzy similarity {sim*100:.1f}% below {effective_min_sim*100:.0f}% threshold."
+    return True, ""
+
+
+def validate_patch_verbatim(
+    before_xml: str,
+    after_xml: str,
+    raw_ocr_text: Optional[str] = None,
+    max_drop_ratio: float = 0.20,
+    min_global_similarity: float = 0.85,
+) -> Tuple[bool, str]:
+    """Fuzzy verbatim guard: allows minor formatting/space drift and source-backed fixes,
+    while rejecting catastrophic drops (>20%), runaway bloat, or text corruption.
+    """
+    s_before = _strip_all_markup_for_verbatim(before_xml)
+    s_after = _strip_all_markup_for_verbatim(after_xml)
+    if s_before == s_after:
+        return True, ""
+
+    if not s_after:
+        return False, "Rejected patch batch: dropped 100% of source text."
+    if not s_before:
+        return False, "Rejected patch batch: source XML had no non-markup text."
+
+    retention = len(s_after) / len(s_before)
+    s_raw = _strip_all_markup_for_verbatim(raw_ocr_text) if raw_ocr_text else ""
+
+    if retention < (1.0 - max_drop_ratio):
+        # Allow large deletion only if raw source confirms the new XML keeps >=80% of raw text
+        # (e.g. stripping a huge duplicated/hallucinated parser block).
+        if not (s_raw and len(s_after) >= len(s_raw) * (1.0 - max_drop_ratio)):
+            drop_pct = (1.0 - retention) * 100.0
+            return (
+                False,
+                f"Rejected patch batch: dropped {drop_pct:.1f}% of source text (exceeds {max_drop_ratio*100:.0f}% limit).",
+            )
+
+    if retention > (1.0 + max_drop_ratio):
+        if not (s_raw and len(s_after) <= len(s_raw) * 1.15):
+            return (
+                False,
+                f"Rejected patch batch: expanded text by {(retention - 1.0)*100:.1f}% without raw source backing.",
+            )
+
+    # For short documents (<4000 chars), also verify global SequenceMatcher similarity so
+    # equal-length substitutions (e.g. rewriting formulas/numbers) cannot slip past retention.
+    if max(len(s_before), len(s_after)) <= 4000:
+        sim = difflib.SequenceMatcher(None, s_before, s_after).ratio()
+        if sim < min_global_similarity:
+            if s_raw:
+                raw_sim_before = difflib.SequenceMatcher(None, s_raw, s_before).quick_ratio()
+                raw_sim_after = difflib.SequenceMatcher(None, s_raw, s_after).ratio()
+                if raw_sim_after > raw_sim_before and raw_sim_after >= min_global_similarity:
+                    return True, ""
+            return (
+                False,
+                f"Rejected patch batch: violated verbatim source fidelity (similarity {sim*100:.1f}% < {min_global_similarity*100:.0f}%).",
+            )
+
+    return True, ""
+
+
+def verbatim_preserved(
+    before_xml: str,
+    after_xml: str,
+    raw_ocr_text: Optional[str] = None,
+    max_drop_ratio: float = 0.20,
+) -> bool:
+    """Verifies via fuzzy alignment that patching did not corrupt or drop source text."""
+    ok, _ = validate_patch_verbatim(
+        before_xml,
+        after_xml,
+        raw_ocr_text=raw_ocr_text,
+        max_drop_ratio=max_drop_ratio,
+    )
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +392,45 @@ class SearchReplacePatcher:
                 applied_count += 1
                 continue
 
+            # Level 2b: Blank-line-ignoring line-trimmed match (handles \n\n vs \n\n\n\n differences)
+            search_nonempty = [line.strip() for line in search_str.splitlines() if line.strip()]
+            if len(search_nonempty) >= 2:
+                doc_nonempty = [
+                    (orig_idx, line.strip())
+                    for orig_idx, line in enumerate(current_text.splitlines())
+                    if line.strip()
+                ]
+                ne_matches = [
+                    i
+                    for i in range(len(doc_nonempty) - len(search_nonempty) + 1)
+                    if [t for _, t in doc_nonempty[i : i + len(search_nonempty)]] == search_nonempty
+                ]
+                if len(ne_matches) > 1:
+                    snippet = search_str[:80].replace("\n", " ")
+                    failed_reasons.append(
+                        f"Block #{idx} SEARCH block is ambiguous ({len(ne_matches)} matches); "
+                        f"add surrounding context to make it unique: '{snippet}...'"
+                    )
+                    continue
+                if len(ne_matches) == 1:
+                    m_idx = ne_matches[0]
+                    start_line_idx = doc_nonempty[m_idx][0]
+                    end_line_idx = doc_nonempty[m_idx + len(search_nonempty) - 1][0] + 1
+                    orig_raw_lines = current_text.splitlines(keepends=True)
+
+                    rep_lines = [line + "\n" for line in replace_str.splitlines()]
+                    if rep_lines and not replace_str.endswith("\n"):
+                        rep_lines[-1] = rep_lines[-1].rstrip("\n")
+
+                    patched_lines = (
+                        orig_raw_lines[:start_line_idx]
+                        + rep_lines
+                        + orig_raw_lines[end_line_idx:]
+                    )
+                    current_text = "".join(patched_lines)
+                    applied_count += 1
+                    continue
+
             # Level 3: Fuzzy character-mapped normalized whitespace match (unique match only)
             fuzzy_patched = cls._apply_fuzzy_whitespace_replace(
                 current_text, search_str, replace_str
@@ -292,24 +448,89 @@ class SearchReplacePatcher:
 
         return current_text, applied_count, failed_reasons
 
+    @classmethod
+    def apply_blocks_with_verbatim_guard(
+        cls,
+        current_xml: str,
+        baseline_xml: str,
+        blocks: List[SearchReplaceBlock],
+        raw_ocr_text: Optional[str] = None,
+        max_drop_ratio: float = 0.20,
+    ) -> Tuple[str, int, List[str]]:
+        """Apply blocks individually, rejecting only blocks that violate fuzzy verbatim fidelity.
+
+        Unlike all-or-nothing batch rollback, valid blocks in the same response are preserved
+        while individual offending blocks are filtered out with actionable error feedback.
+        """
+        if not blocks:
+            return current_xml, 0, []
+
+        raw_stripped = _strip_all_markup_for_verbatim(raw_ocr_text) if raw_ocr_text else ""
+        accepted_blocks: List[SearchReplaceBlock] = []
+        failed_reasons: List[str] = []
+
+        for idx, block in enumerate(blocks, start=1):
+            if contains_diff_sentinel(block.search_text) or contains_diff_sentinel(block.replace_text):
+                failed_reasons.append(
+                    f"Block #{idx} rejected: contains residual diff/conflict markers."
+                )
+                continue
+            ok, reason = validate_single_block_verbatim(
+                block.search_text,
+                block.replace_text,
+                raw_stripped=raw_stripped,
+                min_similarity=1.0 - max_drop_ratio,
+            )
+            if not ok:
+                failed_reasons.append(
+                    f"Block #{idx} rejected (violated verbatim source fidelity): {reason}"
+                )
+                continue
+            accepted_blocks.append(block)
+
+        if not accepted_blocks:
+            return current_xml, 0, failed_reasons
+
+        candidate_xml, applied, patch_fails = cls.apply_blocks(current_xml, accepted_blocks)
+        failed_reasons.extend(patch_fails)
+
+        if applied > 0:
+            if contains_diff_sentinel(candidate_xml) and not contains_diff_sentinel(current_xml):
+                failed_reasons.append(
+                    "Rejected patch batch: introduced residual diff/conflict markers."
+                )
+                return current_xml, 0, failed_reasons
+            ok_doc, doc_reason = validate_patch_verbatim(
+                baseline_xml,
+                candidate_xml,
+                raw_ocr_text=raw_ocr_text,
+                max_drop_ratio=max_drop_ratio,
+            )
+            if not ok_doc:
+                failed_reasons.append(doc_reason)
+                return current_xml, 0, failed_reasons
+
+        return candidate_xml, applied, failed_reasons
+
     @staticmethod
     def _apply_fuzzy_whitespace_replace(
         doc_text: str, search_str: str, replace_str: str
     ) -> Optional[str]:
         """
         Replaces flexible whitespace occurrences using linear-time, non-backtracking token matching.
-        Eliminates adjacent whitespace quantifiers to prevent ReDoS on large documents.
+        Falls back to head/tail anchor alignment for oversized (>2500 chars / >300 tokens) blocks.
         """
         if not search_str or not search_str.strip():
             return None
 
-        # Guard against excessively large search blocks that could degrade regex performance
-        if len(search_str) > 2500:
+        tokens = [re.escape(t) for t in re.findall(r"\w+|[^\w\s]", search_str.strip()) if t]
+        if not tokens:
             return None
 
-        tokens = [re.escape(t) for t in re.findall(r"\w+|[^\w\s]", search_str.strip()) if t]
-        if not tokens or len(tokens) > 300:
-            return None
+        if len(search_str) > 2500 or len(tokens) > 300:
+            return SearchReplacePatcher._apply_head_tail_fuzzy_replace(
+                doc_text, search_str, replace_str, tokens
+            )
 
         # Join tokens with flexible whitespace, ensuring NO adjacent or duplicate quantifiers
         pattern = r"\s*".join(tokens)
@@ -323,6 +544,48 @@ class SearchReplacePatcher:
         except Exception:
             pass
 
+        return None
+
+    @staticmethod
+    def _apply_head_tail_fuzzy_replace(
+        doc_text: str,
+        search_str: str,
+        replace_str: str,
+        tokens: List[str],
+    ) -> Optional[str]:
+        """Linear-time head+tail anchor matcher for large search blocks (>300 tokens)."""
+        if len(tokens) < 20:
+            return None
+        head_pat = r"\s*".join(tokens[:10])
+        tail_pat = r"\s*".join(tokens[-10:])
+        try:
+            head_matches = list(re.finditer(head_pat, doc_text))
+            if not head_matches or len(head_matches) > 8:
+                return None
+            tail_matches = list(re.finditer(tail_pat, doc_text))
+            if not tail_matches or len(tail_matches) > 8:
+                return None
+        except Exception:
+            return None
+
+        min_span = int(len(search_str) * 0.65)
+        max_span = int(len(search_str) * 1.50) + 400
+        search_compact = "".join(search_str.split())
+        candidates: List[Tuple[int, int]] = []
+
+        for hm in head_matches:
+            for tm in tail_matches:
+                span_len = tm.end() - hm.start()
+                if span_len < min_span or span_len > max_span:
+                    continue
+                cand_compact = "".join(doc_text[hm.start() : tm.end()].split())
+                sm = difflib.SequenceMatcher(None, cand_compact, search_compact)
+                if sm.quick_ratio() >= 0.90 and sm.ratio() >= 0.90:
+                    candidates.append((hm.start(), tm.end()))
+
+        if len(candidates) == 1:
+            start, end = candidates[0]
+            return doc_text[:start] + replace_str + doc_text[end:]
         return None
 
 
@@ -439,7 +702,7 @@ You must NOT output the entire file. You MUST ONLY output one or more Search/Rep
 3. PAIRED STIMULUS INTEGRITY: Shared passages serving 2+ questions MUST use paired <stimulus>...</stimulus> tags wrapping verbatim text from <<<RAW_SOURCE_TEXT>>> (never self-closing anchor tags). A <stimulus> MUST NEVER wrap <question_label>, <stem>, <option_label>, <option_text>, <explanation>, page metadata, or website watermarks.
 4. QUESTION STRUCTURE & NUMBERING: Wrap unannotated questions in <question_label> and <stem>. Never duplicate question labels.
 5. 100% VERBATIM FIDELITY: Ensure replacement text matches the raw OCR source text verbatim with no rewriting.
-6. EXACT SEARCH MATCHING: The text inside <<<<<<< SEARCH must match lines in CURRENT_ANNOTATED_XML character-for-character.
+6. EXACT SEARCH MATCHING: The text inside <<<<<<< SEARCH must match lines in CURRENT_ANNOTATED_XML character-for-character. If a repeated phrase could match multiple places (e.g. '## Hướng dẫn giải' or 'A. 1'), include the preceding <question_label> or 2-4 surrounding lines in SEARCH to make it unique.
 7. CONFIRMED-ERROR GATE: The diagnostics list contains only reviewer-confirmed true positives. Do not invent, repair, or discuss any other defect.
 8. FALSE-POSITIVE ASSESSMENT: If a supplied confirmed issue is not actually present after inspecting the source and XML, do not patch for it. You may report that disposition in this exact optional block:
 
@@ -457,7 +720,7 @@ If you include the block, assess only supplied issue IDs. A missing assessment m
 15. SOLUTION & GRADING KEY WRAPPING (ERR-03): If grading guides, answer key tables, or scoring rubrics ('HƯỚNG DẪN CHẤM', 'ĐÁP ÁN') were erroneously tagged as exam questions, replace them with `<explanation>...</explanation>`.
 16. LATEX DELIMITER REPAIR (ERR-04): When LaTeX math choices have inverted tags like `$<option_text>...$</option_text>`, replace with `<option_text>$...$</option_text>`. If figure attributes have accidental self-closing delimiters like `x /> 0`, remove or escape the accidental delimiter.
 17. TABLE BOUNDARY EXTRACTION (ERR-05): When a table containing choices or True/False statements is nested inside `<stem>`, close the stem BEFORE the table with `</stem>`, and tag the choice rows/cells with `<option_label>a)</option_label>` and `<option_text>Statement</option_text>`.
-18. ADMINISTRATIVE METADATA STRIPPING (ERR-06): When school headers, exam metadata, or administrative titles ('SỞ GD&ĐT', 'TRƯỜNG THPT', 'UBND TỈNH') are wrapped in `<section>`, remove `<section>` and `</section>`, leaving the text untagged plain text.
+18. ADMINISTRATIVE METADATA STRIPPING (ERR-06): When school headers, exam metadata, page numbers ('Trang 4'), website watermarks ('thuvienhoclieu.com', 'toanmath'), or administrative titles ('SỞ GD&ĐT', 'TRƯỜNG THPT', 'UBND TỈNH') are wrapped in `<section>` or `<explanation>`, ONLY remove the `<section>`/`</section>` or `<explanation>`/`</explanation>` wrapper tags—NEVER delete the underlying watermark, page number, or header text itself.
 """
 
 
@@ -693,22 +956,14 @@ class EditorAgent:
                 )
                 break
 
-            patched_xml, applied_count, failed_reasons = SearchReplacePatcher.apply_blocks(
-                current_xml, diff_blocks
+            patched_xml, applied_count, failed_reasons = (
+                SearchReplacePatcher.apply_blocks_with_verbatim_guard(
+                    current_xml=current_xml,
+                    baseline_xml=annotated_xml,
+                    blocks=diff_blocks,
+                    raw_ocr_text=raw_ocr_text,
+                )
             )
-            if applied_count > 0:
-                if contains_diff_sentinel(patched_xml) and not contains_diff_sentinel(current_xml):
-                    failed_reasons.append(
-                        "Rejected patch batch: introduced residual diff/conflict markers."
-                    )
-                    patched_xml = current_xml
-                    applied_count = 0
-                elif not verbatim_preserved(annotated_xml, patched_xml):
-                    failed_reasons.append(
-                        "Rejected patch batch: violated 100% verbatim source fidelity."
-                    )
-                    patched_xml = current_xml
-                    applied_count = 0
 
             total_applied_patches += applied_count
             all_failed_reasons.extend(failed_reasons)

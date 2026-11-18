@@ -360,3 +360,157 @@ def test_loop_emits_initial_and_round_checkpoints() -> None:
     assert checkpoints[1]["candidate_xml"] == "<stem>Original</stem>"
     assert checkpoints[1]["round_number"] == 1
     assert checkpoints[1]["review"]["decision"] == "PASS"
+
+
+def test_load_revision_targets_does_not_treat_no_llm_report_as_cached_llm(tmp_path) -> None:
+    import json
+    from sequence_labelling.annotator.revision_loop import load_revision_targets
+
+    raw_dir = tmp_path / "raw"
+    annot_dir = tmp_path / "annot"
+    chunk_dir = annot_dir / "exam_1" / "chunks"
+    chunk_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+
+    xml_p = chunk_dir / "chunk_0.xml"
+    xml_p.write_text("<explanation>### BẢNG ĐÁP ÁN\n1A</explanation>", encoding="utf-8")
+    (chunk_dir / "chunk_0.json").write_text('{"raw_chunk_text": "### BẢNG ĐÁP ÁN\\n1A"}', encoding="utf-8")
+    # Simulate stale LLM audit JSON on disk from an older run
+    (chunk_dir / "chunk_0.audit.json").write_text(
+        '{"doc_id": "exam_1::chunk_0", "overall_score": 95.0, "llm_score": 95.0, "decision": "PASS"}',
+        encoding="utf-8",
+    )
+
+    report_p = tmp_path / "heuristic_report.json"
+    report_p.write_text(
+        json.dumps(
+            {
+                "reports": [
+                    {
+                        "doc_id": "exam_1::chunk_0",
+                        "file_path": str(xml_p),
+                        "overall_score": 98.0,
+                        "decision": "NEEDS_REVISION",
+                        "llm_score": None,
+                        "confirmation_status": "not_run",
+                        "issues": [
+                            {
+                                "category": "mislabelled_element",
+                                "severity": "MAJOR",
+                                "message": "Answer key / rubric header inside <explanation>",
+                            }
+                        ],
+                        "confirmed_issues": [],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    targets = load_revision_targets(
+        report_path=report_p,
+        raw_dir=raw_dir,
+        annotated_dir=annot_dir,
+        decisions={"NEEDS_REVISION"},
+        granularity="chunk",
+    )
+    assert len(targets) == 1
+    assert targets[0]["cached_llm_result"] is None
+
+
+def test_load_revision_targets_chunk_falls_back_to_exam_markdown(tmp_path) -> None:
+    import json
+    from sequence_labelling.annotator.revision_loop import load_revision_targets
+
+    raw_dir = tmp_path / "raw"
+    annot_dir = tmp_path / "annot"
+    chunk_dir = annot_dir / "exam_single" / "chunks"
+    chunk_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+
+    xml_p = chunk_dir / "chunk_0.xml"
+    xml_p.write_text("<section>PART I</section>", encoding="utf-8")
+    raw_md = raw_dir / "exam_single.md"
+    raw_md.write_text("PART I", encoding="utf-8")
+
+    report_p = tmp_path / "report.json"
+    report_p.write_text(
+        json.dumps(
+            {
+                "reports": [
+                    {
+                        "doc_id": "exam_single::chunk_0",
+                        "file_path": str(xml_p),
+                        "raw_file_path": None,
+                        "overall_score": 85.0,
+                        "decision": "NEEDS_REVISION",
+                        "confirmation_status": "not_run",
+                        "issues": [],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    targets = load_revision_targets(
+        report_path=report_p,
+        raw_dir=raw_dir,
+        annotated_dir=annot_dir,
+        decisions={"NEEDS_REVISION"},
+        granularity="chunk",
+    )
+    assert len(targets) == 1
+    assert targets[0]["raw_path"] == raw_md.resolve()
+
+
+def test_loop_retries_round_2_when_round_1_patch_fails_to_apply() -> None:
+    editor_calls: List[List[Dict[str, str]]] = []
+    responses = iter(
+        [
+            """<<<<<<< SEARCH
+<section>Nonexistent snippet</section>
+=======
+<stem>Sample text</stem>
+>>>>>>> REPLACE""",
+            """<<<<<<< SEARCH
+<section>Sample text</section>
+=======
+<stem>Sample text</stem>
+>>>>>>> REPLACE""",
+        ]
+    )
+
+    def complete(messages: List[Dict[str, str]], **_: Any) -> str:
+        editor_calls.append(list(messages))
+        return next(responses)
+
+    reviewer = Mock(spec=AnnotationReviewerAgent)
+    reviewer.review_document.side_effect = [
+        _report(60, ReviewDecision.NEEDS_REVISION, "Initial error"),
+        _report(60, ReviewDecision.NEEDS_REVISION, "Initial error"),
+        _report(95, ReviewDecision.PASS),
+    ]
+
+    loop = EditorReviewerLoop(editor=EditorAgent(), reviewer=reviewer, max_rounds=2)
+    result = loop.run(
+        annotated_xml="<section>Sample text</section>",
+        raw_ocr_text="Sample text",
+        doc_id="exam_retry",
+        editor_completion_fn=complete,
+    )
+
+    assert result.success is True
+    assert result.rounds_completed == 2
+    assert result.repaired_xml == "<stem>Sample text</stem>"
+    assert "PREVIOUS_ROUND_PATCH_FAILURES" in editor_calls[1][-1]["content"]
+
+
+def test_resolve_provider_and_account_daominhwysi() -> None:
+    from sequence_labelling.llm.deepseek_client import _resolve_provider_and_account
+
+    assert _resolve_provider_and_account("daominhwysi", None) == ("agy", "daominhwysi")
+    assert _resolve_provider_and_account("agy:daominhwysi", None) == ("agy", "daominhwysi")
+    assert _resolve_provider_and_account("agy", "daominhwysi") == ("agy", "daominhwysi")
+

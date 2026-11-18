@@ -891,7 +891,8 @@ def test_reviewer_system_prompt_contains_parser_example_and_rules():
     assert "<section>PHẦN I." in prompt
     assert "<question_label>Câu 1:</question_label>" in prompt
     assert "<option_label>a)</option_label>" in prompt
-    assert "<explanation>HƯỚNG DẪN GIẢI CHI TIẾT:" in prompt
+    assert "<section>HƯỚNG DẪN GIẢI CHI TIẾT:</section>" in prompt
+    assert "<explanation>Câu 1:" in prompt
     assert "<|END|>" in prompt
 
     # 2. Verify system vs non-system xml tag rule
@@ -1523,6 +1524,131 @@ def test_check_section_4_lock_catches_admin_bold_html_and_question_headings():
     ok_issues, ok_score, _ = DeterministicAuditor.check_question_and_option_structure(valid_part)
     assert ok_score == 100.0
     assert ok_issues == []
+
+
+def test_check_paired_stimulus_integrity_catches_trailing_single_question():
+    trailing_sq = (
+        "<stimulus>Đoạn văn dài hơn năm mươi ký tự dùng để kiểm tra stimulus ở cuối bài.</stimulus>\n"
+        "<question_label>Câu 1.</question_label> <stem>Nội dung câu hỏi duy nhất?</stem>\n"
+        "<option_label>A.</option_label> <option_text>Đúng</option_text>"
+    )
+    issues, score = DeterministicAuditor.check_paired_stimulus_integrity(trailing_sq)
+    assert score < 100.0
+    assert any(iss.category == "single_question_stimulus" for iss in issues)
+
+
+def test_check_annotation_rule_heuristics_catches_dataset_violations():
+    # 1. Markdown heading hashes outside question_label
+    bad_md = "## <question_label>Câu 1.</question_label> <stem>Nội dung</stem>"
+    iss_md, s_md = DeterministicAuditor.check_annotation_rule_heuristics(bad_md)
+    assert s_md < 100.0
+    assert any("Markdown heading hashes" in iss.message for iss in iss_md)
+
+    # 2. Sentence arrangement propositions mislabelled as option_label
+    bad_arr = (
+        "<question_label>Question 13.</question_label> <stem>Arrange:</stem>\n"
+        "<option_label>a.</option_label> <option_text>First sentence.</option_text>\n"
+        "<option_label>b.</option_label> <option_text>Second sentence.</option_text>\n"
+        "<option_label>c.</option_label> <option_text>Third sentence.</option_text>\n"
+        "<option_label>A.</option_label> <option_text>a - b - c</option_text>\n"
+        "<option_label>B.</option_label> <option_text>b - a - c</option_text>\n"
+        "<option_label>C.</option_label> <option_text>c - b - a</option_text>\n"
+        "<option_label>D.</option_label> <option_text>a - c - b</option_text>"
+    )
+    iss_arr, s_arr = DeterministicAuditor.check_annotation_rule_heuristics(bad_arr)
+    assert s_arr < 100.0
+    assert any("Sentence arrangement" in iss.message for iss in iss_arr)
+
+    # 3. Cell-level barem explanation
+    bad_cell = (
+        "<table><tr><td><explanation>Bước 1</explanation></td><td><explanation>**0.5**</explanation></td></tr></table>"
+    )
+    iss_cell, s_cell = DeterministicAuditor.check_annotation_rule_heuristics(bad_cell)
+    assert s_cell < 100.0
+    assert any("cell-level <explanation>" in iss.message for iss in iss_cell)
+
+    # 4. Answer header wrapped inside explanation & untagged answer header
+    bad_hdr_in = "<explanation>### BẢNG ĐÁP ÁN\nCâu 1 chọn A.</explanation>"
+    iss_h1, _ = DeterministicAuditor.check_annotation_rule_heuristics(bad_hdr_in)
+    assert any("wrapped inside <explanation>" in iss.message for iss in iss_h1)
+
+    bad_hdr_out = "### HƯỚNG DẪN GIẢI CHI TIẾT\n\n<explanation>Câu 1 chọn A.</explanation>"
+    iss_h2, _ = DeterministicAuditor.check_annotation_rule_heuristics(bad_hdr_out)
+    assert any("left untagged" in iss.message for iss in iss_h2)
+
+    # 5. Clean canonical XML should score 100.0
+    clean_xml = (
+        "<section>PHẦN I. TRẮC NGHIỆM</section>\n"
+        "<question_label>## Câu 1.</question_label> <stem>Tính tổng $1 + 1$?</stem>\n"
+        "<option_label>A.</option_label> <option_text>2</option_text>\n"
+        "<section>### HƯỚNG DẪN GIẢI</section>\n"
+        "<explanation><table><tr><th>Câu</th><th>Đáp án</th><th>Điểm</th></tr>"
+        "<tr><td>1</td><td>A</td><td>**0,5**</td></tr></table></explanation>"
+    )
+    iss_ok, s_ok = DeterministicAuditor.check_annotation_rule_heuristics(clean_xml)
+    assert s_ok == 100.0
+    assert iss_ok == []
+
+
+def test_check_annotation_rule_heuristics_allows_per_question_inline_loi_giai():
+    """Per-question '**Lời giải**' / '## Hướng dẫn giải' inside <explanation> is valid, not an exam-wide <section>."""
+    xml_inline = (
+        "<question_label>Câu 1.</question_label> <stem>Tính 1+1?</stem>\n"
+        "<option_label>A.</option_label> <option_text>2</option_text>\n"
+        "<explanation>**Lời giải**\nTa có $1+1=2$. Chọn A.</explanation>\n\n"
+        "<question_label>Câu 2.</question_label> <stem>Tính 2+2?</stem>\n"
+        "<option_label>A.</option_label> <option_text>4</option_text>\n"
+        "<explanation>## Hướng dẫn giải\nTa có $2+2=4$.</explanation>\n"
+    )
+    iss_ok, s_ok = DeterministicAuditor.check_annotation_rule_heuristics(xml_inline)
+    assert s_ok == 100.0
+    assert iss_ok == []
+
+
+def test_check_annotation_rule_heuristics_allows_true_false_and_variation_tables_in_loi_giai():
+    """True/False a-d summary tables and math variation tables inside single-question <explanation> are valid."""
+    xml_tf = (
+        "<question_label>Câu 1.</question_label> <stem>Xét tính đúng sai:</stem>\n"
+        "<explanation>**Lời giải**\n"
+        "<table><tr><th>a) Đúng</th><th>b) Sai</th><th>c) Đúng</th><th>d) Sai</th></tr></table>\n"
+        "a) Đúng. b) Sai.</explanation>\n\n"
+        "<question_label>Câu 2.</question_label> <stem>Tìm cực trị:</stem>\n"
+        "<explanation>### Lời giải\nBảng biến thiên:\n"
+        "<table><tr><th>$x$</th><td>$-\\infty$</td><td>$0$</td><td>$+\\infty$</td></tr></table></explanation>\n"
+    )
+    iss_ok, s_ok = DeterministicAuditor.check_annotation_rule_heuristics(xml_tf)
+    assert s_ok == 100.0
+    assert iss_ok == []
+
+    # Multi-question answer-key table under Lời giải MUST still be flagged
+    xml_bad = (
+        "<explanation>**Lời giải**\n"
+        "<table><tr><th>Câu</th><th>Đáp án</th></tr><tr><td>1</td><td>A</td></tr><tr><td>2</td><td>B</td></tr></table>"
+        "</explanation>"
+    )
+    iss_bad, s_bad = DeterministicAuditor.check_annotation_rule_heuristics(xml_bad)
+    assert s_bad < 100.0
+    assert any("wrapped inside <explanation>" in iss.message for iss in iss_bad)
+
+
+def test_review_semantic_retries_on_empty_or_malformed_json():
+    """Verify DeepSeekReviewer.review_semantic retries when response is empty or invalid JSON."""
+    reviewer = DeepSeekReviewer(model="gemini-3.8-flash", provider="daominhwysi", thinking="medium")
+    valid_json = '{"parser_error_confirmations": [], "issues": [], "summary": "OK"}'
+    with (
+        patch("sequence_labelling.annotator.reviewer.time.sleep"),
+        patch(
+            "sequence_labelling.annotator.reviewer.chat",
+            side_effect=["", "{bad json", valid_json],
+        ) as mock_chat,
+    ):
+        result = reviewer.review_semantic(
+            xml_content="<stem>1+1=?</stem>",
+            deterministic_metrics={},
+        )
+    assert result == {"parser_error_confirmations": [], "issues": [], "summary": "OK"}
+    assert mock_chat.call_count == 3
+
 
 
 

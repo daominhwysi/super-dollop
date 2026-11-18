@@ -671,11 +671,16 @@ class DeterministicAuditor:
             r"(?:SỞ\s+(?:GD|GIÁO\s+DỤC)|TRƯỜNG\s+(?:THPT|THCS|TIỂU\s+HỌC|ĐẠI\s+HỌC)|"
             r"UBND\s+(?:TỈNH|THÀNH\s+PHỐ|HUYỆN|THỊ\s+XÃ|QUẬN)|PHÒNG\s+(?:GD|GIÁO\s+DỤC)|"
             r"BỘ\s+GIÁO\s+DỤC|CỤM\s+CHUYÊN\s+MÔN|KỲ\s+THI|Mã\s+đề(?:\s+thi)?\s*:|"
+            r"KIỂM\s+TRA\s+(?:GIỮA|CUỐI)\s+(?:HỌC\s+)?K[ỲÌ]|Môn(?:\s+thi)?\s*:|Ngày\s+kiểm\s+tra\s*:|"
             r"-{3,}\s*HẾT\s*-{3,}|\*\*HẾT\*\*|-+\s*Hết\s*-+|"
             r"Thí\s+sinh\s+không\s+được\s+sử\s+dụng|Giám\s+thị\s+coi\s+thi|"
             r"Họ,?\s*tên\s+thí\s+sinh|Số\s+báo\s+danh|Thời\s+gian\s+làm\s+bài|"
             r"Đề\s+(?:thi\s+)?có\s+\d+\s+trang|ĐỀ\s+CHÍNH\s+THỨC|"
             r"thuvienhoclieu|toanmath|tailieutoan|vietjack|loigiaihay|Moon\.vn|https?://|www\.)",
+            re.IGNORECASE,
+        )
+        valid_part_guard_re = re.compile(
+            r"(?:PHẦN\s+[IVX0-9]+|PART\s+[A-Z0-9]+|BẢNG\s+ĐÁP\s+ÁN|HƯỚNG\s+DẪN|ĐỌC\s+HIỂU)",
             re.IGNORECASE,
         )
         divider_or_page_re = re.compile(r"^\s*(?:[-–—=*_]{2,}|(?:Trang|Page)\s+\d+(?:\s*/\s*\d+)?|\d+)\s*$", re.IGNORECASE)
@@ -687,7 +692,10 @@ class DeterministicAuditor:
         for sm in section_matches:
             plain = re.sub(r"<[^>]+>", " ", sm.group(1))
             plain_no_md = re.sub(r"^[\s#*_=]+", "", plain, flags=re.MULTILINE).strip()
-            if admin_sec_re.search(sm.group(1)) or divider_or_page_re.match(plain.strip()):
+            if (
+                (admin_sec_re.search(sm.group(1)) and not valid_part_guard_re.search(plain_no_md))
+                or divider_or_page_re.match(plain.strip())
+            ):
                 admin_sec_matches.append(sm)
             if q_head_sec_re.match(plain_no_md) or (len(plain.strip()) > 400 and swallow_q_sec_re.search(plain_no_md)):
                 q_sec_matches.append(sm)
@@ -1033,21 +1041,292 @@ class DeterministicAuditor:
                 deductions += 15.0
                 continue
 
-            # 3. Bounded multi-question rule when a terminating <section> or <stimulus> follows
+            # 3. Bounded or trailing single-question stimulus rule
             next_bound = boundary_re.search(xml_content, s_end)
-            if next_bound:
-                scope_text = xml_content[s_end : next_bound.start()]
-                q_count = len(q_label_re.findall(scope_text))
-                if q_count == 1:
+            scope_text = xml_content[s_end : next_bound.start()] if next_bound else xml_content[s_end:]
+            q_count = len(q_label_re.findall(scope_text))
+            has_complete_single_q = q_count == 1 and bool(
+                re.search(r"</(?:stem|option_text|explanation)>", scope_text)
+            )
+            if (next_bound and q_count == 1) or (not next_bound and has_complete_single_q):
+                line_num = xml_content.count("\n", 0, s_start) + 1
+                issues.append(
+                    AuditIssue(
+                        category="single_question_stimulus",
+                        severity=IssueSeverity.MAJOR,
+                        message=(
+                            f"Stimulus #{stim_idx + 1} serves only 1 question"
+                            f"{' before the next section/stimulus boundary' if next_bound else ' at document/chunk end'}."
+                        ),
+                        line_number=line_num,
+                        context_snippet=clean_inner[:120],
+                    )
+                )
+                deductions += 10.0
+
+        score = max(0.0, 100.0 - deductions)
+        return issues, score
+
+    @staticmethod
+    def check_annotation_rule_heuristics(xml_content: str) -> Tuple[List[AuditIssue], float]:
+        """
+        Code-based heuristic checks enforcing AGENTS.md invariants and prompt_annotator.md Rules 11-18:
+        1. Markdown heading prefixes ('#', '##') must sit inside <question_label> (AGENTS.md 1.2 / Rule 18-1).
+        2. Sentence arrangement items ('a.', 'b.', 'c.') before 'A. a-b-c' permutations belong inside <stem> (AGENTS.md 1.3).
+        3. Rubric/barem HTML <table> must be wrapped whole in <explanation>, never split per <td> cell (Rule 18-4).
+        4. Answer-key / rubric headers belong in <section>, neither absorbed inside <explanation> nor untagged before it (Rule 18-3/4).
+        5. Untagged rubric/barem score tables outside <explanation> must be wrapped in <explanation> (Rule 18-4).
+        6. Self-closing <figure .../> tags must remain atomic without XML tags interrupting them (Rule 11).
+        """
+        issues: List[AuditIssue] = []
+        deductions = 0.0
+        if not xml_content or not xml_content.strip():
+            return issues, 100.0
+
+        # 1. Markdown heading hashes left outside <question_label>
+        md_q_orphan_re = re.compile(
+            r"(?:^|\n)(#{1,6}\s*)</?(?:option_text|stem|section)>\s*<question_label>"
+            r"|(?:^|\n)(#{1,6}[ \t]+)<question_label>",
+            re.MULTILINE,
+        )
+        m_md = md_q_orphan_re.search(xml_content)
+        if m_md:
+            line_num = xml_content.count("\n", 0, m_md.start()) + 1
+            snippet = xml_content[max(0, m_md.start() - 10) : m_md.end() + 40].replace("\n", " ")
+            issues.append(
+                AuditIssue(
+                    category="mislabelled_element",
+                    severity=IssueSeverity.MAJOR,
+                    message=(
+                        "Markdown heading hashes ('##'/'#') immediately precede <question_label> outside the tag. "
+                        "Per AGENTS.md §1.2 and Rule 18(1), move the leading heading hashes inside <question_label>."
+                    ),
+                    line_number=line_num,
+                    context_snippet=snippet[:140],
+                )
+            )
+            deductions += 10.0
+
+        # 2. Sentence arrangement propositions (a., b., c.) mislabelled as <option_label> before A. a-b-c
+        q_matches = list(re.finditer(r"<question_label>(.*?)</question_label>", xml_content, re.DOTALL))
+        lower_opt_re = re.compile(r"^\s*[a-e]\s*[.)]\s*$", re.IGNORECASE)
+        upper_opt_re = re.compile(r"^\s*[A-D]\s*[.)]?\s*$")
+        perm_text_re = re.compile(r"^\s*[a-e](?:\s*[-–—]\s*[a-e]){2,}\s*\.?\s*$", re.IGNORECASE)
+        for i, qm in enumerate(q_matches):
+            q_end = q_matches[i + 1].start() if i + 1 < len(q_matches) else len(xml_content)
+            block = xml_content[qm.end() : q_end]
+            opts = list(
+                re.finditer(
+                    r"<option_label>(.*?)</option_label>\s*<option_text>(.*?)</option_text>",
+                    block,
+                    re.DOTALL,
+                )
+            )
+            if len(opts) >= 6:
+                has_lower = any(lower_opt_re.match(o.group(1)) for o in opts)
+                has_perm = any(
+                    upper_opt_re.match(o.group(1))
+                    and perm_text_re.match(re.sub(r"<[^>]+>", "", o.group(2)))
+                    for o in opts
+                )
+                if has_lower and has_perm:
+                    line_num = xml_content.count("\n", 0, qm.start()) + 1
+                    snippet = xml_content[qm.start() : min(len(xml_content), qm.start() + 140)].replace("\n", " ")
                     issues.append(
                         AuditIssue(
-                            category="single_question_stimulus",
+                            category="mislabelled_element",
                             severity=IssueSeverity.MAJOR,
-                            message=f"Stimulus #{stim_idx + 1} serves only 1 question before the next section/stimulus boundary.",
-                            context_snippet=clean_inner[:120],
+                            message=(
+                                "Sentence arrangement propositions (a., b., c., ...) were mislabelled as <option_label>/<option_text> "
+                                "before permutation options (A. a-b-c). Per AGENTS.md §1.3, fold sentence propositions a.-e. inside <stem> "
+                                "and reserve <option_label>/<option_text> strictly for A.-D. choices."
+                            ),
+                            line_number=line_num,
+                            context_snippet=snippet,
                         )
                     )
-                    deductions += 10.0
+                    deductions += 15.0
+                    break
+
+        # 3. Cell-level <explanation> split inside HTML <td>/<th> barem table
+        expl_matches = list(re.finditer(r"<explanation\b[^>]*>(.*?)</explanation>", xml_content, re.DOTALL | re.IGNORECASE))
+        cell_hits: List[re.Match] = []
+        for em in expl_matches:
+            before = xml_content[max(0, em.start() - 35) : em.start()]
+            after = xml_content[em.end() : min(len(xml_content), em.end() + 20)]
+            if re.search(r"<t[dh]\b[^>]*>\s*$", before, re.IGNORECASE) and re.match(
+                r"\s*</t[dh]>", after, re.IGNORECASE
+            ):
+                cell_hits.append(em)
+        if cell_hits:
+            first_hit = cell_hits[0]
+            line_num = xml_content.count("\n", 0, first_hit.start()) + 1
+            snippet = xml_content[max(0, first_hit.start() - 20) : min(len(xml_content), first_hit.end() + 20)].replace("\n", " ")
+            issues.append(
+                AuditIssue(
+                    category="mislabelled_element",
+                    severity=IssueSeverity.MAJOR,
+                    message=(
+                        f"Found {len(cell_hits)} cell-level <explanation> tags fragmented inside <td>/<th> cells of a barem table. "
+                        f"Per Rule 18(4), wrap the entire rubric <table>...</table> inside one unified <explanation>...</explanation> block."
+                    ),
+                    line_number=line_num,
+                    context_snippet=snippet[:140],
+                )
+            )
+            deductions += 15.0
+
+        # 4. Answer-key / rubric header inside <explanation> or left untagged in plain text before <explanation>
+        # Section-level answer key / rubric headers (NOT per-question "**Lời giải**" / "**Đáp án:** A").
+        section_answer_header_re = re.compile(
+            r"^(?:#{1,6}\s*)?(?:\*{1,2})?(?:BẢNG\s+ĐÁP\s+ÁN(?:\s+[A-ZÀ-Ỹ0-9\s]+)?|"
+            r"ĐÁP\s+ÁN(?:\s+CHI\s+TIẾT|\s+THAM\s+KHẢO|\s+ĐỀ\s+THI|\s+CÁC\s+MÃ\s+ĐỀ)?|"
+            r"HƯỚNG\s+DẪN\s+CHẤM(?:\s+CHI\s+TIẾT)?|THANG\s+ĐIỂM(?:\s+ĐÁP\s+ÁN)?)\s*(?:\*{1,2})?:?\s*$",
+            re.IGNORECASE,
+        )
+        solution_header_re = re.compile(
+            r"^(?:#{1,6}\s*)?(?:\*{1,2})?(?:HƯỚNG\s+DẪN\s+GIẢI(?:\s+CHI\s+TIẾT)?|LỜI\s+GIẢI(?:\s+CHI\s+TIẾT)?)\s*(?:\*{1,2})?\.?:?\s*$",
+            re.IGNORECASE,
+        )
+        multi_q_in_expl_re = re.compile(
+            r"(?:\b(?:Câu|Question|Bài)\s+\d+\b|\b1\s*[.)]\s*[A-D]\b[\s\S]{0,120}\b2\s*[.)]\s*[A-D]\b)",
+            re.IGNORECASE,
+        )
+
+        def _is_multi_question_solution_body(body: str) -> bool:
+            if len(set(re.findall(r"\b(?:Câu|Question|Bài)\s+(\d+)\b", body, re.IGNORECASE))) >= 2:
+                return True
+            if re.search(r"\b1\s*[.)]\s*[A-D]\b[\s\S]{0,120}\b2\s*[.)]\s*[A-D]\b", body):
+                return True
+            for tbl_match in re.finditer(r"<table\b[\s\S]*?</table>", body, re.IGNORECASE):
+                tbl_text = re.sub(r"<[^>]+>", " ", tbl_match.group(0))
+                if len(set(re.findall(r"\b(?:Câu|Question|Bài)\s*(\d+)\b", tbl_text, re.IGNORECASE))) >= 2:
+                    return True
+                if len(set(re.findall(r"\b(\d{1,2})\s*[.):-]?\s*[A-D]\b", tbl_text))) >= 2:
+                    return True
+                if re.search(r"\b(?:Câu|Bài)\b[\s\S]{0,60}\b(?:Đáp\s*án|Điểm)\b", tbl_text, re.IGNORECASE):
+                    return True
+            return False
+
+        hdr_in_hits = 0
+        for em in expl_matches:
+            expl_body = em.group(1)
+            first_line = expl_body.lstrip().splitlines()[0].strip() if expl_body.strip() else ""
+            if not first_line:
+                continue
+            is_sec_hdr = bool(section_answer_header_re.match(first_line))
+            is_multi_sol_hdr = bool(
+                solution_header_re.match(first_line)
+                and _is_multi_question_solution_body(expl_body)
+            )
+            if is_sec_hdr or is_multi_sol_hdr:
+                line_num = xml_content.count("\n", 0, em.start()) + 1
+                issues.append(
+                    AuditIssue(
+                        category="mislabelled_element",
+                        severity=IssueSeverity.MAJOR,
+                        message=(
+                            f"Answer key / rubric header '{first_line[:60]}' is wrapped inside <explanation> instead of <section>. "
+                            f"Per Rule 18(3)-(4), place answer key titles inside <section>...</section> and wrap only the solutions/table below in <explanation>."
+                        ),
+                        line_number=line_num,
+                        context_snippet=xml_content[em.start() : min(len(xml_content), em.start() + 140)].replace("\n", " "),
+                    )
+                )
+                deductions += 10.0
+                hdr_in_hits += 1
+                if hdr_in_hits >= 5:
+                    break
+
+        hdr_out_hits = 0
+        for em in expl_matches:
+            prev_chunk = xml_content[max(0, em.start() - 220) : em.start()].rstrip()
+            lines_before = prev_chunk.splitlines()
+            last_line = lines_before[-1].strip() if lines_before else ""
+            if not last_line or last_line.endswith(">"):
+                continue
+            before_hdr = "\n".join(lines_before[:-1]).rstrip()
+            after_question_item = bool(re.search(r"</(?:option_text|stem|question_label)>\s*$", before_hdr))
+            is_sec_hdr = bool(section_answer_header_re.match(last_line))
+            is_sol_sec_hdr = bool(
+                solution_header_re.match(last_line)
+                and not after_question_item
+                and (
+                    last_line.startswith("#")
+                    or "CHI TIẾT" in last_line.upper()
+                    or _is_multi_question_solution_body(em.group(1))
+                    or len(multi_q_in_expl_re.findall(em.group(1))) >= 1
+                )
+            )
+            if is_sec_hdr or is_sol_sec_hdr:
+                line_num = xml_content.count("\n", 0, em.start()) + 1
+                issues.append(
+                    AuditIssue(
+                        category="mislabelled_element",
+                        severity=IssueSeverity.MAJOR,
+                        message=(
+                            f"Answer key / rubric header '{last_line[:60]}' directly preceding <explanation> was left untagged. "
+                            f"Per Rule 18(3), wrap answer key / grading headers in <section>...</section>."
+                        ),
+                        line_number=line_num,
+                        context_snippet=f"{last_line} ... <explanation>"[:140],
+                    )
+                )
+                deductions += 10.0
+                hdr_out_hits += 1
+                if hdr_out_hits >= 5:
+                    break
+
+        # 5. Completely untagged rubric/barem table outside <explanation>
+        spec_matrix_re = re.compile(
+            r"(?:Chương\s*/?\s*chủ\s+đề|Nhận\s+biết|Thông\s+hiểu|Vận\s+dụng|Mức\s+độ\s+đánh\s+giá)",
+            re.IGNORECASE,
+        )
+        score_val_re = re.compile(r"(?:\*\*\s*)?(?:0[.,](?:25|5|75)|[1-9][.,]0)\s*(?:đ|điểm)?(?:\s*\*\*)?")
+        for m_tbl in re.finditer(r"<table>.*?</table>", xml_content, re.DOTALL | re.IGNORECASE):
+            tbl = m_tbl.group(0)
+            prefix = xml_content[max(0, m_tbl.start() - 1200) : m_tbl.start()]
+            if prefix.rfind("<explanation>") > prefix.rfind("</explanation>"):
+                continue
+            if prefix.rfind("<stimulus>") > prefix.rfind("</stimulus>"):
+                continue
+            if "<explanation>" not in tbl and "<option_text>" not in tbl and not spec_matrix_re.search(tbl):
+                score_hits = len(score_val_re.findall(tbl))
+                if score_hits >= 3 and re.search(r"(?:Câu|Bài|Điểm|Đáp án|Nội dung)", tbl, re.IGNORECASE):
+                    line_num = xml_content.count("\n", 0, m_tbl.start()) + 1
+                    issues.append(
+                        AuditIssue(
+                            category="mislabelled_element",
+                            severity=IssueSeverity.MAJOR,
+                            message=(
+                                f"Found an untagged scoring/barem <table> ({score_hits} score cells) outside <explanation>. "
+                                f"Per Rule 18(4) and Eval Rule 7, wrap rubric and answer tables in <explanation>...</explanation>."
+                            ),
+                            line_number=line_num,
+                            context_snippet=tbl[:140].replace("\n", " "),
+                        )
+                    )
+                    deductions += 15.0
+                    break
+
+        # 6. <figure .../> placeholder split by an XML system tag
+        broken_fig_m = re.search(
+            r"<figure\b[^>]*(?:</?(?:section|stimulus|question_label|stem|option_label|option_text|explanation)\b)",
+            xml_content,
+            re.IGNORECASE,
+        )
+        if broken_fig_m:
+            line_num = xml_content.count("\n", 0, broken_fig_m.start()) + 1
+            issues.append(
+                AuditIssue(
+                    category="xml_syntax",
+                    severity=IssueSeverity.MAJOR,
+                    message="Self-closing <figure .../> placeholder was illegally split by a system XML tag (violates Rule 11 Figure Immutability).",
+                    line_number=line_num,
+                    context_snippet=broken_fig_m.group(0)[:140].replace("\n", " "),
+                )
+            )
+            deductions += 15.0
 
         score = max(0.0, 100.0 - deductions)
         return issues, score
@@ -1729,8 +2008,8 @@ Trong mỗi ý a), b), c), d) ở mỗi câu, thí sinh chọn đúng hoặc sai
 - <option_label>c)</option_label> <option_text>Gia tốc cực đại của vật là $a_{\\max} = 400\\text{ cm/s}^2$.</option_text>
 - <option_label>d)</option_label> <option_text>Tại thời điểm $t = 0$, vật đang đi qua vị trí cân bằng theo chiều dương.</option_text>
 
-<explanation>HƯỚNG DẪN GIẢI CHI TIẾT:
-Câu 1: Chọn B vì vectơ E và B dao động cùng pha.
+<section>HƯỚNG DẪN GIẢI CHI TIẾT:</section>
+<explanation>Câu 1: Chọn B vì vectơ E và B dao động cùng pha.
 Câu 2: Bước sóng $\\lambda = c / f = 3 \\cdot 10^8 / 10^8 = 3\\text{ m}$. Chọn A.</explanation>
 ```
 
@@ -1839,6 +2118,9 @@ When reporting issues, you MUST categorize each error using one of the following
 10. **Zero Questions / Non-Exam Front Matter**: If a document or chunk consists of front matter (book cover, table of contents, foreword, user guide, exam matrix analysis, syllabus summary) and contains no actual exam questions, having 0 questions in XML is 100% CORRECT and VALID. If a deterministic finding claims zero questions or unannotated questions for such non-exam text, confirm it as a FALSE POSITIVE (`is_true_positive: false`).
 11. **Section Tags & 4-Lock Protocol**: Tagging section dividers is governed strictly by the 4-Lock Protocol: (1) Markdown question headings (e.g. `## Câu 1.`) belong 100% inside `<question_label>`, NEVER `<section>`. Tagging question headers as `<section>` is a `mislabelled_element` defect. (2) Administrative metadata (school name `SỞ GD&ĐT`, exam title, code `MÃ ĐỀ: 101`, footer `--- HẾT ---`) MUST remain UNTAGGED plain text. Tagging metadata as `<section>` is a `mislabelled_element` defect. (3) Major exam part titles (`PHẦN I`, `PART 5`, `ĐỌC HIỂU`) and answer key headers (`### BẢNG ĐÁP ÁN`, `### HƯỚNG DẪN GIẢI`) are valid `<section>` tags. (4) Worked solutions below answer keys belong in `<explanation>`.
 12. **Neural Sequence Model Tags (Paired Stimulus Tags Valid)**: In this model evaluation, the system evaluates a neural token classification model (ModernBERT BIO tags). Therefore, `<stimulus>...</stimulus>` legitimately appears as standard paired XML tags wrapping the stimulus text. Both paired `<stimulus>...</stimulus>` and self-closing anchor `<stimulus id="..." />` tags are 100% VALID and ACCEPTED. NEVER report paired `<stimulus>...</stimulus>` as malformed, broken syntax, or missing anchor attributes!
+13. **Sentence Arrangement Questions (`a., b., c.` inside `<stem>`)**: When a question presents ordered sentence propositions labeled `a., b., c., d., e.` followed by permutation choices (`A. a-b-c`, `B. b-a-c`, etc.), the propositions `a.-e.` belong INSIDE `<stem>`, NEVER `<option_label>`/`<option_text>`. Only the permutation options `A., B., C., D.` are `<option_label>`/`<option_text>`.
+14. **Table Boundary Rule (No `<table>` Inside `<stem>`)**: In questions with tables containing statements or options, `<stem>` MUST close BEFORE `<table>` opens; choices/statements in the table belong in `<option_label>`/`<option_text>`, never swallowed inside `<stem>`.
+15. **Unified Barem / Answer Tables (Rule 18-4)**: Scoring rubric and answer tables below an answer key `<section>` header MUST be wrapped as one whole `<explanation><table>...</table></explanation>` block, NEVER fragmented cell-by-cell (`<td><explanation>...</explanation></td>`) and NEVER including the `### BẢNG ĐÁP ÁN` title inside `<explanation>`.
 
 ---
 
@@ -1913,6 +2195,43 @@ Respond ONLY with a valid JSON object with NO markdown codeblocks or extra text:
             f"{tail}"
         )
 
+    @staticmethod
+    def _parse_llm_json_response(raw_response: str) -> Tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+        """Parse reviewer JSON output, tolerating think tags, fences, trailing commas, and LaTeX escapes."""
+        cleaned = (raw_response or "").strip()
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if len(lines) >= 2:
+                cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return None, ValueError("Empty LLM response")
+
+        json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        target_json = json_match.group(0) if json_match else cleaned
+
+        sanitized = re.sub(r",\s*([\]}])", r"\1", target_json)
+        escape_pattern = r'(\\+)([^"\\/bfnrtu]|u(?![\da-fA-F]{4}))'
+
+        def _fix_slashes(m):
+            slashes = m.group(1)
+            follow = m.group(2)
+            if len(slashes) % 2 == 1:
+                return slashes + "\\" + follow
+            return m.group(0)
+
+        sanitized = re.sub(escape_pattern, _fix_slashes, sanitized)
+        last_err: Optional[Exception] = None
+        for candidate in (sanitized, target_json):
+            try:
+                parsed = json.loads(candidate, strict=False)
+                if isinstance(parsed, dict):
+                    return parsed, None
+            except Exception as err:
+                last_err = err
+        return None, last_err
+
     def review_semantic(
         self,
         xml_content: str,
@@ -1975,55 +2294,34 @@ Respond ONLY with a valid JSON object with NO markdown codeblocks or extra text:
             f"Inspect the document, confirm the supplied deterministic findings, identify only additional parser errors, and return your JSON report."
         )
 
-        try:
-            raw_response = chat(
-                prompt=user_prompt,
-                system=self.SYSTEM_PROMPT,
-                model=self.model,
-                provider=self.provider,
-                thinking=self.thinking,
-            )
-
-            cleaned = raw_response.strip()
-            # Strip think tags
-            cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
-            # Strip code blocks
-            if cleaned.startswith("```"):
-                lines = cleaned.splitlines()
-                if len(lines) >= 2:
-                    if lines[-1].strip() == "```":
-                        cleaned = "\n".join(lines[1:-1])
-                    else:
-                        cleaned = "\n".join(lines[1:])
-            cleaned = cleaned.strip()
-
-            # Find json block
-            json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            target_json = json_match.group(0) if json_match else cleaned
-
-            # Sanitize LLM JSON quirks (trailing commas, LaTeX backslashes like \alpha, \frac, \underline)
-            sanitized = re.sub(r",\s*([\]}])", r"\1", target_json)
-            escape_pattern = r'(\\+)([^"\\/bfnrtu]|u(?![\da-fA-F]{4}))'
-            def _fix_slashes(m):
-                slashes = m.group(1)
-                follow = m.group(2)
-                if len(slashes) % 2 == 1:
-                    return slashes + "\\" + follow
-                return m.group(0)
-            sanitized = re.sub(escape_pattern, _fix_slashes, sanitized)
+        max_attempts = 3
+        for attempt in range(max_attempts):
             try:
-                return json.loads(sanitized, strict=False)
-            except Exception:
-                try:
-                    return json.loads(target_json, strict=False)
-                except Exception as parse_err:
-                    print(f"[Reviewer Warning] DeepSeek LLM JSON parse failed: {parse_err}")
-                    return None
-        except Exception as e:
-            if is_quota_or_cap_error(e):
-                raise e
-            print(f"[Reviewer Warning] DeepSeek LLM evaluation call failed: {e}")
+                raw_response = chat(
+                    prompt=user_prompt,
+                    system=self.SYSTEM_PROMPT,
+                    model=self.model,
+                    provider=self.provider,
+                    thinking=self.thinking,
+                )
+            except Exception as e:
+                if is_quota_or_cap_error(e):
+                    raise e
+                if attempt < max_attempts - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                print(f"[Reviewer Warning] DeepSeek LLM evaluation call failed: {e}")
+                return None
+
+            parsed, parse_err = self._parse_llm_json_response(raw_response or "")
+            if parsed is not None:
+                return parsed
+            if attempt < max_attempts - 1:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            print(f"[Reviewer Warning] DeepSeek LLM JSON parse failed: {parse_err}")
             return None
+        return None
 
 
 class AnnotationReviewerAgent:
@@ -2093,14 +2391,18 @@ class AnnotationReviewerAgent:
         issues.extend(stim_anchor_issues)
         stim_score = min(stim_nest_score, stim_anchor_score)
 
-        # 4. Question and Option Structure Integrity
+        # 4. Question and Option Structure Integrity & Annotation Rule Heuristics
         q_issues, q_score, metrics = (
             DeterministicAuditor.check_question_and_option_structure(
                 xml_content, raw_ocr_text=raw_ocr_text
             )
         )
         issues.extend(q_issues)
-        s_structure = round(q_score * 0.70 + stim_score * 0.30, 1)
+        heur_issues, heur_score = DeterministicAuditor.check_annotation_rule_heuristics(
+            xml_content
+        )
+        issues.extend(heur_issues)
+        s_structure = round(q_score * 0.55 + stim_score * 0.25 + heur_score * 0.20, 1)
 
         # 5. DET Question Coverage (Recall)
         det_cov_issues, det_cov_score, det_cov_metrics = (

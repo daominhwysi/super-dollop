@@ -580,3 +580,76 @@ def test_edit_review_set_resumes_compatible_branch_candidate(tmp_path):
 
     assert resumed[0]["resume_from_branch"] is True
     assert resumed[0]["xml_path"] == candidate.resolve()
+
+
+def test_patcher_blank_line_insensitive_and_head_tail_large_block():
+    original = (
+        "<question_label>Câu 1.</question_label>\n\n\n\n"
+        "<stem>Đề bài rất dài.</stem>\n\n"
+        + ("Nội dung đoạn văn phụ mô tả chi tiết bài toán. " * 70)
+        + "\n<option_label>A.</option_label> <option_text>1</option_text>"
+    )
+    # Blank line difference (\n\n instead of \n\n\n\n)
+    b1 = SearchReplaceBlock(
+        search_text="<question_label>Câu 1.</question_label>\n\n<stem>Đề bài rất dài.</stem>",
+        replace_text="<question_label>Câu 1.</question_label>\n<stem>Đề bài rất dài.</stem>",
+    )
+    patched1, applied1, failed1 = SearchReplacePatcher.apply_blocks(original, [b1])
+    assert applied1 == 1 and not failed1
+
+    # Oversized block (>2500 chars / >300 tokens) with minor whitespace variance
+    long_body = "Nội dung đoạn văn phụ mô tả chi tiết bài toán. " * 70
+    b2 = SearchReplaceBlock(
+        search_text="<stem>Đề bài rất dài.</stem>\n" + long_body.strip() + "\n<option_label>A.</option_label>",
+        replace_text="<stimulus>Đề bài rất dài.\n" + long_body.strip() + "</stimulus>\n<option_label>A.</option_label>",
+    )
+    patched2, applied2, failed2 = SearchReplacePatcher.apply_blocks(patched1, [b2])
+    assert applied2 == 1 and not failed2
+    assert "<stimulus>" in patched2
+
+
+def test_fuzzy_verbatim_guard_allows_source_restore_and_partial_batch():
+    raw_ocr = "Câu 1. Tính x = 10. A. 10 B. 20 C. 30 D. 40"
+    xml_in = (
+        "<section>Câu 1.</section> <stem>Tính x = 10.</stem> "
+        "<option_label>A.</option_label> <option_text>10</option_text> "
+        "<option_label>B.</option_label> <option_text>20</option_text>"
+    )
+    blocks = [
+        # Valid block restoring omitted options C and D from raw_ocr
+        SearchReplaceBlock(
+            search_text="<option_label>B.</option_label> <option_text>20</option_text>",
+            replace_text="<option_label>B.</option_label> <option_text>20</option_text> <option_label>C.</option_label> <option_text>30</option_text> <option_label>D.</option_label> <option_text>40</option_text>",
+        ),
+        # Corrupt block rewriting wording/numbers not in raw_ocr
+        SearchReplaceBlock(
+            search_text="<stem>Tính x = 10.</stem>",
+            replace_text="<stem>Tính y = 999.</stem>",
+        ),
+    ]
+    patched, applied, failed = SearchReplacePatcher.apply_blocks_with_verbatim_guard(
+        current_xml=xml_in,
+        baseline_xml=xml_in,
+        blocks=blocks,
+        raw_ocr_text=raw_ocr,
+    )
+    assert applied == 1
+    assert len(failed) == 1
+    assert "30" in patched and "40" in patched
+    assert "999" not in patched
+
+
+def test_short_block_fuzzy_threshold_allows_minor_punctuation_cleanup():
+    from sequence_labelling.annotator.editor import validate_single_block_verbatim
+
+    ok, reason = validate_single_block_verbatim(
+        search_text="<stem>Chọn đáp án đúng nhất:</stem>",
+        replace_text="<stem>Chọn đáp án đúng:</stem>",
+    )
+    assert ok, f"Expected short-block cleanup to pass, got: {reason}"
+
+    bad_ok, _ = validate_single_block_verbatim(
+        search_text="<stem>Tính x = 10.</stem>",
+        replace_text="<stem>Hoàn toàn khác.</stem>",
+    )
+    assert not bad_ok
