@@ -15,7 +15,7 @@ import time
 import re
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Union
 
 import torch
 import numpy as np
@@ -196,30 +196,91 @@ def check_cloze_stemless_validity(xml_text: str) -> Tuple[bool, int]:
     return (not has_empty_stem), stemless_matches
 
 
+DEFAULT_HF_MODEL_ID = "daominhwysi/sealior-modernbert-vi-exam-seq-labeling"
+DEFAULT_LOCAL_FALLBACK = "results/sanity_check"
+
+
+def _looks_like_hf_repo_id(value: str) -> bool:
+    """Returns True if value looks like an owner/repo Hugging Face Hub ID rather than a local path."""
+    if not value or value == DEFAULT_LOCAL_FALLBACK or value.startswith(("./", "../", "/", "~")):
+        return False
+    parts = value.split("/")
+    if len(parts) != 2 or not all(parts):
+        return False
+    return parts[0] not in {"results", "output", "checkpoints", "data", "tmp"}
+
+
+def resolve_latest_model_source(
+    model_path: Optional[Union[str, Path]] = None,
+    default_repo_id: str = DEFAULT_HF_MODEL_ID,
+    revision: str = "main",
+    offline: bool = False,
+) -> Tuple[Optional[Path], str]:
+    """
+    Resolves a model checkpoint path cleanly:
+    1. Existing local checkpoint directory containing config.json is used directly.
+    2. Explicit HF Hub repo ID (`owner/repo`) or missing default local placeholder
+       always checks Hugging Face Hub for the latest commit on `revision` via
+       `snapshot_download` (honoring HF_HOME / HF_HUB_CACHE), falling back to
+       strict offline cache ONLY if the Hub check fails.
+    """
+    raw_arg = str(model_path).strip() if model_path is not None else ""
+    if raw_arg:
+        local_cand = Path(raw_arg).expanduser()
+        if local_cand.exists() and (local_cand / "config.json").exists():
+            return local_cand, f"local:{local_cand}"
+
+    target_repo = raw_arg if _looks_like_hf_repo_id(raw_arg) else default_repo_id
+    if not target_repo:
+        return (Path(raw_arg) if raw_arg else None), raw_arg
+
+    from huggingface_hub import HfApi, snapshot_download
+
+    token = os.getenv("HF_TOKEN") or None
+    if not offline:
+        try:
+            info = HfApi(token=token).repo_info(
+                repo_id=target_repo,
+                repo_type="model",
+                revision=revision,
+            )
+            latest_sha = getattr(info, "sha", revision) or revision
+            snapshot_path = snapshot_download(
+                repo_id=target_repo,
+                revision=latest_sha,
+                token=token,
+                local_files_only=False,
+            )
+            return Path(snapshot_path), f"hf:{target_repo}@{latest_sha[:12]} (latest {revision})"
+        except Exception as e:
+            print(f"Warning: Could not reach Hugging Face Hub for {target_repo}@{revision}: {e}")
+
+    try:
+        snapshot_path = snapshot_download(
+            repo_id=target_repo,
+            revision=revision,
+            token=token,
+            local_files_only=True,
+        )
+        return Path(snapshot_path), f"hf-cache:{target_repo}@{revision} (offline)"
+    except Exception as e:
+        print(f"Warning: Could not resolve offline cached snapshot for {target_repo}@{revision}: {e}")
+        return (Path(raw_arg) if raw_arg else None), target_repo
+
+
 def _resolve_hf_cached_snapshot(model_dir: Optional[Path]) -> Optional[Path]:
-    """Resolves a Hugging Face cached model snapshot preferring refs/main."""
-    if model_dir and model_dir.exists() and (model_dir / "config.json").exists():
-        return model_dir
-    hf_repo = Path.home() / ".cache/huggingface/hub/models--daominhwysi--sealior-modernbert-vi-exam-seq-labeling"
-    snapshots_dir = hf_repo / "snapshots"
-    ref_main = hf_repo / "refs/main"
-    if ref_main.exists():
-        rev = ref_main.read_text(encoding="utf-8").strip()
-        cand = snapshots_dir / rev
-        if (cand / "config.json").exists():
-            return cand
-    if snapshots_dir.exists():
-        for cand in sorted(snapshots_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-            if (cand / "config.json").exists() and ((cand / "model.safetensors").exists() or (cand / "pytorch_model.bin").exists()):
-                return cand
-    return model_dir
+    """Backward-compatible wrapper around resolve_latest_model_source."""
+    resolved, _ = resolve_latest_model_source(model_path=model_dir)
+    return resolved
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Sequence Labelling Model against Gold Benchmark.")
     parser.add_argument("--config", type=str, default="configs/train_config.yaml", help="Path to config YAML")
     parser.add_argument("--gold_set", "--gold-set", "--gold-manifest", type=str, default="data/benchmark_gold_set.json", help="Path to gold set JSON")
-    parser.add_argument("--model_path", "--model-path", "--checkpoint", type=str, default="results/sanity_check", help="Path to model checkpoint")
+    parser.add_argument("--model_path", "--model-path", "--checkpoint", type=str, default=DEFAULT_HF_MODEL_ID, help="Local checkpoint path or Hugging Face Hub model ID")
+    parser.add_argument("--revision", type=str, default="main", help="Hugging Face Hub branch/commit/tag to resolve (default: main)")
+    parser.add_argument("--offline", action="store_true", help="Resolve Hugging Face model from local cache only without network checks")
     parser.add_argument("--device", type=str, default=None, help="Device (cpu or cuda)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of documents to evaluate")
     parser.add_argument("--use_det", action="store_true", help="Use deterministic parser directly")
@@ -251,29 +312,35 @@ def main():
         documents = documents[:args.limit]
     print(f"Evaluating Documents: {len(documents)} documents (Corpus Token Total: {gold_data.get('total_tokens', 'N/A')})\n")
 
-    # Try loading model if checkpoint exists
-    model_dir = Path(args.model_path) if args.model_path else None
-    model_dir = _resolve_hf_cached_snapshot(model_dir)
-
     model = None
     tokenizer = None
     id_to_tag = None
-    if not args.use_det and model_dir and model_dir.exists() and (model_dir / "config.json").exists():
-        try:
-            from transformers import AutoTokenizer
-            print(f"Loading checkpoint from: {model_dir}")
-            tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-            tag_to_id, id_to_tag = load_label_mapping(model_dir)
-            model = EnhancedBertForTokenClassification.from_pretrained(
-                str(model_dir),
-                num_labels=len(id_to_tag)
-            ).to(device)
-            model.eval()
-            print("Successfully loaded EnhancedBertForTokenClassification checkpoint.\n")
-        except Exception as e:
-            print(f"Notice: Could not load trained model checkpoint from {model_dir}: {e}")
+    if not args.use_det:
+        model_dir, model_source = resolve_latest_model_source(
+            model_path=args.model_path,
+            revision=args.revision,
+            offline=args.offline,
+        )
+        if model_dir and model_dir.exists() and (model_dir / "config.json").exists():
+            try:
+                from transformers import AutoTokenizer
+                print(f"Resolved model source: {model_source}")
+                print(f"Loading checkpoint from: {model_dir}")
+                tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+                tag_to_id, id_to_tag = load_label_mapping(model_dir)
+                model = EnhancedBertForTokenClassification.from_pretrained(
+                    str(model_dir),
+                    num_labels=len(id_to_tag)
+                ).to(device)
+                model.eval()
+                print("Successfully loaded EnhancedBertForTokenClassification checkpoint.\n")
+            except Exception as e:
+                print(f"Notice: Could not load trained model checkpoint from {model_dir}: {e}")
+                print("Falling back to Deterministic Parser + Gold Consistency verification.\n")
+                model = None
+        else:
+            print(f"Notice: No valid checkpoint resolved for '{args.model_path}' ({model_source}).")
             print("Falling back to Deterministic Parser + Gold Consistency verification.\n")
-            model = None
 
     # Track metrics
     labels_to_eval = [
