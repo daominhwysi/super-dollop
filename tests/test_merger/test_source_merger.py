@@ -357,4 +357,27 @@ def test_remerge_exam_dir_prefers_repaired_chunk_xml_over_stale_json(tmp_path):
     assert remove_annotation_tags(merged_xml) == remove_annotation_tags(repaired_xml).rstrip()
 
 
+def test_remove_annotation_tags_and_validate_handle_html_in_stimulus_anchor():
+    """Quoted anchor attributes containing HTML '>' (e.g. <td>) must not truncate tag stripping or fail validation."""
+    from sequence_labelling.parser.long_parser.source_merger.serializer_validator import (
+        remove_annotation_tags,
+        validate_result,
+    )
+
+    xml_with_html_anchor = (
+        '<stimulus id="stim_1" start_anchor="<table><tr><th>Lớp</th></tr>" '
+        'end_anchor="<td>Tổng cộng</td>" />\n'
+        '<question_label>Câu 1.</question_label> <stem>Tính tổng.</stem>'
+    )
+    stripped = remove_annotation_tags(xml_with_html_anchor)
+    assert "<td>" not in stripped
+    assert "<th>" not in stripped
+    assert "start_anchor" not in stripped
+    assert stripped.strip() == "Câu 1. Tính tổng."
+
+    report = validate_result(stripped, xml_with_html_anchor, [])
+    assert report["source_fidelity_ok"] is True
+    assert report["balanced_ok"] is True
+
+
 

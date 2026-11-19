@@ -16,11 +16,12 @@ LABEL_PRIORITY = {
 
 def remove_annotation_tags(xml_str: str) -> str:
     """
-    Strips all recognized annotation tags from xml_str.
+    Strips all recognized annotation tags from xml_str, respecting quoted attributes
+    whose values may contain HTML/math '>' characters (e.g. start_anchor="<td>...").
     """
     pattern = re.compile(
-        r"</?(?:section|stimulus|question|question_label|stem|option_label|option_text|explanation)[^>]*>",
-        flags=re.IGNORECASE
+        r"""</?(?:section|stimulus|question_label|question|stem|option_label|option_text|explanation)(?=\s|/?>)(?:\s+(?:"[^"]*"|'[^']*'|[^"'>])*)?\s*/?>""",
+        flags=re.IGNORECASE,
     )
     return pattern.sub("", xml_str)
 
@@ -77,9 +78,12 @@ def validate_result(
     detagged = remove_annotation_tags(merged_xml)
     source_fidelity_ok = (detagged == canonical_text)
 
-    # Check balanced tags for recognized annotation tags only
-    allowed_tags = "|".join(LABEL_PRIORITY.keys())
-    tag_re = re.compile(r"</?(" + allowed_tags + r")(?:\s+[^>]*)?>", flags=re.IGNORECASE)
+    # Check balanced tags for recognized annotation tags only (respecting quoted attributes containing '>')
+    allowed_tags = "|".join(sorted(LABEL_PRIORITY.keys(), key=len, reverse=True))
+    tag_re = re.compile(
+        r"</?(" + allowed_tags + r""")(?=\s|/?>)(?:\s+(?:"[^"]*"|'[^']*'|[^"'>])*)?\s*/?>""",
+        flags=re.IGNORECASE,
+    )
     stack = []
     balanced_ok = True
 
